@@ -1,0 +1,10 @@
+node_modules
+.DS_Store
+dump.rdb
+.cursor/debug-*.log
+frontend/.env
+__pycache__/
+*.pyc
+backend/=2.0.0
+frontend/build/
+backend/uploads/

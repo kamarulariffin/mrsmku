@@ -1,0 +1,9 @@
+export { default as AdminMarketplaceDashboard } from './AdminMarketplaceDashboard';
+export { default as VendorManagementPage } from './VendorManagementPage';
+export { default as ProductManagementPage } from './ProductManagementPage';
+export { default as MarketplaceSettingsPage } from './MarketplaceSettingsPage';
+export { default as FinanceDashboardPage } from './FinanceDashboardPage';
+export { default as PayoutManagementPage } from './PayoutManagementPage';
+export { default as AdsManagementPage } from './AdsManagementPage';
+export { default as MonetizationStatsPage } from './MonetizationStatsPage';
+export { default as SalesAnalyticsPage } from './SalesAnalyticsPage';

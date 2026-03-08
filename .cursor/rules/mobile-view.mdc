@@ -1,0 +1,76 @@
+---
+description: Prinsip paparan mobile – zoom, tiada overflow mendatar, sentuhan 44px, satu skrin
+globs: frontend/src/pages/**/*.js
+alwaysApply: false
+---
+
+# Paparan Mobile (Semua Role)
+
+Semua arahan berikut adalah untuk **paparan mobile view**:
+
+1. **Zoom dibenarkan** – Jangan set `user-scalable=no`. Viewport sudah betul di `frontend/public/index.html` (`maximum-scale=5`, `user-scalable=yes`).
+2. **Tiada overflow mendatar** – Layout utama ada `overflow-x-hidden` (App.js). Dalam halaman: elak elemen yang melebihi lebar skrin; gunakan `overflow-x-auto` hanya dalam container yang dibatasi (contoh: bar swipe), bukan pada body/halaman.
+3. **Sentuhan minimum 44px** – Butang dan kawasan boleh klik: gunakan `min-h-[44px]` dan/atau `min-w-[44px]` (atau padding cukup supaya tapak sentuh ≥44px).
+4. **Satu skrin** – Susunan dan saiz kotak disesuaikan supaya kandungan penting nampak dalam satu skrin, terutama di **Pusat Bayaran** (Payment Center).
+
+## Contoh Tailwind
+
+- Tiada overflow: `overflow-x-hidden`, `min-w-0` pada flex children yang boleh mengecut.
+- Tapak sentuh: `min-h-[44px] min-w-[44px]` atau `py-3 px-4` yang hasilkan ≥44px.
+- Mobile-first: gunakan `sm:`, `md:` untuk saiz/ spacing lebih besar pada desktop.
+
+## Halaman / fail yang perlu disesuaikan (semua role)
+
+Sesuaikan prinsip di atas pada halaman berikut jika belum:
+
+**Parent (Ibu Bapa)**  
+- `pages/dashboard/ParentDashboard.js`  
+- `pages/parent/ChildrenPage.js`  
+- `pages/parent/fees/FeesPage.js`  
+- `pages/parent/ParentChildrenFeesPage.js`  
+- `pages/parent/yuran/ParentYuranDashboard.js` (Yuran)  
+- `pages/parent/payments/PaymentsPage.js` (Pembayaran)  
+- `pages/payment_center/NewPaymentCenterLayout.js` (Pusat Bayaran – penting satu skrin; sudah ada min-h-[44px] di beberapa butang)  
+- `pages/modules/PaymentCenterPageNew.js`  
+- `pages/parent/notifications/NotificationsPage.js`  
+- `pages/parent/tabung/TabungPageNew.js`  
+- `pages/modules/BusTicketPage.js`  
+- `pages/modules/KoperasiPage.js`  
+- `pages/parent/ParentHostelPage.js`  
+- `pages/parent/ParentWardenSchedulePage.js`  
+- `pages/user/MyQRCodePage.js`  
+- `pages/complaints/ComplaintsPage.js`  
+- Vendor: `pages/vendor/VendorDashboard.js`, `VendorProductsPage.js`, `VendorOrdersPage.js`, dll.
+
+**Pelajar**  
+- `pages/pelajar/PelajarDashboard.js`  
+- `pages/pelajar/PelajarHostelPage.js`  
+- `pages/parent/fees/FeesPage.js` (Yuran Saya – shared)  
+- `pages/user/MyQRCodePage.js`  
+- `pages/complaints/ComplaintsPage.js`
+
+**Guru (guru_kelas / guru_homeroom)**  
+- `pages/guru/GuruDashboard.js`  
+- `pages/guru/GuruClassDashboard.js`  
+- `pages/guru/TeacherStudentsPage.js`  
+- `pages/guru/TeacherFeesPage.js`  
+- `pages/guru/GuruNotificationsPage.js`
+
+**Warden**  
+- `pages/warden/WardenDashboard.js`  
+- `pages/warden/WardenAsramaPage.js`  
+- `pages/warden/WardenSchedulesPage.js`  
+- `pages/warden/WardenPbwPbpPage.js`  
+- `pages/warden/WardenAnalyticsPage.js`
+
+**Pengawal (Guard)**  
+- `pages/guard/GuardDashboard.js`
+
+**Driver Bas**  
+- `pages/driver/DriverBasDashboardPage.js`  
+- `pages/driver/DriverBasTripPage.js`
+
+**Admin / Bendahari / Superadmin**  
+- Halaman admin boleh kekal dengan `overflow-x-auto` dalam jadual; pastikan wrapper halaman tidak cause overflow mendatar badan (layout utama sudah `overflow-x-hidden`).
+
+Apabila menambah atau mengubah halaman untuk mana-mana role di atas, pastikan prinsip mobile view dipatuhi.

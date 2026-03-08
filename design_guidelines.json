@@ -1,0 +1,130 @@
+{
+  "identity": {
+    "persona": "E1",
+    "tone": "Trustworthy, Community-Focused, Urgent, Transparent",
+    "theme": "light",
+    "design_philosophy": "Fusion over Imitation. Emotional First. Content is King."
+  },
+  "typography": {
+    "font_family": {
+      "heading": "Outfit, sans-serif",
+      "body": "Public Sans, sans-serif",
+      "mono": "JetBrains Mono, monospace"
+    },
+    "rules": {
+      "headings": "Use Outfit with tight tracking (tracking-tight). Weights: 600 (SemiBold) or 700 (Bold). Avoid generic 'Inter' for headings.",
+      "body": "Use Public Sans. Relaxed line-height (leading-relaxed) for readability.",
+      "overline": "Uppercase, tracking-widest, text-xs, font-bold, text-primary/80."
+    }
+  },
+  "colors": {
+    "palette": {
+      "primary": {
+        "DEFAULT": "#0f766e",
+        "foreground": "#ffffff",
+        "50": "#f0fdfa",
+        "100": "#ccfbf1",
+        "500": "#14b8a6",
+        "700": "#0f766e",
+        "900": "#134e4a"
+      },
+      "secondary": {
+        "DEFAULT": "#d97706",
+        "foreground": "#ffffff",
+        "100": "#fef3c7",
+        "600": "#d97706"
+      },
+      "accent": {
+        "DEFAULT": "#f59e0b",
+        "glow": "rgba(245, 158, 11, 0.5)"
+      },
+      "neutral": {
+        "surface": "#ffffff",
+        "background": "#fafaf9",
+        "border": "#e5e7eb",
+        "text_primary": "#0f172a",
+        "text_secondary": "#64748b"
+      }
+    },
+    "usage": {
+      "background": "bg-neutral-background",
+      "surface": "bg-white shadow-sm border border-neutral-border",
+      "primary_action": "bg-primary hover:bg-primary-900 text-white shadow-lg shadow-primary/20 transition-all active:scale-95",
+      "secondary_action": "bg-white border border-neutral-border hover:bg-neutral-50 text-neutral-text_primary",
+      "success_indicator": "text-emerald-600 bg-emerald-50",
+      "urgent_indicator": "text-rose-600 bg-rose-50"
+    }
+  },
+  "layout_strategy": {
+    "container": "max-w-7xl mx-auto px-4 sm:px-6 lg:px-8",
+    "spacing": {
+      "section_gap": "gap-12 md:gap-24",
+      "component_gap": "gap-6 md:gap-8",
+      "internal_padding": "p-6 md:p-8"
+    },
+    "grid_system": {
+      "hero_split": "grid grid-cols-1 lg:grid-cols-12 gap-8 lg:gap-12 items-start",
+      "bento_grid": "grid grid-cols-1 md:grid-cols-3 gap-4 auto-rows-[minmax(180px,auto)]"
+    }
+  },
+  "components": {
+    "DonationCard": {
+      "style": "Sticky on desktop (top-24). Glassmorphism effect or solid white with deep shadow. High hierarchy.",
+      "elements": [
+        "Progress Bar (Animated)",
+        "Amount Selector (Pill shaped)",
+        "Custom Amount Input",
+        "Donate Button (Massive, Pulsing)",
+        "Donor Count (Social Proof)"
+      ]
+    },
+    "ProgressBar": {
+      "style": "H-4 rounded-full bg-slate-100 overflow-hidden relative",
+      "animation": "Fill width with transition-all duration-1000 ease-out. Add a 'shimmer' overlay animation."
+    },
+    "ShareButtons": {
+      "style": "Inline flex gap-3. Icon-only circles or pills with text. Minimalist.",
+      "platforms": ["WhatsApp", "Telegram", "Facebook", "X", "LinkedIn", "Copy Link"]
+    },
+    "HeroSection": {
+      "style": "Immersive image on left/top. Strong Headline. Impact badge.",
+      "image_treatment": "Rounded-2xl or 3xl. Subtle parallax if possible."
+    }
+  },
+  "assets": {
+    "icons": "lucide-react (default). Use specific icons: Heart, Share2, Users, TrendingUp, ShieldCheck, GraduationCap.",
+    "images": {
+      "hero_campaign": "https://images.unsplash.com/photo-1547357733-7221b74f4d71?crop=entropy&cs=srgb&fm=jpg&q=85",
+      "school_exterior": "https://images.unsplash.com/photo-1758611228434-7b5b697abd0a?crop=entropy&cs=srgb&fm=jpg&q=85",
+      "students_group": "https://images.unsplash.com/photo-1557734864-c78b6dfef1b1?crop=entropy&cs=srgb&fm=jpg&q=85",
+      "campaign_detail_1": "https://images.unsplash.com/photo-1634219355134-47e8e0727e80?crop=entropy&cs=srgb&fm=jpg&q=85"
+    }
+  },
+  "interactions": {
+    "hover": "translate-y-[-2px] shadow-lg transition-all duration-300",
+    "click": "scale-95 transition-transform duration-100",
+    "scroll": "Use IntersectionObserver to trigger fade-ins for sections."
+  },
+  "accessibility": {
+    "contrast": "Ensure text-primary on background is > 4.5:1.",
+    "focus": "focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2",
+    "aria": "Progress bars must have aria-valuenow, aria-valuemin, aria-valuemax. Buttons must have aria-label if icon-only."
+  },
+  "instructions_to_main_agent": [
+    "Do NOT override tailwind.config.js unless absolutely necessary. Use arbitrary values if specific spacing needed.",
+    "Implement the 'DonationCard' as a separate component that is sticky on desktop.",
+    "Use 'framer-motion' for the progress bar filling animation and section entrance animations.",
+    "Ensure the 'Share' functionality actually opens the respective platform's share URL (e.g., wa.me, t.me).",
+    "For the 'Recent Donors' list, use a marquee or a smooth vertical scroll if there are many, or just a static list of top 5.",
+    "Use the provided Unsplash URLs for the campaign images.",
+    "Add 'data-testid' to all interactive elements (buttons, inputs, links)."
+  ],
+  "UNIVERSAL_GUIDELINES": [
+    "Avoid generic centered layouts. Use asymmetry.",
+    "Use generous spacing (p-8, p-12).",
+    "Dark colors look good when used independently without gradients.",
+    "Create depth through layered design elements with z-index hierarchy.",
+    "Never use AI assistant emojis.",
+    "Every interaction needs micro-animations."
+  ]
+}

@@ -1,0 +1,1 @@
+export { SedekahPage } from './SedekahPage';

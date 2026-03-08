@@ -1,0 +1,1 @@
+export { AdminInfaqPage } from './AdminInfaqPage';

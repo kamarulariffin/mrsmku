@@ -1,0 +1,1 @@
+export { SickBayPage } from './SickBayPage';

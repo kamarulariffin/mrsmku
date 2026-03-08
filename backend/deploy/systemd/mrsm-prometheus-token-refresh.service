@@ -1,0 +1,17 @@
+[Unit]
+Description=Refresh MRSM Prometheus bearer token
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+# Replace with service account that can read env file and write TOKEN_FILE.
+User=prometheus
+Group=prometheus
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=PROM_TOKEN_ENV_FILE=/etc/prometheus/secrets/mrsm-token.env
+ExecStart=<PROJECT_ROOT>/backend/scripts/refresh_prometheus_token.sh
+TimeoutStartSec=30
+
+[Install]
+WantedBy=multi-user.target

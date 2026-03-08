@@ -1,0 +1,1 @@
+export { AdminKoperasiPage } from './AdminKoperasiPage';

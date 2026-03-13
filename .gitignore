@@ -23,3 +23,4 @@ smoke-test-output.txt
 step1-initial.png
 step2-after-skip.png
 test_reports/
+backend/logs/

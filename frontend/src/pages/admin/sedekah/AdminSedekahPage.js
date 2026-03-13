@@ -42,8 +42,8 @@ export const AdminSedekahPage = () => {
   return (
     <div className="space-y-6 min-w-0 overflow-x-hidden" data-testid="admin-sedekah-page">
       <div>
-        <h1 className="text-2xl font-bold text-primary-900 font-heading">Pengurusan Sedekah</h1>
-        <p className="text-slate-600 mt-1">Urus kempen dan lihat sumbangan (Tabung & Sumbangan)</p>
+        <h1 className="text-2xl font-bold text-primary-900 font-heading">Pengurusan Tabung & Sumbangan</h1>
+        <p className="text-slate-600 mt-1">Urus kempen dan lihat sumbangan berpusat</p>
       </div>
 
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">

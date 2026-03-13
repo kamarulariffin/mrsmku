@@ -38,10 +38,11 @@ export const CartProvider = ({ children }) => {
   const fetchCart = useCallback(async () => {
     try {
       const response = await api.get('/api/payment-center/cart');
+      const fetchedItems = response.data.items || [];
       setCart({
-        items: response.data.items || [],
+        items: fetchedItems,
         total_amount: response.data.total_amount || 0,
-        item_count: response.data.items?.length || 0
+        item_count: fetchedItems.length || 0
       });
     } catch (error) {
       console.error('Error fetching cart:', error);

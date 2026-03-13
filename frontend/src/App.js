@@ -24,14 +24,14 @@ import { LoginPage as NewLoginPage, RegisterPage as NewRegisterPage, ForgotPassw
 import { ParentDashboard as NewParentDashboard } from './pages/dashboard';
 import { AdminDashboard as NewAdminDashboard } from './pages/admin';
 import { BusTicketPage, KoperasiPage, NewPaymentCenterLayout } from './pages/modules';
-import { LandingPage, PublicSedekahPage, PublicCampaignDetailPage } from './pages/public';
+import { LandingPage, PublicSedekahPage, PublicCampaignDetailPage, InstitutionRegistrationWizardPage } from './pages/public';
 import { AnalyticsAIPage, BusAdminAnalyticsPage } from './pages/analytics';
 import { AGMPage } from './pages/agm';
 import { MyQRCodePage } from './pages/user';
 import { WardenDashboard as NewWardenDashboard, WardenAnalyticsPage, WardenAsramaPage, WardenSchedulesPage, WardenPbwPbpPage, WardenARPage } from './pages/warden';
 import { SickBayPage as NewSickBayPage } from './pages/sickbay';
 import { GuardDashboard as NewGuardDashboard } from './pages/guard';
-import { SuperAdminDashboard as NewSuperAdminDashboard, UserManagementPage as NewUserManagementPage, AuditLogPage as NewAuditLogPage, RBACConfigPage as NewRBACConfigPage, SettingsPage as NewSettingsPage } from './pages/superadmin';
+import { SuperAdminDashboard as NewSuperAdminDashboard, UserManagementPage as NewUserManagementPage, AuditLogPage as NewAuditLogPage, RBACConfigPage as NewRBACConfigPage, SettingsPage as NewSettingsPage, TenantOnboardingPage as NewTenantOnboardingPage } from './pages/superadmin';
 import { SampleLayoutPage } from './pages/sample';
 import { GuruDashboard as NewGuruDashboard, GuruClassDashboard as NewGuruClassDashboard, TeacherStudentsPage, TeacherFeesPage, GuruNotificationsPage } from './pages/guru';
 
@@ -67,7 +67,7 @@ import ARNotificationReportPage from './pages/admin/ARNotificationReportPage';
 import { AdminKoperasiPage as NewAdminKoperasiPage } from './pages/admin/koperasi';
 import { AdminStudentsPage as NewAdminStudentsPage } from './pages/admin/students';
 import { AdminReportsPage as NewAdminReportsPage } from './pages/admin/reports';
-import { SetYuranManagementPage, StudentYuranListPage, YuranSettingsPage } from './pages/admin/yuran';
+import { ChargesManagementPage, SetYuranManagementPage, StudentYuranListPage, YuranSettingsPage } from './pages/admin/yuran';
 import ManualBendahariPage from './pages/admin/ManualBendahariPage';
 import ManualBendahariFullPage from './pages/admin/ManualBendahariFullPage';
 import KnowledgePage from './pages/admin/KnowledgePage';
@@ -85,7 +85,6 @@ import { UniversalInventoryPage } from './pages/inventory';
 import CategoryManagementPage from './pages/admin/CategoryManagementPage';
 import SmartDashboardPage from './pages/admin/SmartDashboardPage';
 import { 
-  AccountingDashboardPage, 
   AccountingDashboard,
   TransactionList,
   TransactionForm,
@@ -95,6 +94,7 @@ import {
   MonthlyReport,
   AnnualReport,
   BankAccountsPage,
+  BankReconciliationPage,
   FinancialYearPage,
   AGMReportsPage,
   ChartOfAccountsPage,
@@ -869,7 +869,10 @@ const DashboardLayout = ({ children }) => {
   useEffect(() => {
     const loadModuleSettings = async () => {
       try {
-        const res = await api.get('/api/settings/modules/public');
+        const tenantCode = user?.tenant_code || '';
+        const res = await api.get('/api/settings/modules', {
+          params: tenantCode ? { tenant_code: tenantCode } : {},
+        });
         const modules = res.data.modules || {};
         const enabledMap = {};
         Object.keys(modules).forEach(key => {
@@ -886,7 +889,7 @@ const DashboardLayout = ({ children }) => {
       }
     };
     loadModuleSettings();
-  }, []);
+  }, [user?.tenant_code]);
 
   // Helper to check if module is enabled
   const isModuleEnabled = (moduleKey) => moduleSettings[moduleKey] !== false;
@@ -905,19 +908,21 @@ const DashboardLayout = ({ children }) => {
     sokongan: 'Sokongan',
     sistem: 'Sistem & Tetapan',
   };
+  const normalizeNavPath = (path) => String(path || '').split('#')[0];
   const pathToSection = (path) => {
-    if (!path) return 'utama';
-    if (path === '/superadmin' || path === '/admin' || path === '/warden' || path === '/guru' || path === '/pelajar' || path === '/dashboard' || path === '/guard' || path === '/koop-admin' || path === '/bus-admin' || path === '/driver-bas') return 'utama';
-    if (path.includes('smart-dashboard') || path === '/my-qrcode' || path === '/children' || path === '/tabung') return 'utama';
-    if (path === '/payment-center' || path === '/payments' || path === '/payment-parent' || path === '/payments-parent' || path.includes('financial-dashboard') || path.includes('ar-dashboard') || path.includes('ar-outstanding') || path.includes('ar-notification-report') || path.includes('warden/ar') || path.includes('accounting') || path.includes('yuran') || path.includes('tabung')) return 'kewangan';
-    if (path.includes('users') || path.includes('students') || path.includes('guru-kelas') || path.includes('rbac') || path.includes('student-import')) return 'pengguna';
-    if (path.includes('hostel') || path.includes('jadual-guru-asrama') || path.includes('warden/schedules') || path.includes('warden/pbw-pbp') || path.includes('warden/asrama') || path.includes('sickbay')) return 'asrama';
-    if (path.includes('discipline') || path.includes('complaints')) return 'disiplin';
-    if (path.includes('bus') || path.includes('vehicles') || path.includes('bus-tickets')) return 'pengangkutan';
-    if (path.includes('koperasi') || path.includes('marketplace') || path.includes('inventory') || path.includes('categories') || path === '/vendor') return 'perdagangan';
-    if (path.includes('reports') || path.includes('analytics')) return 'laporan';
-    if (path.includes('chatbox-faq') || path.includes('notifications') || path.includes('email-templates')) return 'sokongan';
-    if (path.includes('audit') || path.includes('settings')) return 'sistem';
+    const normalizedPath = normalizeNavPath(path);
+    if (!normalizedPath) return 'utama';
+    if (normalizedPath === '/superadmin' || normalizedPath === '/admin' || normalizedPath === '/warden' || normalizedPath === '/guru' || normalizedPath === '/pelajar' || normalizedPath === '/dashboard' || normalizedPath === '/guard' || normalizedPath === '/koop-admin' || normalizedPath === '/bus-admin' || normalizedPath === '/driver-bas') return 'utama';
+    if (normalizedPath.includes('smart-dashboard') || normalizedPath === '/my-qrcode' || normalizedPath === '/children' || normalizedPath === '/tabung') return 'utama';
+    if (normalizedPath === '/payment-center' || normalizedPath === '/payments' || normalizedPath === '/payment-parent' || normalizedPath === '/payments-parent' || normalizedPath.includes('financial-dashboard') || normalizedPath.includes('ar-dashboard') || normalizedPath.includes('ar-outstanding') || normalizedPath.includes('ar-notification-report') || normalizedPath.includes('warden/ar') || normalizedPath.includes('accounting') || normalizedPath.includes('yuran') || normalizedPath.includes('tabung') || normalizedPath.includes('manual-bendahari')) return 'kewangan';
+    if (normalizedPath.includes('users') || normalizedPath.includes('students') || normalizedPath.includes('guru-kelas') || normalizedPath.includes('rbac') || normalizedPath.includes('student-import')) return 'pengguna';
+    if (normalizedPath.includes('hostel') || normalizedPath.includes('jadual-guru-asrama') || normalizedPath.includes('warden/schedules') || normalizedPath.includes('warden/pbw-pbp') || normalizedPath.includes('warden/asrama') || normalizedPath.includes('sickbay')) return 'asrama';
+    if (normalizedPath.includes('discipline') || normalizedPath.includes('complaints')) return 'disiplin';
+    if (normalizedPath.includes('bus') || normalizedPath.includes('vehicles') || normalizedPath.includes('bus-tickets')) return 'pengangkutan';
+    if (normalizedPath.includes('koperasi') || normalizedPath.includes('marketplace') || normalizedPath.includes('inventory') || normalizedPath.includes('categories') || normalizedPath === '/vendor') return 'perdagangan';
+    if (normalizedPath.includes('reports') || normalizedPath.includes('analytics')) return 'laporan';
+    if (normalizedPath.includes('chatbox-faq') || normalizedPath.includes('notifications') || normalizedPath.includes('email-templates')) return 'sokongan';
+    if (normalizedPath.includes('audit') || normalizedPath.includes('settings')) return 'sistem';
     return 'utama';
   };
 
@@ -943,11 +948,12 @@ const DashboardLayout = ({ children }) => {
     
     if (role === 'superadmin') return filterByModule([
       { icon: Home, label: 'Dashboard', path: '/superadmin' },
+      { icon: Building, label: 'Onboarding Institusi', path: '/superadmin/tenant-onboarding' },
       { icon: TrendingUp, label: 'Dashboard Pintar', path: '/admin/smart-dashboard' },
       { icon: PieChart, label: 'Dashboard Kewangan', path: '/admin/financial-dashboard' },
       { icon: Brain, label: 'Analisis Kewangan AI', path: '/admin/financial-analytics-ai' },
       { icon: Calculator, label: 'Sistem Perakaunan', path: '/admin/accounting-full' },
-      { icon: Wallet, label: 'Ringkasan Akaun', path: '/admin/accounting' },
+      { icon: CheckCircle, label: 'Reconcile Bank', path: '/admin/accounting/bank-reconciliation' },
       { icon: FileText, label: 'Laporan Khas AGM', path: '/admin/agm-reports' },
       { icon: Users, label: 'Pengguna', path: '/superadmin/users' },
       { icon: Shield, label: 'RBAC', path: '/superadmin/rbac' },
@@ -955,6 +961,7 @@ const DashboardLayout = ({ children }) => {
       { icon: UserCheck, label: 'Guru Kelas', path: '/admin/guru-kelas' },
       { icon: CreditCard, label: 'Pakej Yuran', path: '/admin/yuran/set-yuran' },
       { icon: Wallet, label: 'Semua Yuran', path: '/admin/yuran/pelajar' },
+      { icon: Receipt, label: 'Caj Tambahan', path: '/admin/yuran/charges' },
       { icon: Settings, label: 'Tetapan Invois & AGM', path: '/admin/yuran/settings' },
       { icon: Gift, label: 'Tabung & Sumbangan', path: '/admin/tabung' },
       { icon: Bus, label: 'Pengurusan Bas', path: '/admin/bus' },
@@ -980,39 +987,43 @@ const DashboardLayout = ({ children }) => {
     ]);
     if (role === 'bendahari') return filterByModule([
       { icon: Home, label: 'Dashboard', path: '/admin' },
-      { icon: PieChart, label: 'Dashboard Kewangan', path: '/admin/financial-dashboard' },
+      { icon: CheckCircle, label: 'Reconcile Bank (Prioriti)', path: '/admin/accounting/bank-reconciliation' },
+      { icon: Calculator, label: 'Sistem Perakaunan', path: '/admin/accounting-full' },
       { icon: BarChart3, label: 'AR (Akaun Belum Terima)', path: '/admin/ar-dashboard' },
       { icon: Send, label: 'Hantar Peringatan Yuran Tertunggak', path: '/admin/ar-outstanding' },
       { icon: FileText, label: 'Laporan Notifikasi AR', path: '/admin/ar-notification-report' },
-      { icon: Brain, label: 'Analisis Kewangan AI', path: '/admin/financial-analytics-ai' },
-      { icon: Calculator, label: 'Sistem Perakaunan', path: '/admin/accounting-full' },
-      { icon: Wallet, label: 'Ringkasan Akaun', path: '/admin/accounting' },
-      { icon: FileText, label: 'Laporan Khas AGM', path: '/admin/agm-reports' },
-      { icon: CreditCard, label: 'Pakej Yuran', path: '/admin/yuran/set-yuran' },
       { icon: Wallet, label: 'Semua Yuran', path: '/admin/yuran/pelajar' },
+      { icon: CreditCard, label: 'Pakej Yuran', path: '/admin/yuran/set-yuran' },
+      { icon: Receipt, label: 'Caj Tambahan', path: '/admin/yuran/charges' },
       { icon: Settings, label: 'Tetapan Invois & AGM', path: '/admin/yuran/settings' },
+      { icon: HelpCircle, label: 'Checklist Operasi Bendahari', path: '/admin/manual-bendahari#checklist-priority' },
+      { icon: PieChart, label: 'Dashboard Kewangan', path: '/admin/financial-dashboard' },
+      { icon: Brain, label: 'Analisis Kewangan AI', path: '/admin/financial-analytics-ai' },
+      { icon: FileText, label: 'Laporan Khas AGM', path: '/admin/agm-reports' },
+      { icon: BarChart3, label: 'Laporan', path: '/admin/reports' },
       { icon: Gift, label: 'Tabung & Sumbangan', path: '/admin/tabung' },
       { icon: ShoppingCart, label: 'Koperasi', path: '/admin/koperasi' },
-      { icon: BarChart3, label: 'Laporan', path: '/admin/reports' },
       { icon: Mail, label: 'E-mel Template', path: '/admin/email-templates' },
       { icon: Library, label: 'Pusat Pengetahuan', path: '/admin/knowledge' },
     ]);
     if (role === 'admin') return filterByModule([
       { icon: Home, label: 'Dashboard', path: '/admin' },
-      { icon: TrendingUp, label: 'Dashboard Pintar', path: '/admin/smart-dashboard' },
-      { icon: PieChart, label: 'Dashboard Kewangan', path: '/admin/financial-dashboard' },
+      { icon: CheckCircle, label: 'Reconcile Bank (Prioriti)', path: '/admin/accounting/bank-reconciliation' },
+      { icon: Calculator, label: 'Sistem Perakaunan', path: '/admin/accounting-full' },
       { icon: BarChart3, label: 'AR (Akaun Belum Terima)', path: '/admin/ar-dashboard' },
       { icon: Send, label: 'Hantar Peringatan Yuran Tertunggak', path: '/admin/ar-outstanding' },
       { icon: FileText, label: 'Laporan Notifikasi AR', path: '/admin/ar-notification-report' },
+      { icon: HelpCircle, label: 'Checklist Operasi Bendahari', path: '/admin/manual-bendahari#checklist-priority' },
+      { icon: PieChart, label: 'Dashboard Kewangan', path: '/admin/financial-dashboard' },
       { icon: Brain, label: 'Analisis Kewangan AI', path: '/admin/financial-analytics-ai' },
-      { icon: Calculator, label: 'Sistem Perakaunan', path: '/admin/accounting-full' },
-      { icon: Wallet, label: 'Ringkasan Akaun', path: '/admin/accounting' },
+      { icon: TrendingUp, label: 'Dashboard Pintar', path: '/admin/smart-dashboard' },
       { icon: FileText, label: 'Laporan Khas AGM', path: '/admin/agm-reports' },
       { icon: Users, label: 'Pengguna', path: '/superadmin/users' },
       { icon: Users, label: 'Pelajar', path: '/admin/students' },
       { icon: GraduationCap, label: 'Guru Kelas', path: '/admin/guru-kelas' },
-      { icon: CreditCard, label: 'Pakej Yuran', path: '/admin/yuran/set-yuran' },
       { icon: Wallet, label: 'Semua Yuran', path: '/admin/yuran/pelajar' },
+      { icon: CreditCard, label: 'Pakej Yuran', path: '/admin/yuran/set-yuran' },
+      { icon: Receipt, label: 'Caj Tambahan', path: '/admin/yuran/charges' },
       { icon: Settings, label: 'Tetapan Invois & AGM', path: '/admin/yuran/settings' },
       { icon: Gift, label: 'Tabung & Sumbangan', path: '/admin/tabung' },
       { icon: Bus, label: 'Pengurusan Bas', path: '/admin/bus' },
@@ -1035,23 +1046,26 @@ const DashboardLayout = ({ children }) => {
     ]);
     if (role === 'sub_bendahari') return filterByModule([
       { icon: Home, label: 'Dashboard', path: '/admin' },
+      { icon: CheckCircle, label: 'Reconcile Bank (Prioriti)', path: '/admin/accounting/bank-reconciliation' },
+      { icon: Calculator, label: 'Sistem Perakaunan', path: '/admin/accounting-full' },
       { icon: BarChart3, label: 'AR (Akaun Belum Terima)', path: '/admin/ar-dashboard' },
       { icon: Send, label: 'Hantar Peringatan Yuran Tertunggak', path: '/admin/ar-outstanding' },
       { icon: FileText, label: 'Laporan Notifikasi AR', path: '/admin/ar-notification-report' },
-      { icon: Calculator, label: 'Sistem Perakaunan', path: '/admin/accounting-full' },
-      { icon: Wallet, label: 'Ringkasan Akaun', path: '/admin/accounting' },
-      { icon: FileText, label: 'Laporan Khas AGM', path: '/admin/agm-reports' },
-      { icon: CreditCard, label: 'Pakej Yuran', path: '/admin/yuran/set-yuran' },
       { icon: Wallet, label: 'Semua Yuran', path: '/admin/yuran/pelajar' },
+      { icon: CreditCard, label: 'Pakej Yuran', path: '/admin/yuran/set-yuran' },
+      { icon: Receipt, label: 'Caj Tambahan', path: '/admin/yuran/charges' },
       { icon: Settings, label: 'Tetapan Invois & AGM', path: '/admin/yuran/settings' },
-      { icon: ShoppingCart, label: 'Koperasi', path: '/admin/koperasi' },
+      { icon: HelpCircle, label: 'Checklist Operasi Bendahari', path: '/admin/manual-bendahari#checklist-priority' },
+      { icon: FileText, label: 'Laporan Khas AGM', path: '/admin/agm-reports' },
       { icon: BarChart3, label: 'Laporan', path: '/admin/reports' },
+      { icon: ShoppingCart, label: 'Koperasi', path: '/admin/koperasi' },
       { icon: Mail, label: 'E-mel Template', path: '/admin/email-templates' },
       { icon: Library, label: 'Pusat Pengetahuan', path: '/admin/knowledge' },
     ]);
     if (['juruaudit'].includes(role)) return filterByModule([
       { icon: Home, label: 'Dashboard', path: '/admin' },
       { icon: Calculator, label: 'Sistem Perakaunan', path: '/admin/accounting-full' },
+      { icon: CheckCircle, label: 'Reconcile Bank', path: '/admin/accounting/bank-reconciliation' },
       { icon: FileText, label: 'Laporan Khas AGM', path: '/admin/agm-reports' },
       { icon: CheckCircle, label: 'Pengesahan', path: '/admin/accounting/verification' },
       { icon: Mail, label: 'E-mel Template', path: '/admin/email-templates' },
@@ -1140,7 +1154,7 @@ const DashboardLayout = ({ children }) => {
   };
 
   const rawNavItems = getNavItems();
-  const navItems = rawNavItems.map((item) => ({ ...item, section: pathToSection(item.path) }));
+  const navItems = rawNavItems.map((item) => ({ ...item, normalizedPath: normalizeNavPath(item.path), section: pathToSection(item.path) }));
 
   // Group by section for accordion (kekal order)
   const sectionOrder = SECTION_ORDER.filter((id) => navItems.some((i) => i.section === id));
@@ -1155,7 +1169,7 @@ const DashboardLayout = ({ children }) => {
   })).filter((g) => g.items.length > 0);
 
   // Accordion: buka section yang mengandungi halaman semasa
-  const currentSection = navItems.find((i) => i.path === location.pathname)?.section;
+  const currentSection = navItems.find((i) => i.normalizedPath === location.pathname)?.section;
   const [openSections, setOpenSections] = useState(() => {
     const o = {};
     sectionOrder.forEach((id) => {
@@ -1164,7 +1178,7 @@ const DashboardLayout = ({ children }) => {
     return o;
   });
   useEffect(() => {
-    const curr = navItems.find((i) => i.path === location.pathname)?.section;
+    const curr = navItems.find((i) => i.normalizedPath === location.pathname)?.section;
     if (curr) setOpenSections((prev) => ({ ...prev, [curr]: true }));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [location.pathname]);
@@ -1221,7 +1235,7 @@ const DashboardLayout = ({ children }) => {
                         <Link
                           key={item.path}
                           to={item.path}
-                          className={`flex items-center gap-3 px-3 py-2.5 rounded-xl transition-all duration-200 text-sm ${location.pathname === item.path ? 'bg-gradient-to-r from-teal-400/90 to-violet-400/90 text-white shadow-lg' : 'text-slate-300 hover:bg-white/10 hover:text-white'}`}
+                          className={`flex items-center gap-3 px-3 py-2.5 rounded-xl transition-all duration-200 text-sm ${location.pathname === item.normalizedPath ? 'bg-gradient-to-r from-teal-400/90 to-violet-400/90 text-white shadow-lg' : 'text-slate-300 hover:bg-white/10 hover:text-white'}`}
                         >
                           <item.icon size={18} />{item.label}
                         </Link>
@@ -1237,7 +1251,7 @@ const DashboardLayout = ({ children }) => {
 
       {/* Desktop Top Header Bar */}
       <header className="hidden md:flex fixed top-0 left-64 right-0 z-40 h-16 bg-white/80 backdrop-blur-xl border-b border-slate-200/50 items-center justify-end px-6 gap-4">
-        <CartIconButton />
+        <CartIconButton showCategoryCounts />
         <NotificationCenter />
         <div className="flex items-center gap-3 pl-4 border-l border-slate-200">
           <div className={`w-8 h-8 rounded-full flex items-center justify-center bg-gradient-to-br from-amber-400 to-orange-400 text-white shadow-pastel-sm`}><roleInfo.icon size={16} /></div>
@@ -1303,7 +1317,7 @@ const DashboardLayout = ({ children }) => {
                                 key={item.path}
                                 to={item.path}
                                 onClick={() => setSidebarOpen(false)}
-                                className={`flex items-center gap-3 px-3 py-3 min-h-[44px] rounded-xl transition-all duration-200 text-sm ${location.pathname === item.path ? 'bg-gradient-to-r from-teal-400/90 to-violet-400/90 text-white shadow-lg' : 'text-slate-300 hover:bg-white/10 hover:text-white'}`}
+                                className={`flex items-center gap-3 px-3 py-3 min-h-[44px] rounded-xl transition-all duration-200 text-sm ${location.pathname === item.normalizedPath ? 'bg-gradient-to-r from-teal-400/90 to-violet-400/90 text-white shadow-lg' : 'text-slate-300 hover:bg-white/10 hover:text-white'}`}
                               >
                                 <item.icon size={18} />{item.label}
                               </Link>
@@ -1323,7 +1337,7 @@ const DashboardLayout = ({ children }) => {
       <nav className="md:hidden mobile-nav bg-white/90 backdrop-blur-xl border-t border-slate-200/60 shadow-[0_-4px_20px_rgba(0,0,0,0.06)]" style={{ paddingBottom: 'max(0.5rem, env(safe-area-inset-bottom))' }}>
         <div className="flex justify-around items-center py-2 px-1">
           {navItems.slice(0, 5).map((item) => (
-            <Link key={item.path} to={item.path} className={`flex flex-col items-center gap-0.5 min-w-[52px] min-h-[48px] justify-center rounded-lg active:bg-slate-100 transition-colors ${location.pathname === item.path ? 'text-teal-600' : 'text-slate-500'}`}>
+            <Link key={item.path} to={item.path} className={`flex flex-col items-center gap-0.5 min-w-[52px] min-h-[48px] justify-center rounded-lg active:bg-slate-100 transition-colors ${location.pathname === item.normalizedPath ? 'text-teal-600' : 'text-slate-500'}`}>
               <item.icon size={22} strokeWidth={2} /><span className="text-[11px] font-semibold leading-tight text-center max-w-[64px] truncate">{item.label}</span>
             </Link>
           ))}
@@ -1376,15 +1390,10 @@ const DashboardLayout = ({ children }) => {
 
 // NOTE: NotificationsPage refactored to /pages/parent/notifications/NotificationsPage.js
 
-// ===================== SEDEKAH/DONATION PAGES =====================
-// NOTE: SedekahPage, ProgressBar, DonationCard refactored to /pages/parent/sedekah/SedekahPage.js
-
-// NOTE: AdminSedekahPage refactored to /pages/admin/sedekah/AdminSedekahPage.js
-
-
-// ===================== INFAQ SLOT MODULE =====================
-// NOTE: InfaqPage refactored to /pages/modules/InfaqPage.js
-// NOTE: AdminInfaqPage refactored to /pages/admin/infaq/AdminInfaqPage.js
+// ===================== DONATION FLOW (UNIFIED) =====================
+// NOTE: Canonical donation experience is /tabung (TabungPageNew) and checkout via centralized cart.
+// NOTE: Legacy parent/module pages (SedekahPage, InfaqPage, TabungPage) are deprecated and now redirect to /tabung.
+// NOTE: Legacy admin aliases (/admin/sedekah, /admin/infaq) redirect to /admin/tabung.
 
 // ===================== ADMIN PAGES =====================
 // NOTE: AdminDashboard refactored to /pages/admin/AdminDashboard.js
@@ -1659,11 +1668,12 @@ const App = () => {
             <Route path="/" element={user ? <Navigate to={getDefaultRoute()} /> : <LandingPage />} />
             <Route path="/login" element={user ? <Navigate to={getDefaultRoute()} /> : <NewLoginPage />} />
             <Route path="/register" element={user ? <Navigate to="/dashboard" /> : <NewRegisterPage />} />
+            <Route path="/daftar-institusi" element={user ? <Navigate to={getDefaultRoute()} /> : <InstitutionRegistrationWizardPage />} />
             <Route path="/forgot-password" element={user ? <Navigate to={getDefaultRoute()} /> : <NewForgotPasswordPage />} />
             <Route path="/reset-password" element={user ? <Navigate to={getDefaultRoute()} /> : <NewResetPasswordPage />} />
           
-          {/* Public Donation Page (No Login Required) */}
-          <Route path="/donate/:campaignId" element={<PublicDonatePage />} />
+          {/* Public donation page; logged-in users are redirected to canonical /tabung flow */}
+          <Route path="/donate/:campaignId" element={user ? <Navigate to="/tabung" replace /> : <PublicDonatePage />} />
           
           {/* Public Campaign Detail Page */}
           <Route path="/kempen/:campaignId" element={<PublicCampaignDetailPage />} />
@@ -1674,10 +1684,10 @@ const App = () => {
           {/* Daftar Syarikat Bas (awam, tanpa login) */}
           <Route path="/daftar-syarikat-bas" element={<BusCompanyRegisterPage />} />
           
-          {/* Tabung & Sumbangan (Unified Infaq + Sedekah) Routes */}
+          {/* Canonical Tabung & Sumbangan route (centralized cart checkout) */}
           <Route path="/tabung" element={user ? <DashboardLayout><TabungPageNew /></DashboardLayout> : <Navigate to="/login" />} />
           
-          {/* Public Sedekah (no login): show public pages; when logged in redirect to tabung */}
+          {/* Legacy aliases keep backward compatibility but redirect logged-in users to /tabung */}
           <Route path="/sedekah" element={user ? <Navigate to="/tabung" replace /> : <PublicSedekahPage />} />
           <Route path="/sedekah/:campaignId" element={user ? <Navigate to="/tabung" replace /> : <PublicCampaignDetailPage />} />
           <Route path="/infaq" element={<Navigate to="/tabung" replace />} />
@@ -1698,6 +1708,7 @@ const App = () => {
           {/* SuperAdmin Routes */}
           <Route path="/superadmin" element={user?.role === 'superadmin' ? <DashboardLayout><NewSuperAdminDashboard /></DashboardLayout> : <Navigate to="/login" />} />
           <Route path="/superadmin/users" element={user && ['superadmin', 'admin'].includes(user?.role) ? <DashboardLayout><NewUserManagementPage /></DashboardLayout> : <Navigate to="/login" />} />
+          <Route path="/superadmin/tenant-onboarding" element={user?.role === 'superadmin' ? <DashboardLayout><NewTenantOnboardingPage /></DashboardLayout> : <Navigate to="/login" />} />
           <Route path="/superadmin/rbac" element={user?.role === 'superadmin' ? <DashboardLayout><NewRBACConfigPage /></DashboardLayout> : <Navigate to="/login" />} />
           <Route path="/superadmin/audit" element={user?.role === 'superadmin' ? <DashboardLayout><NewAuditLogPage /></DashboardLayout> : <Navigate to="/login" />} />
           <Route path="/superadmin/settings" element={user && ['superadmin', 'admin'].includes(user.role) ? <DashboardLayout><NewSettingsPage /></DashboardLayout> : <Navigate to="/login" />} />
@@ -1722,7 +1733,7 @@ const App = () => {
           <Route path="/admin/ar-outstanding" element={user && ['admin', 'bendahari', 'sub_bendahari', 'superadmin'].includes(user.role) ? <DashboardLayout><AROutstandingPage /></DashboardLayout> : <Navigate to="/login" />} />
           <Route path="/admin/ar-notification-report" element={user && ['admin', 'bendahari', 'sub_bendahari', 'superadmin'].includes(user.role) ? <DashboardLayout><ARNotificationReportPage /></DashboardLayout> : <Navigate to="/login" />} />
           <Route path="/admin/agm-reports" element={user && ['admin', 'bendahari', 'sub_bendahari', 'juruaudit', 'superadmin'].includes(user.role) ? <DashboardLayout><AGMReportsPage /></DashboardLayout> : <Navigate to="/login" />} />
-          {/* Legacy Admin routes - redirect to new unified page */}
+          {/* Legacy Admin aliases -> canonical /admin/tabung */}
           <Route path="/admin/sedekah" element={<Navigate to="/admin/tabung" replace />} />
           <Route path="/admin/infaq" element={<Navigate to="/admin/tabung" replace />} />
           <Route path="/admin/bus" element={user && ['admin', 'superadmin'].includes(user.role) ? <DashboardLayout><NewAdminBusManagementPage /></DashboardLayout> : <Navigate to="/login" />} />
@@ -1731,13 +1742,19 @@ const App = () => {
           {/* Yuran Module Routes */}
           <Route path="/admin/yuran/set-yuran" element={user && ['admin', 'bendahari', 'sub_bendahari', 'superadmin'].includes(user.role) ? <DashboardLayout><SetYuranManagementPage /></DashboardLayout> : <Navigate to="/login" />} />
           <Route path="/admin/yuran/pelajar" element={user && ['admin', 'bendahari', 'sub_bendahari', 'superadmin'].includes(user.role) ? <DashboardLayout><StudentYuranListPage /></DashboardLayout> : <Navigate to="/login" />} />
+          <Route path="/admin/yuran/charges" element={user && ['admin', 'bendahari', 'sub_bendahari', 'superadmin'].includes(user.role) ? <DashboardLayout><ChargesManagementPage /></DashboardLayout> : <Navigate to="/login" />} />
           <Route path="/admin/yuran/settings" element={user && ['admin', 'bendahari', 'sub_bendahari', 'superadmin'].includes(user.role) ? <DashboardLayout><YuranSettingsPage /></DashboardLayout> : <Navigate to="/login" />} />
           <Route path="/admin/manual-bendahari" element={user && ['bendahari', 'sub_bendahari', 'admin', 'superadmin'].includes(user.role) ? <DashboardLayout><ManualBendahariPage /></DashboardLayout> : <Navigate to="/login" />} />
           <Route path="/admin/manual-bendahari/full" element={user && ['bendahari', 'sub_bendahari', 'admin', 'superadmin'].includes(user.role) ? <DashboardLayout><ManualBendahariFullPage /></DashboardLayout> : <Navigate to="/login" />} />
           <Route path="/admin/knowledge" element={user && ['bendahari', 'sub_bendahari', 'admin', 'juruaudit', 'superadmin'].includes(user.role) ? <DashboardLayout><KnowledgePage /></DashboardLayout> : <Navigate to="/login" />} />
           <Route path="/admin/email-templates" element={!user ? <Navigate to="/login" /> : ['bendahari', 'sub_bendahari'].includes(user?.role) ? <DashboardLayout><BendahariEmailTemplatesPage /></DashboardLayout> : ['superadmin', 'admin', 'warden', 'guru_kelas', 'guru_homeroom', 'juruaudit', 'koop_admin', 'guard'].includes(user?.role) ? <DashboardLayout><EmailTemplatesPage /></DashboardLayout> : <Navigate to="/bus-admin" replace />} />
           
-          <Route path="/admin/accounting" element={user && ['admin', 'bendahari', 'sub_bendahari', 'superadmin'].includes(user.role) ? <DashboardLayout><AccountingDashboardPage /></DashboardLayout> : <Navigate to="/login" />} />
+          <Route
+            path="/admin/accounting"
+            element={user && ['admin', 'bendahari', 'sub_bendahari', 'juruaudit', 'superadmin'].includes(user.role)
+              ? <Navigate to="/admin/accounting-full" replace />
+              : <Navigate to="/login" />}
+          />
           
           {/* Full Accounting Module Routes */}
           <Route path="/admin/accounting-full" element={user && ['admin', 'bendahari', 'sub_bendahari', 'juruaudit', 'superadmin'].includes(user.role) ? <DashboardLayout><AccountingDashboard /></DashboardLayout> : <Navigate to="/login" />} />
@@ -1753,6 +1770,7 @@ const App = () => {
           
           {/* Bank Accounts & Financial Year Routes */}
           <Route path="/admin/accounting/bank-accounts" element={user && ['admin', 'bendahari', 'sub_bendahari', 'juruaudit', 'superadmin'].includes(user.role) ? <DashboardLayout><BankAccountsPage /></DashboardLayout> : <Navigate to="/login" />} />
+          <Route path="/admin/accounting/bank-reconciliation" element={user && ['admin', 'bendahari', 'sub_bendahari', 'juruaudit', 'superadmin'].includes(user.role) ? <DashboardLayout><BankReconciliationPage /></DashboardLayout> : <Navigate to="/login" />} />
           <Route path="/admin/accounting/financial-years" element={user && ['admin', 'bendahari', 'sub_bendahari', 'juruaudit', 'superadmin'].includes(user.role) ? <DashboardLayout><FinancialYearPage /></DashboardLayout> : <Navigate to="/login" />} />
           <Route path="/admin/accounting/agm-reports" element={user && ['admin', 'bendahari', 'sub_bendahari', 'juruaudit', 'superadmin'].includes(user.role) ? <DashboardLayout><AGMReportsPage /></DashboardLayout> : <Navigate to="/login" />} />
           <Route path="/admin/accounting/chart-of-accounts" element={user && ['admin', 'bendahari', 'sub_bendahari', 'juruaudit', 'superadmin'].includes(user.role) ? <DashboardLayout><ChartOfAccountsPage /></DashboardLayout> : <Navigate to="/login" />} />

@@ -8,6 +8,7 @@ import {
   MessageCircle, Facebook, AlertCircle, Star, Sparkles, Archive, Clock
 } from 'lucide-react';
 import api, { API_URL } from '../../../services/api';
+import { useCart } from '../../../context/CartContext';
 
 // ===================== GLASS COMPONENTS =====================
 
@@ -207,7 +208,9 @@ const MilestoneProgressBar = ({ campaign, compact = false }) => {
 
 // ===================== CAMPAIGN DETAIL VIEW =====================
 
-const CampaignDetailView = ({ campaign, onClose, onDonationSuccess }) => {
+const CampaignDetailView = ({ campaign, onClose }) => {
+  const navigate = useNavigate();
+  const { addToCart, fetchCart } = useCart();
   const [currentImageIndex, setCurrentImageIndex] = useState(0);
   const [showQR, setShowQR] = useState(false);
   const [copied, setCopied] = useState(false);
@@ -256,27 +259,49 @@ const CampaignDetailView = ({ campaign, onClose, onDonationSuccess }) => {
   };
 
   const handleDonate = async () => {
+    if (!campaign?.can_donate) return;
+
+    const amount = calculateAmount();
+    if (!Number.isFinite(amount) || amount <= 0) {
+      toast.error('Jumlah sumbangan tidak sah.');
+      return;
+    }
+
     setDonating(true);
     try {
-      const payload = {
-        campaign_id: campaign.id,
+      const metadata = {
+        amount,
         is_anonymous: form.is_anonymous,
         message: form.message,
-        payment_method: 'fpx'
+        campaign_type: campaign.campaign_type || 'amount'
       };
-      
+
       if (campaign.campaign_type === 'slot') {
-        payload.slots = form.slots;
-      } else {
-        payload.amount = form.amount;
+        metadata.slots = Math.max(1, Number(form.slots || 1));
       }
-      
-      const res = await api.post('/api/tabung/donate', payload);
-      setDonationSuccess(res.data);
-      toast.success('Sumbangan berjaya!');
-      onDonationSuccess?.();
+
+      const result = await addToCart('infaq', {
+        item_id: campaign.id,
+        quantity: 1,
+        metadata
+      });
+
+      if (!result?.success) {
+        toast.error(result?.error || 'Gagal menambah sumbangan ke troli.');
+        return;
+      }
+
+      await fetchCart();
+
+      setDonationSuccess({
+        added_to_cart: true,
+        campaign_title: campaign.title,
+        amount,
+        slots: metadata.slots || null
+      });
+      toast.success('Sumbangan ditambah ke troli berpusat.');
     } catch (err) {
-      toast.error(err.response?.data?.detail || 'Gagal membuat sumbangan');
+      toast.error(err.response?.data?.detail || 'Gagal menambah sumbangan ke troli');
     } finally {
       setDonating(false);
     }
@@ -373,8 +398,8 @@ const CampaignDetailView = ({ campaign, onClose, onDonationSuccess }) => {
             >
               <CheckCircle size={40} className="text-white" />
             </motion.div>
-            <h3 className="text-2xl font-bold text-slate-900 mb-2">Sumbangan Berjaya!</h3>
-            <p className="text-slate-600 mb-6">Terima kasih atas sumbangan anda</p>
+            <h3 className="text-2xl font-bold text-slate-900 mb-2">Ditambah ke Troli</h3>
+            <p className="text-slate-600 mb-6">Lengkapkan pembayaran di Pusat Bayaran untuk sahkan sumbangan.</p>
             
             <GlassCard className="p-4 mb-6 text-left space-y-3">
               <div className="flex justify-between">
@@ -392,17 +417,27 @@ const CampaignDetailView = ({ campaign, onClose, onDonationSuccess }) => {
                 </div>
               )}
               <div className="flex justify-between pt-3 border-t border-slate-200">
-                <span className="text-slate-600">No. Resit</span>
-                <span className="font-mono text-sm text-slate-900">{donationSuccess.receipt_number}</span>
+                <span className="text-slate-600">Status</span>
+                <span className="font-medium text-amber-600">Menunggu checkout</span>
               </div>
             </GlassCard>
             
             <div className="flex gap-3">
-              <Button variant="outline" onClick={onClose} className="flex-1">
-                Tutup
+              <Button
+                variant="outline"
+                onClick={() => setDonationSuccess(null)}
+                className="flex-1"
+              >
+                Tambah Lagi
               </Button>
-              <Button onClick={copyLink} className="flex-1">
-                <Share2 size={18} /> Kongsi
+              <Button
+                onClick={() => {
+                  onClose?.();
+                  navigate('/payment-center?tab=troli');
+                }}
+                className="flex-1"
+              >
+                <Wallet size={18} /> Pergi ke Troli
               </Button>
             </div>
           </div>
@@ -618,7 +653,7 @@ const CampaignDetailView = ({ campaign, onClose, onDonationSuccess }) => {
               >
                 {campaign.can_donate ? (
                   <>
-                    <Wallet size={20} /> Sahkan Sumbangan
+                    <Wallet size={20} /> Tambah ke Troli
                   </>
                 ) : (
                   <>
@@ -693,7 +728,6 @@ const CampaignDetailView = ({ campaign, onClose, onDonationSuccess }) => {
 // ===================== MAIN PAGE =====================
 
 export default function TabungPage() {
-  const navigate = useNavigate();
   const [campaigns, setCampaigns] = useState([]);
   const [myDonations, setMyDonations] = useState([]);
   const [loading, setLoading] = useState(true);
@@ -896,7 +930,7 @@ export default function TabungPage() {
                           variant="outline" 
                           size="md" 
                           className="flex-1"
-                          onClick={(e) => { e.stopPropagation(); navigate(`/donate/${campaign.id}`); }}
+                          onClick={(e) => { e.stopPropagation(); handleCampaignClick(campaign); }}
                           data-testid={`featured-detail-btn-${campaign.id}`}
                         >
                           Ketahui Lebih Lanjut
@@ -1062,7 +1096,7 @@ export default function TabungPage() {
                       variant="outline" 
                       size="md" 
                       className="flex-1"
-                      onClick={(e) => { e.stopPropagation(); navigate(`/donate/${campaign.id}`); }}
+                      onClick={(e) => { e.stopPropagation(); handleCampaignClick(campaign); }}
                       data-testid={`campaign-detail-btn-${campaign.id}`}
                     >
                       Ketahui Lebih Lanjut
@@ -1210,7 +1244,7 @@ export default function TabungPage() {
                       variant="outline" 
                       size="md" 
                       className="w-full border-slate-300 text-slate-600 hover:bg-slate-50"
-                      onClick={(e) => { e.stopPropagation(); navigate(`/donate/${campaign.id}`); }}
+                      onClick={(e) => { e.stopPropagation(); handleCampaignClick(campaign); }}
                     >
                       Lihat Rekod Kempen
                     </Button>
@@ -1287,7 +1321,6 @@ export default function TabungPage() {
             <CampaignDetailView
               campaign={selectedCampaign}
               onClose={() => setSelectedCampaign(null)}
-              onDonationSuccess={fetchData}
             />
           </>
         )}

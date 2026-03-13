@@ -90,6 +90,234 @@ const getItemLabel = (type) => {
   }
 };
 
+const YURAN_CART_TYPES = ['yuran', 'yuran_partial', 'yuran_installment', 'yuran_two_payment'];
+
+const isYuranCartType = (type) => YURAN_CART_TYPES.includes(type);
+
+const formatCurrencyRM = (value) => {
+  const amount = Number(value || 0);
+  return `RM ${amount.toLocaleString('ms-MY', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+};
+
+const normalizeYuranInvoiceStatus = (status) => {
+  const normalized = String(status || '').trim().toLowerCase();
+  if (['pending', 'partial', 'paid', 'overdue'].includes(normalized)) {
+    return normalized;
+  }
+  return '';
+};
+
+const getYuranInvoiceStatusMeta = (status) => {
+  const normalized = normalizeYuranInvoiceStatus(status);
+  switch (normalized) {
+    case 'paid':
+      return {
+        label: 'Selesai',
+        badgeTone: 'bg-emerald-50 text-emerald-700 border-emerald-200',
+        textTone: 'text-emerald-700'
+      };
+    case 'partial':
+      return {
+        label: 'Separa',
+        badgeTone: 'bg-violet-50 text-violet-700 border-violet-200',
+        textTone: 'text-violet-700'
+      };
+    case 'overdue':
+      return {
+        label: 'Lewat',
+        badgeTone: 'bg-rose-50 text-rose-700 border-rose-200',
+        textTone: 'text-rose-700'
+      };
+    case 'pending':
+      return {
+        label: 'Belum Bayar',
+        badgeTone: 'bg-amber-50 text-amber-700 border-amber-200',
+        textTone: 'text-amber-700'
+      };
+    default:
+      return null;
+  }
+};
+
+const getYuranDueMeta = (metadata = {}) => {
+  const dueRaw = metadata?.due_date;
+  if (!dueRaw) return null;
+
+  const parsedDate = new Date(dueRaw);
+  const dateLabel = Number.isNaN(parsedDate.getTime())
+    ? String(dueRaw)
+    : parsedDate.toLocaleDateString('ms-MY');
+
+  const daysCandidate = Number(metadata?.days_to_due);
+  const hasDays = Number.isFinite(daysCandidate);
+  const isOverdue = metadata?.is_overdue === true || (hasDays && daysCandidate < 0);
+  const isDueSoon = hasDays && daysCandidate >= 0 && daysCandidate <= 7;
+
+  let helperText = '';
+  if (isOverdue) {
+    helperText = 'Lewat';
+  } else if (hasDays) {
+    helperText = daysCandidate === 0 ? 'Hari ini' : `${daysCandidate} hari lagi`;
+  }
+
+  const badgeTone = isOverdue
+    ? 'bg-rose-50 text-rose-700 border-rose-200'
+    : isDueSoon
+      ? 'bg-amber-50 text-amber-700 border-amber-200'
+      : 'bg-sky-50 text-sky-700 border-sky-200';
+
+  const textTone = isOverdue
+    ? 'text-rose-700'
+    : isDueSoon
+      ? 'text-amber-700'
+      : 'text-slate-800';
+
+  return { dateLabel, helperText, badgeTone, textTone, isOverdue };
+};
+
+const getYuranInvoiceNumberLabel = (item) => {
+  const metadata = item?.metadata || {};
+  const explicit = String(
+    metadata?.invoice_number
+    || metadata?.invoice_number_label
+    || item?.invoice_number
+    || item?.invoice_number_label
+    || ''
+  ).trim();
+  if (explicit) return explicit;
+  const rawId = String(item?.item_id || item?.itemId || item?.yuran_id || '').replace(/[^a-zA-Z0-9]/g, '').toUpperCase();
+  if (rawId) return `INV-${rawId.slice(-8)}`;
+  return '';
+};
+
+const RECEIPT_YURAN_ITEM_TYPES = ['yuran', 'yuran_partial', 'yuran_installment', 'yuran_two_payment'];
+
+const isReceiptYuranItemType = (itemType) => RECEIPT_YURAN_ITEM_TYPES.includes(String(itemType || '').trim().toLowerCase());
+
+const getInvoiceLabelFromReceiptItem = (item) => {
+  const metadata = item?.metadata || {};
+  const explicit = String(
+    metadata?.invoice_number
+    || metadata?.invoice_number_label
+    || item?.invoice_number
+    || item?.invoice_number_label
+    || ''
+  ).trim();
+  if (explicit) return explicit;
+  if (!isReceiptYuranItemType(item?.item_type)) return '';
+  const rawId = String(item?.item_id || item?.yuran_id || '').replace(/[^a-zA-Z0-9]/g, '').toUpperCase();
+  if (rawId) return `INV-${rawId.slice(-8)}`;
+  return '';
+};
+
+const getReceiptInvoiceNumbers = (receipt) => {
+  const directNumbers = Array.isArray(receipt?.invoice_numbers)
+    ? receipt.invoice_numbers
+      .map((value) => String(value || '').trim())
+      .filter(Boolean)
+    : [];
+  if (directNumbers.length > 0) {
+    return [...new Set(directNumbers)];
+  }
+
+  const derived = (Array.isArray(receipt?.items) ? receipt.items : [])
+    .map((item) => getInvoiceLabelFromReceiptItem(item))
+    .filter(Boolean);
+  return [...new Set(derived)];
+};
+
+const getReceiptInvoiceSummary = (receipt, maxVisible = 2) => {
+  const labels = getReceiptInvoiceNumbers(receipt);
+  if (labels.length === 0) return '';
+  if (labels.length <= maxVisible) return labels.join(', ');
+  return `${labels.slice(0, maxVisible).join(', ')} +${labels.length - maxVisible} lagi`;
+};
+
+const getYuranOutstandingAmount = (item) => {
+  const metadata = item?.metadata || {};
+  const originalAmount = Number(metadata.original_amount);
+  const paidAmount = Number(metadata.paid_amount || 0);
+  if (Number.isFinite(originalAmount) && originalAmount > 0) {
+    return Math.max(originalAmount - (Number.isFinite(paidAmount) ? paidAmount : 0), 0);
+  }
+  return Number(item?.amount || 0) * Number(item?.quantity || 1);
+};
+
+const getYuranMiniSummaryBadges = (item) => {
+  const metadata = item?.metadata || {};
+  const badges = [];
+  const invoiceNumberLabel = getYuranInvoiceNumberLabel(item);
+  const invoiceStatusMeta = getYuranInvoiceStatusMeta(metadata.invoice_status);
+  const dueMeta = getYuranDueMeta(metadata);
+
+  if (metadata.student_name) {
+    badges.push({
+      label: 'Pelajar',
+      value: metadata.student_name,
+      tone: 'bg-slate-50 text-slate-700 border-slate-200'
+    });
+  }
+
+  if (metadata.tingkatan) {
+    badges.push({
+      label: 'Tingkatan',
+      value: `${metadata.tingkatan}`,
+      tone: 'bg-amber-50 text-amber-700 border-amber-200'
+    });
+  }
+
+  if (invoiceNumberLabel) {
+    badges.push({
+      label: 'Invois',
+      value: invoiceNumberLabel,
+      tone: 'bg-sky-50 text-sky-700 border-sky-200'
+    });
+  }
+
+  if (invoiceStatusMeta) {
+    badges.push({
+      label: 'Status',
+      value: invoiceStatusMeta.label,
+      tone: invoiceStatusMeta.badgeTone
+    });
+  }
+
+  if (dueMeta) {
+    badges.push({
+      label: dueMeta.isOverdue ? 'Lewat' : 'Akhir',
+      value: dueMeta.dateLabel,
+      tone: dueMeta.badgeTone
+    });
+  }
+
+  if ((item?.item_type === 'yuran_two_payment' || item?.item_type === 'yuran_installment') && metadata.payment_number && metadata.max_payments) {
+    badges.push({
+      label: 'Ansuran',
+      value: `${metadata.payment_number}/${metadata.max_payments}`,
+      tone: 'bg-violet-50 text-violet-700 border-violet-200'
+    });
+  }
+
+  if (item?.item_type === 'yuran_partial') {
+    const selectedCount = Array.isArray(metadata.selected_items) ? metadata.selected_items.length : 0;
+    if (selectedCount > 0) {
+      badges.push({
+        label: 'Item Dipilih',
+        value: `${selectedCount}`,
+        tone: 'bg-indigo-50 text-indigo-700 border-indigo-200'
+      });
+    }
+  }
+
+  badges.push({
+    label: 'Baki',
+    value: formatCurrencyRM(getYuranOutstandingAmount(item)),
+    tone: 'bg-emerald-50 text-emerald-700 border-emerald-200'
+  });
+
+  return badges;
+};
+
 // ============ PAYMENT SLIDER PANEL ============
 const PaymentSliderPanel = ({ 
   isOpen, 
@@ -796,10 +1024,12 @@ const PaymentSliderPanel = ({
 
 // ============ YURAN CARD COMPONENT ============
 const YuranCard = ({ yuran, onOpenPayment }) => {
-  const [expanded, setExpanded] = useState(false);
   const outstanding = yuran.amount || 0;
   const progressPercent = ((yuran.paid_amount || 0) / (yuran.original_amount || 1)) * 100;
   const colors = TINGKATAN_COLORS[yuran.tingkatan] || TINGKATAN_COLORS[1];
+  const invoiceNumberLabel = getYuranInvoiceNumberLabel(yuran);
+  const invoiceStatusMeta = getYuranInvoiceStatusMeta(yuran.invoice_status || yuran.status);
+  const dueMeta = getYuranDueMeta(yuran);
 
   return (
     <motion.div
@@ -861,6 +1091,26 @@ const YuranCard = ({ yuran, onOpenPayment }) => {
         <div className="flex items-center justify-between gap-4">
           <div className="flex-1">
             <p className="text-sm text-slate-500">{yuran.description}</p>
+            <div className="flex flex-wrap items-center gap-1.5 mt-2">
+              {invoiceNumberLabel && (
+                <span className="inline-flex items-center gap-1 px-2 py-1 rounded-lg border text-[11px] leading-none bg-sky-50 text-sky-700 border-sky-200">
+                  <span className="font-semibold">Invois</span>
+                  <span>{invoiceNumberLabel}</span>
+                </span>
+              )}
+              {invoiceStatusMeta && (
+                <span className={`inline-flex items-center gap-1 px-2 py-1 rounded-lg border text-[11px] leading-none ${invoiceStatusMeta.badgeTone}`}>
+                  <span className="font-semibold">Status</span>
+                  <span>{invoiceStatusMeta.label}</span>
+                </span>
+              )}
+              {dueMeta && (
+                <span className={`inline-flex items-center gap-1 px-2 py-1 rounded-lg border text-[11px] leading-none ${dueMeta.badgeTone}`}>
+                  <span className="font-semibold">{dueMeta.isOverdue ? 'Lewat' : 'Akhir'}</span>
+                  <span>{dueMeta.dateLabel}</span>
+                </span>
+              )}
+            </div>
             <div className="flex items-center gap-4 mt-2 text-sm">
               <span className="text-emerald-600">
                 Dibayar: RM {(yuran.paid_amount || 0).toFixed(2)}
@@ -940,7 +1190,7 @@ const PaymentCenterPage = () => {
   const [selectedReceipt, setSelectedReceipt] = useState(null);
   const [showReceiptModal, setShowReceiptModal] = useState(false);
   
-  // Infaq amount/slots input
+  // Tabung/sumbangan amount/slots input
   const [infaqInputs, setInfaqInputs] = useState({});
 
   const authContext = useAuth();
@@ -1272,6 +1522,7 @@ const PaymentCenterPage = () => {
 
   // Calculate totals
   const totalOutstanding = (pendingItems.yuran || []).reduce((sum, y) => sum + (y.amount || 0), 0);
+  const selectedReceiptInvoiceNumbers = getReceiptInvoiceNumbers(selectedReceipt);
 
   return (
     <div className="min-h-screen bg-gradient-to-br from-slate-50 via-pastel-mint/20 to-pastel-lavender/20" data-testid="payment-center-page">
@@ -1316,7 +1567,7 @@ const PaymentCenterPage = () => {
             {[
               { id: 'yuran', label: 'Yuran Saya', icon: GraduationCap, count: pendingItems.yuran?.length || 0, color: 'amber' },
               { id: 'two_payments', label: '2 Bayaran', icon: CalendarClock, count: pendingItems.two_payments?.length || 0, color: 'purple' },
-              { id: 'infaq', label: 'Tabung', icon: Heart, count: pendingItems.infaq?.length || 0, color: 'pink' },
+              { id: 'infaq', label: 'Tabung & Sumbangan', icon: Heart, count: pendingItems.infaq?.length || 0, color: 'pink' },
               { id: 'receipts', label: 'Resit', icon: Receipt, count: receipts.length, color: 'slate' },
               { id: 'cart', label: 'Troli', icon: ShoppingCart, count: cart.item_count, color: 'indigo' }
             ].map(tab => (
@@ -1414,7 +1665,7 @@ const PaymentCenterPage = () => {
                         <ShoppingBag className="text-slate-400" size={40} />
                       </div>
                       <h3 className="text-lg font-semibold text-slate-700 mb-2">Troli Kosong</h3>
-                      <p className="text-slate-500 mb-6">Pilih item dari tab Yuran Saya atau Tabung</p>
+                      <p className="text-slate-500 mb-6">Pilih item dari tab Yuran Saya atau Tabung & Sumbangan</p>
                       <Button variant="outline" onClick={() => setActiveTab('yuran')}>
                         Lihat Yuran Tertunggak
                       </Button>
@@ -1440,23 +1691,22 @@ const PaymentCenterPage = () => {
                                     {getItemLabel(item.item_type)}
                                   </span>
                                   <h4 className="font-bold text-slate-800 mt-1">{item.name}</h4>
-                                  
-                                  {/* For yuran_partial, show items as listing */}
-                                  {item.item_type === 'yuran_partial' && item.metadata?.selected_items ? (
-                                    <div className="mt-2 space-y-1">
-                                      <p className="text-xs font-medium text-slate-600">Senarai Bayaran:</p>
-                                      <ul className="text-sm text-slate-600 space-y-0.5">
-                                        {item.metadata.selected_items.map((subItem, idx) => (
-                                          <li key={idx} className="flex items-center gap-2">
-                                            <span className="w-1.5 h-1.5 bg-amber-500 rounded-full flex-shrink-0"></span>
-                                            <span>{subItem.name}</span>
-                                            <span className="text-slate-400 ml-auto text-xs">RM {subItem.amount?.toFixed(2)}</span>
-                                          </li>
-                                        ))}
-                                      </ul>
-                                    </div>
-                                  ) : item.description && (
+                                  {item.description && (
                                     <p className="text-sm text-slate-500 mt-1">{item.description}</p>
+                                  )}
+                                  {isYuranCartType(item.item_type) && (
+                                    <div className="mt-2 flex flex-wrap gap-1.5">
+                                      {getYuranMiniSummaryBadges(item).map((badge, idx) => (
+                                        <span
+                                          key={`${item.cart_item_id || item.item_id}-mini-${idx}`}
+                                          className={`inline-flex items-center gap-1 px-2 py-1 rounded-lg border text-[11px] leading-none ${badge.tone}`}
+                                          title={`${badge.label}: ${badge.value}`}
+                                        >
+                                          <span className="font-semibold">{badge.label}</span>
+                                          <span className="max-w-[160px] truncate">{badge.value}</span>
+                                        </span>
+                                      ))}
+                                    </div>
                                   )}
                                 </div>
                                 <button
@@ -1467,6 +1717,103 @@ const PaymentCenterPage = () => {
                                   <Trash2 size={18} />
                                 </button>
                               </div>
+
+                              {(() => {
+                                const detailKey = item.cart_item_id || `${item.item_type}-${item.item_id}`;
+                                const metadata = item.metadata || {};
+                                const selectedYuranItems = Array.isArray(metadata.selected_items) ? metadata.selected_items : [];
+                                if (!isYuranCartType(item.item_type)) return null;
+
+                                const showDetails = Boolean(expandedYuran[detailKey]);
+                                const originalAmount = Number(metadata.original_amount ?? 0);
+                                const paidAmount = Number(metadata.paid_amount ?? 0);
+                                const outstandingAmount = getYuranOutstandingAmount(item);
+                                const paymentNumber = Number(metadata.payment_number || 0);
+                                const maxPayments = Number(metadata.max_payments || 0);
+                                const invoiceNumberLabel = getYuranInvoiceNumberLabel(item);
+                                const invoiceStatusMeta = getYuranInvoiceStatusMeta(metadata.invoice_status);
+                                const dueMeta = getYuranDueMeta(metadata);
+
+                                return (
+                                  <div className="mt-3 rounded-xl border border-amber-200 bg-white/80">
+                                    <button
+                                      type="button"
+                                      onClick={() => {
+                                        setExpandedYuran((prev) => ({ ...prev, [detailKey]: !prev[detailKey] }));
+                                      }}
+                                      className="w-full px-3 py-2 text-xs font-semibold text-amber-700 flex items-center justify-between hover:bg-amber-50 rounded-xl transition-colors"
+                                      data-testid={`toggle-yuran-detail-${detailKey}`}
+                                    >
+                                      <span>Maklumat Bayaran Terperinci</span>
+                                      {showDetails ? <ChevronUp size={14} /> : <ChevronDown size={14} />}
+                                    </button>
+
+                                    {showDetails && (
+                                      <div className="px-3 pb-3 pt-1 space-y-2 text-xs">
+                                        <div className="grid grid-cols-2 gap-2 text-slate-600">
+                                          <p>Nama Pelajar</p>
+                                          <p className="font-medium text-slate-800 text-right">{metadata.student_name || '-'}</p>
+                                          <p>Tingkatan</p>
+                                          <p className="font-medium text-slate-800 text-right">
+                                            {metadata.tingkatan ? `Tingkatan ${metadata.tingkatan}` : '-'}
+                                          </p>
+                                          <p>No. Invois</p>
+                                          <p className="font-medium text-slate-800 text-right">{invoiceNumberLabel || '-'}</p>
+                                          {invoiceStatusMeta && (
+                                            <>
+                                              <p>Status Bil</p>
+                                              <p className={`font-medium text-right ${invoiceStatusMeta.textTone}`}>
+                                                {invoiceStatusMeta.label}
+                                              </p>
+                                            </>
+                                          )}
+                                          {dueMeta && (
+                                            <>
+                                              <p>Tarikh Akhir</p>
+                                              <p className={`font-medium text-right ${dueMeta.textTone}`}>
+                                                {dueMeta.dateLabel}{dueMeta.helperText ? ` (${dueMeta.helperText})` : ''}
+                                              </p>
+                                            </>
+                                          )}
+                                          {(item.item_type === 'yuran_two_payment' || item.item_type === 'yuran_installment') && (
+                                            <>
+                                              <p>Ansuran Semasa</p>
+                                              <p className="font-medium text-slate-800 text-right">
+                                                {paymentNumber > 0 && maxPayments > 0 ? `Bayaran ${paymentNumber}/${maxPayments}` : '-'}
+                                              </p>
+                                            </>
+                                          )}
+                                          {originalAmount > 0 && (
+                                            <>
+                                              <p>Jumlah Asal</p>
+                                              <p className="font-medium text-slate-800 text-right">{formatCurrencyRM(originalAmount)}</p>
+                                              <p>Sudah Dibayar</p>
+                                              <p className="font-medium text-slate-800 text-right">{formatCurrencyRM(paidAmount)}</p>
+                                            </>
+                                          )}
+                                          <p>Baki Semasa</p>
+                                          <p className="font-semibold text-emerald-700 text-right">{formatCurrencyRM(outstandingAmount)}</p>
+                                        </div>
+
+                                        {selectedYuranItems.length > 0 && (
+                                          <div className="border-t border-amber-100 pt-2">
+                                            <p className="text-[11px] font-semibold text-slate-700 mb-1.5">Butiran Item Dipilih</p>
+                                            <div className="space-y-1">
+                                              {selectedYuranItems.map((subItem, idx) => (
+                                                <div key={`${detailKey}-item-${idx}`} className="flex items-center gap-2 text-[11px]">
+                                                  <span className="w-1.5 h-1.5 bg-amber-500 rounded-full flex-shrink-0" />
+                                                  <span className="text-slate-700 truncate">{subItem.name || subItem.code || `Item ${idx + 1}`}</span>
+                                                  <span className="text-slate-500 ml-auto">{formatCurrencyRM(subItem.amount || 0)}</span>
+                                                </div>
+                                              ))}
+                                            </div>
+                                          </div>
+                                        )}
+                                      </div>
+                                    )}
+                                  </div>
+                                );
+                              })()}
                               
                               <div className="flex items-center justify-between mt-3">
                                 {['koperasi', 'bus'].includes(item.item_type) ? (
@@ -1487,8 +1834,8 @@ const PaymentCenterPage = () => {
                                   </div>
                                 ) : (
                                   <span className="text-sm text-slate-500">
-                                    {item.item_type === 'yuran_partial' 
-                                      ? `${item.metadata?.selected_items?.length || 0} item dipilih`
+                                    {item.item_type === 'yuran_partial'
+                                      ? `${(item.metadata?.selected_items || []).length} item dipilih`
                                       : 'Kuantiti: 1'
                                     }
                                   </span>
@@ -1605,6 +1952,9 @@ const PaymentCenterPage = () => {
                       const nextNum = plan.next_payment_number || 1;
                       const nextAmt = plan.next_payment_amount ?? item.balance;
                       const progress = ((plan.payments_made || 0) / (plan.max_payments || 2)) * 100;
+                      const invoiceNumberLabel = getYuranInvoiceNumberLabel(item);
+                      const invoiceStatusMeta = getYuranInvoiceStatusMeta(item.invoice_status || item.status);
+                      const dueMeta = getYuranDueMeta(item);
 
                       return (
                         <motion.div
@@ -1622,6 +1972,27 @@ const PaymentCenterPage = () => {
                             <span className="px-3 py-1 rounded-full text-xs font-bold bg-violet-500 text-white">
                               Bayaran {nextNum}/2
                             </span>
+                          </div>
+
+                          <div className="flex flex-wrap gap-1.5 mb-3">
+                            {invoiceNumberLabel && (
+                              <span className="inline-flex items-center gap-1 px-2 py-1 rounded-lg border text-[11px] leading-none bg-sky-50 text-sky-700 border-sky-200">
+                                <span className="font-semibold">Invois</span>
+                                <span>{invoiceNumberLabel}</span>
+                              </span>
+                            )}
+                            {invoiceStatusMeta && (
+                              <span className={`inline-flex items-center gap-1 px-2 py-1 rounded-lg border text-[11px] leading-none ${invoiceStatusMeta.badgeTone}`}>
+                                <span className="font-semibold">Status</span>
+                                <span>{invoiceStatusMeta.label}</span>
+                              </span>
+                            )}
+                            {dueMeta && (
+                              <span className={`inline-flex items-center gap-1 px-2 py-1 rounded-lg border text-[11px] leading-none ${dueMeta.badgeTone}`}>
+                                <span className="font-semibold">{dueMeta.isOverdue ? 'Lewat' : 'Akhir'}</span>
+                                <span>{dueMeta.dateLabel}</span>
+                              </span>
+                            )}
                           </div>
 
                           <div className="space-y-2 mb-4">
@@ -1680,7 +2051,7 @@ const PaymentCenterPage = () => {
                   <Heart className="text-pink-500" size={22} />
                   Tabung & Sumbangan
                 </h2>
-                <p className="text-sm text-slate-500 mb-6">Kempen infaq dan sumbangan aktif</p>
+                <p className="text-sm text-slate-500 mb-6">Kempen tabung dan sumbangan aktif</p>
 
                 {(pendingItems.infaq?.length || 0) === 0 ? (
                   <div className="text-center py-12">
@@ -1807,8 +2178,8 @@ const PaymentCenterPage = () => {
                           >
                             <Heart size={16} /> 
                             {isSlot 
-                              ? `Infaq ${infaqInputs[campaign.item_id]?.slots || 1} Slot (RM ${((infaqInputs[campaign.item_id]?.slots || 1) * campaign.price_per_slot).toFixed(2)})`
-                              : `Infaq RM ${infaqInputs[campaign.item_id]?.amount || 10}`
+                              ? `Tabung ${infaqInputs[campaign.item_id]?.slots || 1} Slot (RM ${((infaqInputs[campaign.item_id]?.slots || 1) * campaign.price_per_slot).toFixed(2)})`
+                              : `Sumbangan RM ${infaqInputs[campaign.item_id]?.amount || 10}`
                             }
                           </Button>
                         </motion.div>
@@ -1844,59 +2215,67 @@ const PaymentCenterPage = () => {
                   </div>
                 ) : (
                   <div className="space-y-3">
-                    {receipts.map((receipt, index) => (
-                      <motion.div
-                        key={receipt.receipt_id}
-                        initial={{ opacity: 0, x: -20 }}
-                        animate={{ opacity: 1, x: 0 }}
-                        transition={{ delay: index * 0.05 }}
-                        className="flex items-center justify-between p-4 bg-slate-50 rounded-xl hover:bg-slate-100 transition-colors"
-                      >
-                        <div className="flex items-center gap-4">
-                          <div className="w-12 h-12 bg-pastel-mint rounded-xl flex items-center justify-center">
-                            <Receipt className="text-teal-600" size={20} />
+                    {receipts.map((receipt, index) => {
+                      const receiptInvoiceSummary = getReceiptInvoiceSummary(receipt);
+                      return (
+                        <motion.div
+                          key={receipt.receipt_id}
+                          initial={{ opacity: 0, x: -20 }}
+                          animate={{ opacity: 1, x: 0 }}
+                          transition={{ delay: index * 0.05 }}
+                          className="flex items-center justify-between p-4 bg-slate-50 rounded-xl hover:bg-slate-100 transition-colors"
+                        >
+                          <div className="flex items-center gap-4">
+                            <div className="w-12 h-12 bg-pastel-mint rounded-xl flex items-center justify-center">
+                              <Receipt className="text-teal-600" size={20} />
+                            </div>
+                            <div>
+                              <p className="font-bold text-slate-800">{receipt.receipt_number}</p>
+                              <p className="text-sm text-slate-500">
+                                {new Date(receipt.payment_date).toLocaleDateString('ms-MY', {
+                                  year: 'numeric',
+                                  month: 'short',
+                                  day: 'numeric'
+                                })}
+                                {' • '}
+                                {receipt.item_count} item
+                              </p>
+                              {receiptInvoiceSummary && (
+                                <p className="text-xs text-sky-700 mt-0.5">
+                                  No. Invois: {receiptInvoiceSummary}
+                                </p>
+                              )}
+                            </div>
                           </div>
-                          <div>
-                            <p className="font-bold text-slate-800">{receipt.receipt_number}</p>
-                            <p className="text-sm text-slate-500">
-                              {new Date(receipt.payment_date).toLocaleDateString('ms-MY', {
-                                year: 'numeric',
-                                month: 'short',
-                                day: 'numeric'
-                              })}
-                              {' • '}
-                              {receipt.item_count} item
-                            </p>
+                          <div className="flex items-center gap-4">
+                            <div className="text-right">
+                              <p className="font-bold text-teal-600 text-lg">RM {receipt.total_amount.toFixed(2)}</p>
+                              <p className={`text-xs font-semibold ${
+                                receipt.status === 'completed' ? 'text-emerald-600' : 'text-amber-600'
+                              }`}>
+                                {receipt.status === 'completed' ? 'Selesai' : receipt.status}
+                              </p>
+                            </div>
+                            <div className="flex gap-2">
+                              <button
+                                onClick={() => viewReceipt(receipt.receipt_id)}
+                                className="p-2 text-slate-500 hover:text-teal-600 hover:bg-pastel-mint/50 rounded-lg transition-colors"
+                                data-testid={`view-receipt-${receipt.receipt_id}`}
+                              >
+                                <Eye size={18} />
+                              </button>
+                              <button
+                                onClick={() => downloadReceiptPdf(receipt.receipt_id, receipt.receipt_number)}
+                                className="p-2 text-slate-500 hover:text-teal-600 hover:bg-pastel-mint/50 rounded-lg transition-colors"
+                                data-testid={`download-receipt-${receipt.receipt_id}`}
+                              >
+                                <Download size={18} />
+                              </button>
+                            </div>
                           </div>
-                        </div>
-                        <div className="flex items-center gap-4">
-                          <div className="text-right">
-                            <p className="font-bold text-teal-600 text-lg">RM {receipt.total_amount.toFixed(2)}</p>
-                            <p className={`text-xs font-semibold ${
-                              receipt.status === 'completed' ? 'text-emerald-600' : 'text-amber-600'
-                            }`}>
-                              {receipt.status === 'completed' ? 'Selesai' : receipt.status}
-                            </p>
-                          </div>
-                          <div className="flex gap-2">
-                            <button
-                              onClick={() => viewReceipt(receipt.receipt_id)}
-                              className="p-2 text-slate-500 hover:text-teal-600 hover:bg-pastel-mint/50 rounded-lg transition-colors"
-                              data-testid={`view-receipt-${receipt.receipt_id}`}
-                            >
-                              <Eye size={18} />
-                            </button>
-                            <button
-                              onClick={() => downloadReceiptPdf(receipt.receipt_id, receipt.receipt_number)}
-                              className="p-2 text-slate-500 hover:text-teal-600 hover:bg-pastel-mint/50 rounded-lg transition-colors"
-                              data-testid={`download-receipt-${receipt.receipt_id}`}
-                            >
-                              <Download size={18} />
-                            </button>
-                          </div>
-                        </div>
-                      </motion.div>
-                    ))}
+                        </motion.div>
+                      );
+                    })}
                   </div>
                 )}
               </Card>
@@ -1978,6 +2357,12 @@ const PaymentCenterPage = () => {
                     <span className="inline-block px-2 py-0.5 bg-emerald-100 text-emerald-700 rounded-full text-xs font-bold">
                       Selesai
                     </span>
+                  </div>
+                  <div className="col-span-2">
+                    <p className="text-xs text-slate-500 uppercase tracking-wide">No. Invois</p>
+                    <p className="font-semibold text-slate-800">
+                      {selectedReceiptInvoiceNumbers.length > 0 ? selectedReceiptInvoiceNumbers.join(', ') : '-'}
+                    </p>
                   </div>
                 </div>
 

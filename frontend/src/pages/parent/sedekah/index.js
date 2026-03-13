@@ -1,1 +1,1 @@
-export { SedekahPage } from './SedekahPage';
+export { SedekahPage, default } from './SedekahPage';

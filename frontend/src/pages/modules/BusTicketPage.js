@@ -6,11 +6,13 @@ import {
   Bus, Ticket, Calendar, Clock, MapPinned, ArrowRight, X, Check, AlertCircle, FileCheck, Plus, Map
 } from 'lucide-react';
 import api, { API_URL } from '../../services/api';
+import { useCart } from '../../context/CartContext';
 import { Spinner, Button, Card } from '../../components/common';
 import { CARA_PULANG_OPTIONS, CARA_PULANG_NEEDS_PLATE, CARA_PULANG_NEEDS_REMARKS } from '../../constants/hostel';
 
 const BusTicketPage = () => {
   const navigate = useNavigate();
+  const { addToCart, fetchCart } = useCart();
   const [trips, setTrips] = useState([]);
   const [children, setChildren] = useState([]);
   const [bookings, setBookings] = useState([]);
@@ -132,16 +134,38 @@ const BusTicketPage = () => {
 
     setProcessing(true);
     try {
-      await api.post('/api/bus/bookings', {
-        trip_id: selectedTrip.id,
-        student_id: selectedChild,
-        drop_off_point: selectedDropOff
+      const selectedStudentData = children.find((child) => child.id === selectedChild);
+      const selectedDropOffData = selectedTrip?.drop_off_points?.find((point) => point.location === selectedDropOff);
+
+      if (!selectedStudentData || !selectedDropOffData) {
+        toast.error('Maklumat tiket tidak lengkap. Sila semak semula pilihan.');
+        return;
+      }
+
+      const result = await addToCart('bus', {
+        item_id: selectedTrip.id,
+        quantity: 1,
+        metadata: {
+          student_id: selectedChild,
+          student_name: selectedStudentData.full_name,
+          drop_off_point: selectedDropOff,
+          amount: Number(selectedDropOffData.price || 0),
+          leave_id: leaveCheckResult?.leave_id || null,
+          pulang_bermalam_id: leaveCheckResult?.leave_id || null,
+        }
       });
-      toast.success('Tempahan berjaya! Menunggu pengesahan.');
+
+      if (!result?.success) {
+        toast.error(result?.error || 'Gagal menambah tiket ke troli.');
+        return;
+      }
+
+      await fetchCart();
       setShowBookingPanel(false);
-      fetchData();
+      toast.success('Tiket bas ditambah ke troli berpusat.');
+      navigate('/payment-center?tab=troli');
     } catch (err) {
-      toast.error(err.response?.data?.detail || 'Gagal membuat tempahan');
+      toast.error(err.response?.data?.detail || 'Gagal menambah tiket ke troli');
     } finally {
       setProcessing(false);
     }
@@ -672,7 +696,7 @@ const BusTicketPage = () => {
                     disabled={!selectedChild || !selectedDropOff || children.length === 0 || (busSettings.require_leave_approval && leaveCheckResult && !leaveCheckResult.can_book)}
                   >
                     <Ticket size={18} className="mr-2" />
-                    Tempah Tiket
+                    Tambah ke Troli
                   </Button>
                 </div>
               </div>

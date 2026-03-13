@@ -385,7 +385,7 @@ const CategoryManager = () => {
                   name="name"
                   value={formData.name}
                   onChange={handleInputChange}
-                  placeholder="Cth: Derma & Infaq"
+                  placeholder="Cth: Derma & Tabung"
                   className="w-full px-4 py-2 border border-gray-200 rounded-lg focus:ring-2 focus:ring-blue-500"
                   data-testid="category-name-input"
                 />

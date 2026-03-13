@@ -1,5 +1,4 @@
 // Accounting Module Exports
-export { default as AccountingDashboardPage } from './AccountingDashboardPage';
 export { default as AccountingDashboard } from './AccountingDashboard';
 export { default as TransactionList } from './TransactionList';
 export { default as TransactionForm } from './TransactionForm';
@@ -13,3 +12,4 @@ export { default as FinancialYearPage } from './FinancialYearPage';
 export { default as AGMReportsPage } from './AGMReportsPage';
 export { default as ChartOfAccountsPage } from './ChartOfAccountsPage';
 export { default as ManualPerakaunanPage } from './ManualPerakaunanPage';
+export { default as BankReconciliationPage } from './BankReconciliationPage';

@@ -171,8 +171,8 @@ export const AdminInfaqPage = () => {
     <div className="space-y-6 min-w-0 overflow-x-hidden" data-testid="admin-infaq-page">
       <div className="flex items-center justify-between">
         <div>
-          <h1 className="text-2xl font-bold text-primary-900 font-heading">Pengurusan Infaq Slot</h1>
-          <p className="text-slate-600 mt-1">Urus kempen infaq dan lihat sumbangan</p>
+          <h1 className="text-2xl font-bold text-primary-900 font-heading">Pengurusan Tabung Slot</h1>
+          <p className="text-slate-600 mt-1">Urus kempen tabung slot dan lihat sumbangan</p>
         </div>
         <Button onClick={openAddPanel} data-testid="add-infaq-campaign-btn">
           <Plus size={18} /> Kempen Baru
@@ -324,7 +324,7 @@ export const AdminInfaqPage = () => {
                   label="Nama Kempen *"
                   value={campaignForm.title}
                   onChange={(e) => setCampaignForm({...campaignForm, title: e.target.value})}
-                  placeholder="cth: Infaq Pembangunan Surau"
+                  placeholder="cth: Tabung Pembangunan Surau"
                   data-testid="campaign-title"
                 />
                 

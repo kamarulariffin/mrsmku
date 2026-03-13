@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import { useNavigate } from 'react-router-dom';
 import {
+  AlertTriangle,
   Calculator,
   Plus,
   TrendingUp,
@@ -21,7 +22,8 @@ import {
   BookOpen,
   Clock,
   Database,
-  HelpCircle
+  HelpCircle,
+  SearchCheck
 } from 'lucide-react';
 import { API_URL } from '../../../services/api';
 
@@ -53,6 +55,14 @@ const AccountingDashboard = () => {
   const [error, setError] = useState('');
   const [migrateLoading, setMigrateLoading] = useState(false);
   const [migrateResult, setMigrateResult] = useState(null);
+  const [reconOverview, setReconOverview] = useState({
+    total_statements: 0,
+    in_progress: 0,
+    ready_for_approval: 0,
+    approved: 0,
+    unresolved_items: 0,
+    difference_alert_count: 0,
+  });
 
   const getAuthHeader = useCallback(() => {
     const token = localStorage.getItem('token');
@@ -92,6 +102,51 @@ const AccountingDashboard = () => {
       if (txRes.ok) {
         const txData = await txRes.json();
         setRecentTransactions(txData.transactions || []);
+      }
+
+      // Fetch bank reconciliation overview for checklist/anomaly panel
+      const reconRes = await fetch(
+        `${API_URL}/api/accounting-full/bank-reconciliation/statements?page=1&limit=200`,
+        { headers }
+      );
+      if (reconRes.ok) {
+        const reconData = await reconRes.json();
+        const rows = reconData?.statements || [];
+        const nextOverview = rows.reduce(
+          (acc, row) => {
+            acc.total_statements += 1;
+            if (row.status === 'ready_for_approval') {
+              acc.ready_for_approval += 1;
+            } else if (row.status === 'approved') {
+              acc.approved += 1;
+            } else {
+              acc.in_progress += 1;
+            }
+            acc.unresolved_items += Number(row.summary?.unresolved_items || 0);
+            if (Math.abs(Number(row.summary?.difference || 0)) > 0.01) {
+              acc.difference_alert_count += 1;
+            }
+            return acc;
+          },
+          {
+            total_statements: 0,
+            in_progress: 0,
+            ready_for_approval: 0,
+            approved: 0,
+            unresolved_items: 0,
+            difference_alert_count: 0,
+          }
+        );
+        setReconOverview(nextOverview);
+      } else {
+        setReconOverview({
+          total_statements: 0,
+          in_progress: 0,
+          ready_for_approval: 0,
+          approved: 0,
+          unresolved_items: 0,
+          difference_alert_count: 0,
+        });
       }
 
     } catch (err) {
@@ -153,6 +208,74 @@ const AccountingDashboard = () => {
       setMigrateLoading(false);
     }
   };
+
+  const checklistItems = [
+    {
+      id: 'pending_verification',
+      title: 'Semak transaksi pending verification',
+      done: Number(stats?.pending_verification || 0) === 0,
+      detail:
+        Number(stats?.pending_verification || 0) === 0
+          ? 'Tiada transaksi pending verification.'
+          : `${stats?.pending_verification || 0} transaksi perlu disahkan.`,
+      route: '/admin/accounting/verification',
+    },
+    {
+      id: 'recon_unresolved',
+      title: 'Selesaikan unresolved item bank reconciliation',
+      done: Number(reconOverview.unresolved_items || 0) === 0,
+      detail:
+        Number(reconOverview.unresolved_items || 0) === 0
+          ? 'Tiada unresolved item.'
+          : `${reconOverview.unresolved_items} unresolved item masih belum selesai.`,
+      route: '/admin/accounting/bank-reconciliation',
+    },
+    {
+      id: 'recon_ready',
+      title: 'Kosongkan queue ready for approval',
+      done: Number(reconOverview.ready_for_approval || 0) === 0,
+      detail:
+        Number(reconOverview.ready_for_approval || 0) === 0
+          ? 'Tiada statement menunggu kelulusan.'
+          : `${reconOverview.ready_for_approval} statement menunggu kelulusan.`,
+      route: '/admin/accounting/bank-reconciliation',
+    },
+    {
+      id: 'difference_alert',
+      title: 'Pastikan semua difference alert disiasat',
+      done: Number(reconOverview.difference_alert_count || 0) === 0,
+      detail:
+        Number(reconOverview.difference_alert_count || 0) === 0
+          ? 'Tiada difference alert aktif.'
+          : `${reconOverview.difference_alert_count} statement dengan difference bukan 0.00.`,
+      route: '/admin/accounting/bank-reconciliation',
+    },
+  ];
+
+  const anomalySignals = [];
+  if (Number(stats?.pending_verification || 0) > 20) {
+    anomalySignals.push(
+      `Pending verification tinggi (${stats?.pending_verification || 0}). Risiko backlog kawalan dalaman meningkat.`
+    );
+  }
+  if (Number(reconOverview.unresolved_items || 0) > 0 && Number(reconOverview.ready_for_approval || 0) > 0) {
+    anomalySignals.push(
+      'Terdapat statement ready for approval tetapi unresolved item masih wujud. Semak konsistensi status.'
+    );
+  }
+  if (Number(reconOverview.difference_alert_count || 0) > 0) {
+    anomalySignals.push(
+      `${reconOverview.difference_alert_count} difference alert dikesan dalam bank reconciliation.`
+    );
+  }
+  if (Number(stats?.all_time?.balance || 0) < 0) {
+    anomalySignals.push('Baki keseluruhan negatif. Siasat segera untuk elak isu kecairan tunai.');
+  }
+  if (Number(stats?.current_month?.expense || 0) > Number(stats?.current_month?.income || 0) * 1.5) {
+    anomalySignals.push(
+      'Perbelanjaan bulan ini jauh lebih tinggi daripada pendapatan. Semak justifikasi transaksi dan cashflow.'
+    );
+  }
 
   return (
     <div className="min-h-screen bg-gradient-to-br from-slate-50 to-blue-50 p-4 md:p-6 min-w-0 overflow-x-hidden" data-testid="accounting-dashboard">
@@ -268,6 +391,71 @@ const AccountingDashboard = () => {
               <Clock className="w-6 h-6 text-amber-600" />
             </div>
           </div>
+        </div>
+      </div>
+
+      <div className="grid grid-cols-1 xl:grid-cols-2 gap-6 mb-6">
+        <div className="bg-white rounded-xl p-5 shadow-sm border border-gray-100">
+          <div className="flex items-center justify-between gap-2 mb-3">
+            <h3 className="font-semibold text-gray-800">Checklist Prioriti Bendahari/Sub Bendahari</h3>
+            <button
+              onClick={() => navigate('/admin/manual-bendahari#checklist-priority')}
+              className="text-xs text-blue-600 hover:underline"
+            >
+              Buka Panduan
+            </button>
+          </div>
+          <div className="space-y-2">
+            {checklistItems.map((item) => (
+              <button
+                key={item.id}
+                onClick={() => navigate(item.route)}
+                className={`w-full text-left rounded-lg border p-3 transition ${
+                  item.done
+                    ? 'bg-emerald-50 border-emerald-200 hover:bg-emerald-100'
+                    : 'bg-amber-50 border-amber-200 hover:bg-amber-100'
+                }`}
+              >
+                <div className="flex items-start gap-2">
+                  {item.done ? (
+                    <CheckCircle className="w-4 h-4 mt-0.5 text-emerald-600" />
+                  ) : (
+                    <Clock className="w-4 h-4 mt-0.5 text-amber-600" />
+                  )}
+                  <div>
+                    <p className="text-sm font-medium text-gray-800">{item.title}</p>
+                    <p className="text-xs text-gray-600 mt-0.5">{item.detail}</p>
+                  </div>
+                </div>
+              </button>
+            ))}
+          </div>
+        </div>
+
+        <div className="bg-white rounded-xl p-5 shadow-sm border border-gray-100">
+          <h3 className="font-semibold text-gray-800 mb-3">Pengesan Perkara Pelik / Ralat Accounting</h3>
+          {anomalySignals.length === 0 ? (
+            <div className="rounded-lg border border-emerald-200 bg-emerald-50 p-3 text-sm text-emerald-800">
+              Tiada anomali kritikal dikesan untuk operasi semasa.
+            </div>
+          ) : (
+            <div className="space-y-2">
+              {anomalySignals.map((signal, idx) => (
+                <div
+                  key={`${signal}-${idx}`}
+                  className="rounded-lg border border-amber-200 bg-amber-50 p-3"
+                >
+                  <div className="flex items-start gap-2">
+                    <AlertTriangle className="w-4 h-4 mt-0.5 text-amber-600" />
+                    <p className="text-sm text-amber-800">{signal}</p>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+          <p className="text-xs text-gray-500 mt-3">
+            Panel ini bantu kesan awal penyimpangan flow supaya tindakan pembetulan boleh dibuat sebelum audit.
+          </p>
         </div>
       </div>
 
@@ -411,28 +599,20 @@ const AccountingDashboard = () => {
           <h3 className="font-semibold text-gray-800 mb-4">Menu Perakaunan</h3>
           <div className="grid grid-cols-2 gap-3">
             <button
+              onClick={() => navigate('/admin/accounting/bank-reconciliation')}
+              className="p-4 bg-emerald-50 rounded-lg hover:bg-emerald-100 transition-colors text-center col-span-2 border border-emerald-200"
+              data-testid="menu-bank-reconciliation"
+            >
+              <SearchCheck className="w-6 h-6 mx-auto text-emerald-600 mb-2" />
+              <span className="text-sm text-gray-700">1. Reconcile Bank (Prioriti)</span>
+            </button>
+            <button
               onClick={() => navigate('/admin/accounting/bank-accounts')}
               className="p-4 bg-blue-50 rounded-lg hover:bg-blue-100 transition-colors text-center"
               data-testid="menu-bank-accounts"
             >
               <Building2 className="w-6 h-6 mx-auto text-blue-600 mb-2" />
-              <span className="text-sm text-gray-700">Akaun Bank</span>
-            </button>
-            <button
-              onClick={() => navigate('/admin/accounting/financial-years')}
-              className="p-4 bg-emerald-50 rounded-lg hover:bg-emerald-100 transition-colors text-center"
-              data-testid="menu-financial-years"
-            >
-              <Calendar className="w-6 h-6 mx-auto text-emerald-600 mb-2" />
-              <span className="text-sm text-gray-700">Tahun Kewangan</span>
-            </button>
-            <button
-              onClick={() => navigate('/admin/accounting/categories')}
-              className="p-4 bg-pastel-mint/50 rounded-lg hover:bg-pastel-mint transition-colors text-center"
-              data-testid="menu-categories"
-            >
-              <Filter className="w-6 h-6 mx-auto text-teal-600 mb-2" />
-              <span className="text-sm text-gray-700">Kategori</span>
+              <span className="text-sm text-gray-700">2. Akaun Bank</span>
             </button>
             <button
               onClick={() => navigate('/admin/accounting/chart-of-accounts')}
@@ -440,7 +620,31 @@ const AccountingDashboard = () => {
               data-testid="menu-chart-of-accounts"
             >
               <BookOpen className="w-6 h-6 mx-auto text-indigo-600 mb-2" />
-              <span className="text-sm text-gray-700">Senarai Akaun</span>
+              <span className="text-sm text-gray-700">3. Senarai Akaun</span>
+            </button>
+            <button
+              onClick={() => navigate('/admin/accounting/categories')}
+              className="p-4 bg-pastel-mint/50 rounded-lg hover:bg-pastel-mint transition-colors text-center"
+              data-testid="menu-categories"
+            >
+              <Filter className="w-6 h-6 mx-auto text-teal-600 mb-2" />
+              <span className="text-sm text-gray-700">4. Kategori</span>
+            </button>
+            <button
+              onClick={() => navigate('/admin/accounting/financial-years')}
+              className="p-4 bg-teal-50 rounded-lg hover:bg-teal-100 transition-colors text-center"
+              data-testid="menu-financial-years"
+            >
+              <Calendar className="w-6 h-6 mx-auto text-teal-600 mb-2" />
+              <span className="text-sm text-gray-700">5. Tahun Kewangan</span>
+            </button>
+            <button
+              onClick={() => navigate('/admin/manual-bendahari#checklist-priority')}
+              className="p-4 bg-amber-50 rounded-lg hover:bg-amber-100 transition-colors text-center"
+              data-testid="menu-bendahari-checklist"
+            >
+              <HelpCircle className="w-6 h-6 mx-auto text-amber-600 mb-2" />
+              <span className="text-sm text-gray-700">6. Checklist Bendahari</span>
             </button>
             <button
               onClick={() => navigate('/admin/accounting/manual')}
@@ -448,7 +652,7 @@ const AccountingDashboard = () => {
               data-testid="menu-manual"
             >
               <HelpCircle className="w-6 h-6 mx-auto text-sky-600 mb-2" />
-              <span className="text-sm text-gray-700">Manual Pengguna</span>
+              <span className="text-sm text-gray-700">7. Manual Pengguna</span>
             </button>
             {canMigrate && (
               <button

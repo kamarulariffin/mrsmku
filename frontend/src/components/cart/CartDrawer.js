@@ -3,13 +3,15 @@ import { motion, AnimatePresence } from 'framer-motion';
 import { useNavigate } from 'react-router-dom';
 import { 
   ShoppingCart, X, Trash2, Plus, Minus, 
-  ShoppingBag, CreditCard, Package, Bus, Heart, GraduationCap, LayoutGrid
+  ShoppingBag, CreditCard, Package, Bus, Heart, GraduationCap, LayoutGrid, ChevronDown, ChevronUp
 } from 'lucide-react';
 import { useCart } from '../../context/CartContext';
 
 const ITEM_TYPE_CONFIG = {
   yuran: { icon: GraduationCap, color: 'bg-pastel-mint text-teal-600', label: 'Yuran' },
   yuran_partial: { icon: GraduationCap, color: 'bg-pastel-lavender text-violet-600', label: 'Bayaran Sebahagian Yuran' },
+  yuran_two_payment: { icon: GraduationCap, color: 'bg-amber-100 text-amber-700', label: 'Bayaran 2 Kali Yuran' },
+  yuran_installment: { icon: GraduationCap, color: 'bg-amber-100 text-amber-700', label: 'Bayaran Ansuran Yuran' },
   koperasi: { icon: Package, color: 'bg-amber-100 text-amber-600', label: 'Koperasi' },
   bus: { icon: Bus, color: 'bg-cyan-100 text-cyan-600', label: 'Tiket Bas' },
   infaq: { icon: Heart, color: 'bg-pink-100 text-pink-600', label: 'Sumbangan' },
@@ -20,40 +22,305 @@ const ITEM_TYPE_CONFIG = {
 // Tab by category: tab id -> item_types included
 const CATEGORY_TABS = [
   { id: 'all', label: 'Semua', icon: LayoutGrid, types: null },
-  { id: 'yuran', label: 'Yuran', icon: GraduationCap, types: ['yuran', 'yuran_partial'] },
+  { id: 'yuran', label: 'Yuran', icon: GraduationCap, types: ['yuran', 'yuran_partial', 'yuran_installment', 'yuran_two_payment'] },
   { id: 'koperasi', label: 'Koperasi', icon: Package, types: ['koperasi'] },
   { id: 'bus', label: 'Tiket Bas', icon: Bus, types: ['bus'] },
   { id: 'sumbangan', label: 'Sumbangan', icon: Heart, types: ['infaq', 'tabung'] },
   { id: 'marketplace', label: 'Marketplace', icon: ShoppingBag, types: ['marketplace'] }
 ];
 
+// Header quick indicator: total + count by category
+const HEADER_CATEGORY_SEGMENTS = [
+  {
+    id: 'yuran',
+    short: 'YR',
+    label: 'Yuran',
+    types: ['yuran', 'yuran_partial', 'yuran_installment', 'yuran_two_payment'],
+    tone: 'bg-amber-100 text-amber-700 border-amber-200'
+  },
+  {
+    id: 'koperasi',
+    short: 'KP',
+    label: 'Koperasi',
+    types: ['koperasi'],
+    tone: 'bg-violet-100 text-violet-700 border-violet-200'
+  },
+  {
+    id: 'bus',
+    short: 'BS',
+    label: 'Tiket Bas',
+    types: ['bus'],
+    tone: 'bg-cyan-100 text-cyan-700 border-cyan-200'
+  },
+  {
+    id: 'sumbangan',
+    short: 'SB',
+    label: 'Sumbangan',
+    types: ['infaq', 'tabung'],
+    tone: 'bg-rose-100 text-rose-700 border-rose-200'
+  },
+  {
+    id: 'marketplace',
+    short: 'MP',
+    label: 'Marketplace',
+    types: ['marketplace'],
+    tone: 'bg-indigo-100 text-indigo-700 border-indigo-200'
+  }
+];
+
+const YURAN_DETAIL_TYPES = ['yuran', 'yuran_partial', 'yuran_installment', 'yuran_two_payment'];
+
+const isYuranDetailType = (type) => YURAN_DETAIL_TYPES.includes(type);
+
+const formatCurrencyRM = (value) => {
+  const amount = Number(value || 0);
+  return `RM ${amount.toLocaleString('ms-MY', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+};
+
+const normalizeYuranInvoiceStatus = (status) => {
+  const normalized = String(status || '').trim().toLowerCase();
+  if (['pending', 'partial', 'paid', 'overdue'].includes(normalized)) {
+    return normalized;
+  }
+  return '';
+};
+
+const getYuranInvoiceStatusMeta = (status) => {
+  const normalized = normalizeYuranInvoiceStatus(status);
+  switch (normalized) {
+    case 'paid':
+      return {
+        label: 'Selesai',
+        badgeTone: 'bg-emerald-50 text-emerald-700 border-emerald-200',
+        textTone: 'text-emerald-700'
+      };
+    case 'partial':
+      return {
+        label: 'Separa',
+        badgeTone: 'bg-violet-50 text-violet-700 border-violet-200',
+        textTone: 'text-violet-700'
+      };
+    case 'overdue':
+      return {
+        label: 'Lewat',
+        badgeTone: 'bg-rose-50 text-rose-700 border-rose-200',
+        textTone: 'text-rose-700'
+      };
+    case 'pending':
+      return {
+        label: 'Belum Bayar',
+        badgeTone: 'bg-amber-50 text-amber-700 border-amber-200',
+        textTone: 'text-amber-700'
+      };
+    default:
+      return null;
+  }
+};
+
+const getYuranDueMeta = (metadata = {}) => {
+  const dueRaw = metadata?.due_date;
+  if (!dueRaw) return null;
+
+  const parsedDate = new Date(dueRaw);
+  const dateLabel = Number.isNaN(parsedDate.getTime())
+    ? String(dueRaw)
+    : parsedDate.toLocaleDateString('ms-MY');
+
+  const daysCandidate = Number(metadata?.days_to_due);
+  const hasDays = Number.isFinite(daysCandidate);
+  const isOverdue = metadata?.is_overdue === true || (hasDays && daysCandidate < 0);
+  const isDueSoon = hasDays && daysCandidate >= 0 && daysCandidate <= 7;
+
+  let helperText = '';
+  if (isOverdue) {
+    helperText = 'Lewat';
+  } else if (hasDays) {
+    helperText = daysCandidate === 0 ? 'Hari ini' : `${daysCandidate} hari lagi`;
+  }
+
+  const badgeTone = isOverdue
+    ? 'bg-rose-50 text-rose-700 border-rose-200'
+    : isDueSoon
+      ? 'bg-amber-50 text-amber-700 border-amber-200'
+      : 'bg-sky-50 text-sky-700 border-sky-200';
+
+  const textTone = isOverdue
+    ? 'text-rose-700'
+    : isDueSoon
+      ? 'text-amber-700'
+      : 'text-slate-800';
+
+  return { dateLabel, helperText, badgeTone, textTone, isOverdue };
+};
+
+const getYuranInvoiceNumberLabel = (item) => {
+  const metadata = item?.metadata || {};
+  const explicit = String(metadata?.invoice_number || metadata?.invoice_number_label || '').trim();
+  if (explicit) return explicit;
+  const rawId = String(item?.item_id || item?.itemId || '').replace(/[^a-zA-Z0-9]/g, '').toUpperCase();
+  if (rawId) return `INV-${rawId.slice(-8)}`;
+  return '';
+};
+
+const getYuranOutstandingAmount = (item) => {
+  const metadata = item?.metadata || {};
+  const originalAmount = Number(metadata.original_amount);
+  const paidAmount = Number(metadata.paid_amount || 0);
+  if (Number.isFinite(originalAmount) && originalAmount > 0) {
+    return Math.max(originalAmount - (Number.isFinite(paidAmount) ? paidAmount : 0), 0);
+  }
+  return Number(item?.amount || 0) * Number(item?.quantity || 1);
+};
+
+const getYuranMiniSummaryBadges = (item) => {
+  const metadata = item?.metadata || {};
+  const badges = [];
+  const invoiceNumberLabel = getYuranInvoiceNumberLabel(item);
+  const invoiceStatusMeta = getYuranInvoiceStatusMeta(metadata.invoice_status);
+  const dueMeta = getYuranDueMeta(metadata);
+
+  if (metadata.student_name) {
+    badges.push({
+      label: 'Pelajar',
+      value: metadata.student_name,
+      tone: 'bg-slate-50 text-slate-700 border-slate-200'
+    });
+  }
+
+  if (metadata.tingkatan) {
+    badges.push({
+      label: 'Tingkatan',
+      value: `${metadata.tingkatan}`,
+      tone: 'bg-amber-50 text-amber-700 border-amber-200'
+    });
+  }
+
+  if (invoiceNumberLabel) {
+    badges.push({
+      label: 'Invois',
+      value: invoiceNumberLabel,
+      tone: 'bg-sky-50 text-sky-700 border-sky-200'
+    });
+  }
+
+  if (invoiceStatusMeta) {
+    badges.push({
+      label: 'Status',
+      value: invoiceStatusMeta.label,
+      tone: invoiceStatusMeta.badgeTone
+    });
+  }
+
+  if (dueMeta) {
+    badges.push({
+      label: dueMeta.isOverdue ? 'Lewat' : 'Akhir',
+      value: dueMeta.dateLabel,
+      tone: dueMeta.badgeTone
+    });
+  }
+
+  if ((item?.item_type === 'yuran_two_payment' || item?.item_type === 'yuran_installment') && metadata.payment_number && metadata.max_payments) {
+    badges.push({
+      label: 'Ansuran',
+      value: `${metadata.payment_number}/${metadata.max_payments}`,
+      tone: 'bg-violet-50 text-violet-700 border-violet-200'
+    });
+  }
+
+  if (item?.item_type === 'yuran_partial') {
+    const selectedCount = Array.isArray(metadata.selected_items) ? metadata.selected_items.length : 0;
+    if (selectedCount > 0) {
+      badges.push({
+        label: 'Item Dipilih',
+        value: `${selectedCount}`,
+        tone: 'bg-indigo-50 text-indigo-700 border-indigo-200'
+      });
+    }
+  }
+
+  badges.push({
+    label: 'Baki',
+    value: formatCurrencyRM(getYuranOutstandingAmount(item)),
+    tone: 'bg-emerald-50 text-emerald-700 border-emerald-200'
+  });
+
+  return badges;
+};
+
 // Cart Icon Button for Header - Opens central cart drawer (one troli for all payments)
-export const CartIconButton = ({ className = '' }) => {
+export const CartIconButton = ({ className = '', showCategoryCounts = false }) => {
   const { cart, toggleCart } = useCart();
-  
+  const itemCount = Number(cart?.item_count || 0);
+
+  const categorySummary = useMemo(() => {
+    const counts = HEADER_CATEGORY_SEGMENTS.reduce((acc, category) => {
+      acc[category.id] = 0;
+      return acc;
+    }, {});
+
+    (cart?.items || []).forEach((item) => {
+      const category = HEADER_CATEGORY_SEGMENTS.find((segment) => segment.types.includes(item.item_type));
+      if (category) counts[category.id] += 1;
+    });
+
+    return HEADER_CATEGORY_SEGMENTS.map((category) => ({
+      ...category,
+      count: counts[category.id] || 0
+    }));
+  }, [cart?.items]);
+
   const handleClick = (e) => {
     e.preventDefault();
     toggleCart();
   };
   
   return (
-    <button
-      onClick={handleClick}
-      className={`relative p-2 hover:bg-pastel-mint/50 rounded-xl transition-colors ${className}`}
-      data-testid="cart-icon-btn"
-      aria-label="Troli Saya"
-    >
-      <ShoppingCart className="w-5 h-5 text-teal-600" />
-      {cart.item_count > 0 && (
-        <motion.span
-          initial={{ scale: 0 }}
-          animate={{ scale: 1 }}
-          className="absolute -top-1 -right-1 w-5 h-5 bg-red-500 text-white text-xs font-bold rounded-full flex items-center justify-center shadow-lg"
+    <div className={`flex items-center gap-2 ${className}`}>
+      <button
+        type="button"
+        onClick={handleClick}
+        className="relative p-2 hover:bg-pastel-mint/50 rounded-xl transition-colors"
+        data-testid="cart-icon-btn"
+        aria-label="Troli Saya"
+      >
+        <ShoppingCart className="w-5 h-5 text-teal-600" />
+        {itemCount > 0 && (
+          <motion.span
+            initial={{ scale: 0 }}
+            animate={{ scale: 1 }}
+            className="absolute -top-1 -right-1 w-5 h-5 bg-red-500 text-white text-xs font-bold rounded-full flex items-center justify-center shadow-lg"
+          >
+            {itemCount > 9 ? '9+' : itemCount}
+          </motion.span>
+        )}
+      </button>
+
+      {showCategoryCounts && (
+        <button
+          type="button"
+          onClick={handleClick}
+          className="hidden md:flex items-center gap-1 p-1.5 rounded-xl border border-slate-200 bg-white/90 hover:bg-slate-50 transition-colors"
+          data-testid="cart-category-indicator"
+          aria-label="Ringkasan troli ikut kategori"
+          title="Ringkasan troli ikut kategori"
         >
-          {cart.item_count > 9 ? '9+' : cart.item_count}
-        </motion.span>
+          {categorySummary.map((category) => (
+            <span
+              key={category.id}
+              className={`inline-flex items-center gap-1 px-2 py-1 rounded-lg border text-[11px] font-semibold leading-none ${
+                category.count > 0
+                  ? category.tone
+                  : 'bg-slate-100 text-slate-500 border-slate-200'
+              }`}
+              title={`${category.label}: ${category.count} item`}
+            >
+              <span>{category.short}</span>
+              <span>{category.count}</span>
+            </span>
+          ))}
+        </button>
       )}
-    </button>
+    </div>
   );
 };
 
@@ -62,6 +329,7 @@ export const CartDrawer = () => {
   const navigate = useNavigate();
   const { cart, isOpen, closeCart, removeFromCart, updateQuantity, loading } = useCart();
   const [activeTab, setActiveTab] = useState('all');
+  const [expandedDetails, setExpandedDetails] = useState({});
 
   const handleCheckout = () => {
     closeCart();
@@ -219,6 +487,20 @@ export const CartDrawer = () => {
                               <span className={`inline-block mt-1 text-xs px-2 py-0.5 rounded-full ${config.color}`}>
                                 {config.label}
                               </span>
+                              {isYuranDetailType(item.item_type) && (
+                                <div className="mt-2 flex flex-wrap gap-1">
+                                  {getYuranMiniSummaryBadges(item).map((badge, idx) => (
+                                    <span
+                                      key={`${item.cart_item_id || item.item_id}-mini-${idx}`}
+                                      className={`inline-flex items-center gap-1 px-1.5 py-0.5 rounded-md border text-[10px] leading-none ${badge.tone}`}
+                                      title={`${badge.label}: ${badge.value}`}
+                                    >
+                                      <span className="font-semibold">{badge.label}</span>
+                                      <span className="max-w-[120px] truncate">{badge.value}</span>
+                                    </span>
+                                  ))}
+                                </div>
+                              )}
                             </div>
                             <button
                               onClick={() => removeFromCart(item.cart_item_id)}
@@ -228,6 +510,102 @@ export const CartDrawer = () => {
                               <Trash2 className="w-4 h-4" />
                             </button>
                           </div>
+
+                          {(() => {
+                            if (!isYuranDetailType(item.item_type)) return null;
+                            const detailKey = item.cart_item_id || `${item.item_type}-${item.item_id}`;
+                            const metadata = item.metadata || {};
+                            const selectedItems = Array.isArray(metadata.selected_items) ? metadata.selected_items : [];
+                            const originalAmount = Number(metadata.original_amount ?? 0);
+                            const paidAmount = Number(metadata.paid_amount ?? 0);
+                            const outstandingAmount = getYuranOutstandingAmount(item);
+                            const paymentNumber = Number(metadata.payment_number || 0);
+                            const maxPayments = Number(metadata.max_payments || 0);
+                            const isOpenDetail = Boolean(expandedDetails[detailKey]);
+                            const invoiceNumberLabel = getYuranInvoiceNumberLabel(item);
+                            const invoiceStatusMeta = getYuranInvoiceStatusMeta(metadata.invoice_status);
+                            const dueMeta = getYuranDueMeta(metadata);
+
+                            return (
+                              <div className="mt-2 rounded-lg border border-amber-200 bg-white/80">
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    setExpandedDetails((prev) => ({ ...prev, [detailKey]: !prev[detailKey] }));
+                                  }}
+                                  className="w-full px-2.5 py-2 text-[11px] font-semibold text-amber-700 flex items-center justify-between hover:bg-amber-50 rounded-lg transition-colors"
+                                  data-testid={`cart-yuran-detail-toggle-${detailKey}`}
+                                >
+                                  <span>Maklumat Bayaran Terperinci</span>
+                                  {isOpenDetail ? <ChevronUp size={14} /> : <ChevronDown size={14} />}
+                                </button>
+
+                                {isOpenDetail && (
+                                  <div className="px-2.5 pb-2.5 pt-1 space-y-1.5 text-[11px] border-t border-amber-100">
+                                    <div className="grid grid-cols-2 gap-1.5 text-slate-600">
+                                      <span>Nama Pelajar</span>
+                                      <span className="text-right font-medium text-slate-800 truncate">{metadata.student_name || '-'}</span>
+                                      <span>Tingkatan</span>
+                                      <span className="text-right font-medium text-slate-800">
+                                        {metadata.tingkatan ? `Tingkatan ${metadata.tingkatan}` : '-'}
+                                      </span>
+                                      <span>No. Invois</span>
+                                      <span className="text-right font-medium text-slate-800">{invoiceNumberLabel || '-'}</span>
+                                      {invoiceStatusMeta && (
+                                        <>
+                                          <span>Status Bil</span>
+                                          <span className={`text-right font-medium ${invoiceStatusMeta.textTone}`}>
+                                            {invoiceStatusMeta.label}
+                                          </span>
+                                        </>
+                                      )}
+                                      {dueMeta && (
+                                        <>
+                                          <span>Tarikh Akhir</span>
+                                          <span className={`text-right font-medium ${dueMeta.textTone}`}>
+                                            {dueMeta.dateLabel}{dueMeta.helperText ? ` (${dueMeta.helperText})` : ''}
+                                          </span>
+                                        </>
+                                      )}
+                                      {(item.item_type === 'yuran_two_payment' || item.item_type === 'yuran_installment') && (
+                                        <>
+                                          <span>Ansuran Semasa</span>
+                                          <span className="text-right font-medium text-slate-800">
+                                            {paymentNumber > 0 && maxPayments > 0 ? `Bayaran ${paymentNumber}/${maxPayments}` : '-'}
+                                          </span>
+                                        </>
+                                      )}
+                                      {originalAmount > 0 && (
+                                        <>
+                                          <span>Jumlah Asal</span>
+                                          <span className="text-right font-medium text-slate-800">{formatCurrencyRM(originalAmount)}</span>
+                                          <span>Sudah Dibayar</span>
+                                          <span className="text-right font-medium text-slate-800">{formatCurrencyRM(paidAmount)}</span>
+                                        </>
+                                      )}
+                                      <span>Baki Semasa</span>
+                                      <span className="text-right font-semibold text-emerald-700">{formatCurrencyRM(outstandingAmount)}</span>
+                                    </div>
+
+                                    {selectedItems.length > 0 && (
+                                      <div className="pt-1">
+                                        <p className="font-semibold text-slate-700 mb-1">Butiran Item Dipilih</p>
+                                        <div className="space-y-1">
+                                          {selectedItems.map((subItem, idx) => (
+                                            <div key={`${detailKey}-sub-${idx}`} className="flex items-center gap-2 text-slate-600">
+                                              <span className="w-1 h-1 rounded-full bg-amber-500" />
+                                              <span className="truncate">{subItem.name || subItem.code || `Item ${idx + 1}`}</span>
+                                              <span className="ml-auto">{formatCurrencyRM(subItem.amount || 0)}</span>
+                                            </div>
+                                          ))}
+                                        </div>
+                                      </div>
+                                    )}
+                                  </div>
+                                )}
+                              </div>
+                            );
+                          })()}
                           
                           {/* Price and Quantity */}
                           <div className="flex items-center justify-between mt-3">

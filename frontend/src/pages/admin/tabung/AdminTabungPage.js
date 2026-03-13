@@ -281,7 +281,7 @@ export default function AdminTabungPage() {
             </div>
             Tabung & Sumbangan
           </h1>
-          <p className="text-slate-600 mt-1">Pengurusan bersepadu Infaq Slot & Sedekah</p>
+          <p className="text-slate-600 mt-1">Pengurusan bersepadu Tabung Slot & Sumbangan Bebas</p>
         </div>
         <div className="flex gap-3">
           <Button variant="outline" onClick={fetchData}>
@@ -375,8 +375,8 @@ export default function AdminTabungPage() {
             className="px-3 py-2 rounded-xl border border-slate-200 text-sm focus:ring-2 focus:ring-emerald-500"
           >
             <option value="all">Semua Jenis</option>
-            <option value="slot">Slot (Infaq)</option>
-            <option value="amount">Sumbangan (Sedekah)</option>
+            <option value="slot">Tabung Slot</option>
+            <option value="amount">Sumbangan Bebas</option>
           </select>
           
           {activeTab === 'campaigns' && (
@@ -678,8 +678,8 @@ export default function AdminTabungPage() {
                   onChange={(e) => setCampaignForm({...campaignForm, campaign_type: e.target.value})}
                   disabled={!!editingCampaign}
                 >
-                  <option value="slot">Slot (Infaq)</option>
-                  <option value="amount">Sumbangan (Sedekah)</option>
+                  <option value="slot">Tabung Slot</option>
+                  <option value="amount">Sumbangan Bebas</option>
                 </Select>
 
                 {campaignForm.campaign_type === 'slot' ? (

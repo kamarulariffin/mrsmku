@@ -107,6 +107,42 @@ const ProgressBar = ({ percent, color = 'emerald' }) => {
   );
 };
 
+const toSafeNumber = (value) => {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : 0;
+};
+
+const formatRinggit = (value) => `RM ${toSafeNumber(value).toLocaleString('ms-MY', { maximumFractionDigits: 2 })}`;
+
+const getAmountCampaignProgress = (campaign) => {
+  if (!campaign || campaign.campaign_type === 'slot') return null;
+
+  const targetAmount = Math.max(0, toSafeNumber(campaign.target_amount));
+  const collectedAmount = Math.max(
+    0,
+    toSafeNumber(campaign.total_collected ?? campaign.collected_amount)
+  );
+
+  if (targetAmount <= 0) return null;
+
+  const achievementPercent = (collectedAmount / targetAmount) * 100;
+  const progressPercent = Math.min(Math.max(achievementPercent, 0), 100);
+  const extraAmount = Math.max(collectedAmount - targetAmount, 0);
+  const remainingAmount = Math.max(targetAmount - collectedAmount, 0);
+  const isTargetReached = collectedAmount >= targetAmount;
+
+  return {
+    targetAmount,
+    collectedAmount,
+    achievementPercent,
+    progressPercent,
+    extraAmount,
+    remainingAmount,
+    isTargetReached,
+    isOverTarget: extraAmount > 0,
+  };
+};
+
 const buildCampaignInternalPath = (campaignId) => `/donate/${campaignId}`;
 
 const buildCampaignInternalUrl = (campaignId, rawUrl = '') => {
@@ -301,6 +337,14 @@ const CampaignDetailPanel = ({ campaign, onClose, onUpdate }) => {
 
   if (!campaign) return null;
 
+  const amountProgress = getAmountCampaignProgress(campaign);
+  const progressDisplayPercent = campaign.campaign_type === 'slot'
+    ? toSafeNumber(campaign.progress_percent)
+    : (amountProgress?.achievementPercent ?? toSafeNumber(campaign.progress_percent));
+  const progressBarPercent = campaign.campaign_type === 'slot'
+    ? toSafeNumber(campaign.progress_percent)
+    : (amountProgress?.progressPercent ?? toSafeNumber(campaign.progress_percent));
+
   return (
     <motion.div
       initial={{ x: '100%' }}
@@ -331,7 +375,7 @@ const CampaignDetailPanel = ({ campaign, onClose, onUpdate }) => {
         {/* Stats */}
         <div className="grid grid-cols-3 gap-4">
           <GlassCard className="p-4 text-center">
-            <p className="text-2xl font-bold text-emerald-600">RM {(campaign.total_collected || 0).toLocaleString()}</p>
+            <p className="text-2xl font-bold text-emerald-600">{formatRinggit(campaign.total_collected || 0)}</p>
             <p className="text-xs text-slate-500">Terkumpul</p>
           </GlassCard>
           <GlassCard className="p-4 text-center">
@@ -339,7 +383,7 @@ const CampaignDetailPanel = ({ campaign, onClose, onUpdate }) => {
             <p className="text-xs text-slate-500">Penderma</p>
           </GlassCard>
           <GlassCard className="p-4 text-center">
-            <p className="text-2xl font-bold text-slate-800">{campaign.progress_percent?.toFixed(0)}%</p>
+            <p className="text-2xl font-bold text-slate-800">{progressDisplayPercent.toFixed(0)}%</p>
             <p className="text-xs text-slate-500">Progress</p>
           </GlassCard>
         </div>
@@ -351,11 +395,31 @@ const CampaignDetailPanel = ({ campaign, onClose, onUpdate }) => {
             <span className="text-sm font-semibold text-emerald-600">
               {campaign.campaign_type === 'slot' 
                 ? `${campaign.slots_sold}/${campaign.total_slots} slot`
-                : `RM ${(campaign.collected_amount || 0).toLocaleString()}/${(campaign.target_amount || 0).toLocaleString()}`
+                : `${formatRinggit(amountProgress?.collectedAmount ?? campaign.collected_amount ?? 0)}/${formatRinggit(amountProgress?.targetAmount ?? campaign.target_amount ?? 0)}`
               }
             </span>
           </div>
-          <ProgressBar percent={campaign.progress_percent} color={campaign.campaign_type === 'slot' ? 'violet' : 'emerald'} />
+          <ProgressBar percent={progressBarPercent} color={campaign.campaign_type === 'slot' ? 'violet' : 'emerald'} />
+          {campaign.campaign_type !== 'slot' && amountProgress && (
+            <div className="mt-3 space-y-2">
+              {amountProgress.isTargetReached ? (
+                <div className="rounded-lg border border-emerald-200 bg-emerald-50 px-3 py-2 text-xs text-emerald-700">
+                  <p className="font-semibold">
+                    Sasaran dicapai ({amountProgress.achievementPercent.toFixed(1)}%).
+                  </p>
+                  <p>
+                    {amountProgress.isOverTarget
+                      ? `Lebihan terkumpul: ${formatRinggit(amountProgress.extraAmount)}`
+                      : 'Jumlah kutipan kini tepat pada sasaran.'}
+                  </p>
+                </div>
+              ) : (
+                <p className="text-xs text-slate-500">
+                  Baki ke sasaran: {formatRinggit(amountProgress.remainingAmount)}
+                </p>
+              )}
+            </div>
+          )}
         </GlassCard>
         
         {/* Share Section */}
@@ -490,7 +554,7 @@ export default function AdminTabungPage() {
   const [filterType, setFilterType] = useState('all');
   const [filterStatus, setFilterStatus] = useState('all');
 
-  const fetchData = useCallback(async () => {
+  const fetchData = useCallback(async ({ silent = false } = {}) => {
     try {
       const [campaignsRes, donationsRes, statsRes, realtimeRes] = await Promise.all([
         api.get('/api/tabung/campaigns'),
@@ -504,7 +568,9 @@ export default function AdminTabungPage() {
       setRealtimeReport(realtimeRes.data);
     } catch (err) {
       console.error(err);
-      toast.error('Gagal memuatkan data');
+      if (!silent) {
+        toast.error('Gagal memuatkan data');
+      }
     } finally {
       setLoading(false);
     }
@@ -513,6 +579,21 @@ export default function AdminTabungPage() {
   useEffect(() => {
     fetchData();
   }, [fetchData]);
+
+  useEffect(() => {
+    const intervalId = setInterval(() => {
+      fetchData({ silent: true });
+    }, 30000);
+    return () => clearInterval(intervalId);
+  }, [fetchData]);
+
+  useEffect(() => {
+    if (!selectedCampaign?.id) return;
+    const latestCampaign = campaigns.find((campaign) => campaign.id === selectedCampaign.id);
+    if (latestCampaign) {
+      setSelectedCampaign(latestCampaign);
+    }
+  }, [campaigns, selectedCampaign?.id]);
 
   // Navigate to create page
   const handleCreateCampaign = () => {
@@ -590,7 +671,7 @@ export default function AdminTabungPage() {
           </div>
         </div>
         <div className="flex gap-3">
-          <Button variant="outline" onClick={fetchData}>
+          <Button variant="outline" onClick={() => fetchData()}>
             <RefreshCw size={18} /> Muat Semula
           </Button>
           <Button onClick={handleCreateCampaign} data-testid="add-campaign-btn">
@@ -690,8 +771,8 @@ export default function AdminTabungPage() {
             className="px-3 py-2 rounded-xl border border-slate-200 bg-white/70 backdrop-blur text-sm focus:ring-2 focus:ring-emerald-500"
           >
             <option value="all">Semua Jenis</option>
-            <option value="slot">Slot (Infaq)</option>
-            <option value="amount">Sumbangan (Sedekah)</option>
+            <option value="slot">Tabung Slot</option>
+            <option value="amount">Sumbangan Bebas</option>
           </select>
           
           {(activeTab === 'campaigns' || activeTab === 'featured') && (
@@ -722,44 +803,58 @@ export default function AdminTabungPage() {
           </div>
           
           <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-4">
-            {campaigns.filter(c => c.is_featured).map((campaign) => (
-              <motion.div
-                key={campaign.id}
-                initial={{ opacity: 0, y: 20 }}
-                animate={{ opacity: 1, y: 0 }}
-                whileHover={{ y: -4 }}
-              >
-                <GlassCard className="overflow-hidden ring-2 ring-amber-400 shadow-amber-200/50">
-                  <div className="aspect-video bg-gradient-to-br from-amber-50 to-orange-50 relative">
-                    {campaign.image_url ? (
-                      <img src={`${API_URL}${campaign.image_url}`} alt={campaign.title} className="w-full h-full object-cover" />
-                    ) : (
-                      <div className="w-full h-full flex items-center justify-center">
-                        <Gift className="w-12 h-12 text-amber-300" />
+            {campaigns.filter(c => c.is_featured).map((campaign) => {
+              const amountProgress = getAmountCampaignProgress(campaign);
+              const featuredProgressPercent = amountProgress
+                ? amountProgress.progressPercent
+                : toSafeNumber(campaign.progress_percent);
+
+              return (
+                <motion.div
+                  key={campaign.id}
+                  initial={{ opacity: 0, y: 20 }}
+                  animate={{ opacity: 1, y: 0 }}
+                  whileHover={{ y: -4 }}
+                >
+                  <GlassCard className="overflow-hidden ring-2 ring-amber-400 shadow-amber-200/50">
+                    <div className="aspect-video bg-gradient-to-br from-amber-50 to-orange-50 relative">
+                      {campaign.image_url ? (
+                        <img src={`${API_URL}${campaign.image_url}`} alt={campaign.title} className="w-full h-full object-cover" />
+                      ) : (
+                        <div className="w-full h-full flex items-center justify-center">
+                          <Gift className="w-12 h-12 text-amber-300" />
+                        </div>
+                      )}
+                      <div className="absolute top-3 left-3 px-3 py-1.5 bg-gradient-to-r from-amber-500 to-orange-500 text-white rounded-full text-xs font-semibold flex items-center gap-1.5">
+                        <Star size={12} fill="currentColor" /> Pilihan Utama
                       </div>
-                    )}
-                    <div className="absolute top-3 left-3 px-3 py-1.5 bg-gradient-to-r from-amber-500 to-orange-500 text-white rounded-full text-xs font-semibold flex items-center gap-1.5">
-                      <Star size={12} fill="currentColor" /> Pilihan Utama
                     </div>
-                  </div>
-                  <div className="p-4 space-y-3">
-                    <h3 className="font-bold text-slate-900">{campaign.title}</h3>
-                    <ProgressBar percent={campaign.progress_percent} color="emerald" />
-                    <div className="flex items-center justify-between">
-                      <span className="text-sm text-slate-500">{campaign.donor_count || 0} penderma</span>
-                      <span className="font-bold text-emerald-600">RM {(campaign.total_collected || 0).toLocaleString()}</span>
+                    <div className="p-4 space-y-3">
+                      <h3 className="font-bold text-slate-900">{campaign.title}</h3>
+                      <ProgressBar percent={featuredProgressPercent} color={campaign.campaign_type === 'slot' ? 'violet' : 'emerald'} />
+                      <div className="flex items-center justify-between">
+                        <span className="text-sm text-slate-500">{campaign.donor_count || 0} penderma</span>
+                        <span className="font-bold text-emerald-600">{formatRinggit(campaign.total_collected || 0)}</span>
+                      </div>
+                      {amountProgress?.isTargetReached && (
+                        <div className="rounded-lg border border-emerald-200 bg-emerald-50 px-3 py-2 text-xs text-emerald-700">
+                          {amountProgress.isOverTarget
+                            ? `Sasaran capai (${amountProgress.achievementPercent.toFixed(1)}%). Lebihan: ${formatRinggit(amountProgress.extraAmount)}`
+                            : 'Sasaran capai (100%).'}
+                        </div>
+                      )}
+                      <button
+                        onClick={() => handleToggleFeatured(campaign.id)}
+                        className="w-full py-2 text-sm font-medium text-red-600 bg-red-50 hover:bg-red-100 rounded-xl transition-colors"
+                        data-testid={`remove-featured-${campaign.id}`}
+                      >
+                        Buang dari Pilihan Utama
+                      </button>
                     </div>
-                    <button
-                      onClick={() => handleToggleFeatured(campaign.id)}
-                      className="w-full py-2 text-sm font-medium text-red-600 bg-red-50 hover:bg-red-100 rounded-xl transition-colors"
-                      data-testid={`remove-featured-${campaign.id}`}
-                    >
-                      Buang dari Pilihan Utama
-                    </button>
-                  </div>
-                </GlassCard>
-              </motion.div>
-            ))}
+                  </GlassCard>
+                </motion.div>
+              );
+            })}
             
             {campaigns.filter(c => c.is_featured).length === 0 && (
               <div className="col-span-full">
@@ -777,7 +872,16 @@ export default function AdminTabungPage() {
       {/* Campaigns Tab - Card Grid */}
       {activeTab === 'campaigns' && (
         <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-4">
-          {filteredCampaigns.map((campaign) => (
+          {filteredCampaigns.map((campaign) => {
+            const amountProgress = getAmountCampaignProgress(campaign);
+            const campaignProgressPercent = amountProgress
+              ? amountProgress.progressPercent
+              : toSafeNumber(campaign.progress_percent);
+            const campaignDisplayPercent = amountProgress
+              ? amountProgress.achievementPercent
+              : toSafeNumber(campaign.progress_percent);
+
+            return (
             <motion.div
               key={campaign.id}
               initial={{ opacity: 0, y: 20 }}
@@ -847,20 +951,27 @@ export default function AdminTabungPage() {
                   
                   <div className="space-y-2">
                     <ProgressBar 
-                      percent={campaign.progress_percent} 
+                      percent={campaignProgressPercent} 
                       color={campaign.campaign_type === 'slot' ? 'violet' : 'emerald'} 
                     />
                     <div className="flex items-center justify-between text-sm">
                       <span className="text-slate-500">
                         {campaign.campaign_type === 'slot' 
                           ? `${campaign.slots_sold}/${campaign.total_slots} slot`
-                          : `${campaign.progress_percent?.toFixed(0)}%`
+                          : `Pencapaian ${campaignDisplayPercent.toFixed(0)}%`
                         }
                       </span>
                       <span className="font-bold text-emerald-600">
-                        RM {(campaign.total_collected || 0).toLocaleString()}
+                        {formatRinggit(campaign.total_collected || 0)}
                       </span>
                     </div>
+                    {amountProgress?.isTargetReached && (
+                      <div className="rounded-lg border border-emerald-200 bg-emerald-50 px-3 py-2 text-xs text-emerald-700">
+                        {amountProgress.isOverTarget
+                          ? `Sasaran capai. Lebihan terkumpul: ${formatRinggit(amountProgress.extraAmount)}`
+                          : 'Sasaran kempen telah dicapai (100%).'}
+                      </div>
+                    )}
                   </div>
                   
                   {/* Button Ketahui Lebih Lanjut */}
@@ -918,7 +1029,8 @@ export default function AdminTabungPage() {
                 </div>
               </GlassCard>
             </motion.div>
-          ))}
+            );
+          })}
           
           {filteredCampaigns.length === 0 && (
             <div className="col-span-full">

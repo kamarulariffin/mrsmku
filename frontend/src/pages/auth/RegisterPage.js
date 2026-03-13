@@ -36,6 +36,14 @@ const RegisterPage = () => {
   const [hostelBlocks, setHostelBlocks] = useState([]);
   const navigate = useNavigate();
   const { login } = useAuth();
+  const tenantCodeHint = React.useMemo(() => {
+    try {
+      const params = new URLSearchParams(window.location.search || '');
+      return (params.get('tenant_code') || params.get('tenant') || '').trim().toLowerCase();
+    } catch {
+      return '';
+    }
+  }, []);
   
   // Load system config and hostel blocks on mount
   useEffect(() => {
@@ -185,6 +193,7 @@ const RegisterPage = () => {
         postcode: formData.postcode,
         city: formData.city,
         state: formData.state,
+        tenant_code: tenantCodeHint || null,
         children: validChildren.length > 0 ? validChildren : null
       };
       const res = await api.post('/api/auth/register', payload);
@@ -265,6 +274,11 @@ const RegisterPage = () => {
                   <p className="font-semibold mb-1">💡 Penting:</p>
                   <p>Sila pastikan yang mendaftar adalah <strong>ibu bapa atau penjaga</strong> yang akan menguruskan bayaran yuran anak. Ini memudahkan proses pembayaran dan penerimaan resit kemudian.</p>
                 </div>
+                {tenantCodeHint ? (
+                  <div className="p-3 bg-cyan-50 border border-cyan-200 rounded-xl text-cyan-700 text-sm">
+                    Pendaftaran ini akan dipautkan ke institusi tenant: <span className="font-mono font-semibold">{tenantCodeHint}</span>
+                  </div>
+                ) : null}
                 
                 <div className="grid md:grid-cols-2 gap-4">
                   <Input label="Nama Penuh" icon={User} placeholder="Nama seperti dalam IC" value={formData.full_name} onChange={(e) => setFormData({ ...formData, full_name: e.target.value })} required data-testid="register-name" />

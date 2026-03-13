@@ -632,8 +632,8 @@ export default function CampaignFormPage() {
                     disabled={isEdit}
                     helper={isEdit ? 'Jenis kempen tidak boleh diubah' : 'Pilih jenis kutipan'}
                   >
-                    <option value="slot">Tabung Slot (Infaq)</option>
-                    <option value="amount">Sumbangan Bebas (Sedekah)</option>
+                    <option value="slot">Tabung Slot</option>
+                    <option value="amount">Sumbangan Bebas</option>
                   </Select>
                 </div>
               </div>
@@ -780,7 +780,7 @@ export default function CampaignFormPage() {
                         Sumbangan Bebas (Tanpa Had Sasaran)
                       </span>
                       <span className="text-xs text-emerald-700">
-                        Sesuai untuk kempen sedekah berterusan. Progress akan guna milestone. (Superadmin/Admin/Bendahari/Sub Bendahari)
+                        Sesuai untuk kempen sumbangan berterusan. Progress akan guna milestone. (Superadmin/Admin/Bendahari/Sub Bendahari)
                       </span>
                     </div>
                   </label>

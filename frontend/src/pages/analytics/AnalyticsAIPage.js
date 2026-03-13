@@ -23,8 +23,8 @@ const AnalyticsAIPage = () => {
     { id: 'yuran', name: 'Yuran', icon: Wallet, color: 'from-blue-500 to-teal-500' },
     { id: 'koperasi', name: 'Koperasi', icon: ShoppingCart, color: 'from-emerald-500 to-teal-500' },
     { id: 'bus', name: 'Bas', icon: Bus, color: 'from-cyan-500 to-blue-500' },
-    { id: 'infaq', name: 'Infaq', icon: Gift, color: 'from-amber-500 to-orange-500' },
-    { id: 'sedekah', name: 'Sedekah', icon: Heart, color: 'from-pink-500 to-rose-500' },
+    { id: 'infaq', name: 'Tabung Slot', icon: Gift, color: 'from-amber-500 to-orange-500' },
+    { id: 'sedekah', name: 'Sumbangan Bebas', icon: Heart, color: 'from-pink-500 to-rose-500' },
     { id: 'hostel', name: 'Hostel', icon: Home, color: 'from-violet-500 to-fuchsia-500' },
     { id: 'sickbay', name: 'Sick Bay', icon: Stethoscope, color: 'from-red-500 to-pink-500' },
   ];
@@ -316,14 +316,14 @@ const AnalyticsAIPage = () => {
                 </Card>
               )}
 
-              {/* Infaq */}
+              {/* Tabung Slot */}
               {(selectedModule === 'all' || selectedModule === 'infaq') && dashboardData?.modules?.infaq && (
                 <Card className="p-5">
                   <div className="flex items-center gap-3 mb-4">
                     <div className="p-2 bg-amber-100 rounded-xl">
                       <Gift className="text-amber-600" size={20} />
                     </div>
-                    <h3 className="font-bold text-slate-900">Infaq Slot</h3>
+                    <h3 className="font-bold text-slate-900">Tabung Slot</h3>
                   </div>
                   <div className="space-y-2 text-sm">
                     <div className="flex justify-between">
@@ -348,14 +348,14 @@ const AnalyticsAIPage = () => {
                 </Card>
               )}
 
-              {/* Sedekah */}
+              {/* Sumbangan Bebas */}
               {(selectedModule === 'all' || selectedModule === 'sedekah') && dashboardData?.modules?.sedekah && (
                 <Card className="p-5">
                   <div className="flex items-center gap-3 mb-4">
                     <div className="p-2 bg-pink-100 rounded-xl">
                       <Heart className="text-pink-600" size={20} />
                     </div>
-                    <h3 className="font-bold text-slate-900">Sedekah</h3>
+                    <h3 className="font-bold text-slate-900">Sumbangan Bebas</h3>
                   </div>
                   <div className="space-y-2 text-sm">
                     <div className="flex justify-between">
@@ -522,7 +522,7 @@ const AnalyticsAIPage = () => {
                   'Ringkaskan prestasi keseluruhan',
                   'Apakah modul paling aktif?',
                   'Cadangkan penambahbaikan',
-                  'Bandingkan kutipan yuran vs infaq'
+                  'Bandingkan kutipan yuran vs tabung slot'
                 ].map((suggestion, idx) => (
                   <button
                     key={idx}

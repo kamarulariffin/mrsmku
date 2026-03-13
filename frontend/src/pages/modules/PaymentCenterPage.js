@@ -4,7 +4,7 @@ import { motion, AnimatePresence } from 'framer-motion';
 import { toast } from 'sonner';
 import { 
   ShoppingCart, Trash2, CreditCard, AlertCircle, Check, 
-  Bus, Package, Heart, Wallet, ChevronRight, Gift, X
+  Bus, Package, Heart, Wallet, ChevronRight, X
 } from 'lucide-react';
 import { useAuth } from '../../App';
 import api from '../../services/api';
@@ -348,19 +348,11 @@ const PaymentCenterPage = () => {
                   <ChevronRight className="ml-auto text-slate-400" size={16} />
                 </button>
                 <button 
-                  onClick={() => navigate('/infaq')}
-                  className="w-full flex items-center gap-3 p-2 text-left hover:bg-slate-50 rounded-lg transition-colors"
-                >
-                  <Gift className="text-emerald-500" size={18} />
-                  <span className="text-sm">Infaq Slot</span>
-                  <ChevronRight className="ml-auto text-slate-400" size={16} />
-                </button>
-                <button 
-                  onClick={() => navigate('/sedekah')}
+                  onClick={() => navigate('/tabung')}
                   className="w-full flex items-center gap-3 p-2 text-left hover:bg-slate-50 rounded-lg transition-colors"
                 >
                   <Heart className="text-pink-500" size={18} />
-                  <span className="text-sm">Sedekah</span>
+                  <span className="text-sm">Tabung &amp; Sumbangan</span>
                   <ChevronRight className="ml-auto text-slate-400" size={16} />
                 </button>
               </div>

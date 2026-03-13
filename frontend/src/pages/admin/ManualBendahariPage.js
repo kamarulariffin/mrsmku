@@ -43,6 +43,7 @@ const NAV_ITEMS = [
   { id: 'pusat-bayaran', label: 'Pusat Bayaran', icon: CreditCard },
   { id: 'pusat-bayaran-panel-slider', label: 'Panel Slider Bayaran', icon: PanelRight },
   { id: 'ringkasan-akaun', label: 'Ringkasan Akaun', icon: Wallet },
+  { id: 'checklist-priority', label: 'Checklist Prioriti Operasi', icon: CheckCircle2 },
   { id: 'modul-perakaunan-transaksi', label: 'Perakaunan & Laporan', icon: FileText },
   { id: 'ar-akaun-belum-terima', label: 'AR (Akaun Belum Terima)', icon: BarChart3 },
   { id: 'emel-template', label: 'E-mel Template', icon: Mail },
@@ -419,28 +420,45 @@ export default function ManualBendahariPage() {
               <p>Dashboard modul perakaunan: wang masuk/keluar bulan ini, baki, transaksi menunggu pengesahan. Klik &quot;Manual Pengguna&quot; untuk manual khusus perakaunan. Pautan: Transaksi Baru, Senarai Transaksi, Kategori, Akaun Bank, Laporan.</p>
             </Section>
 
-            <Section number={11} title="Modul Perakaunan – Transaksi & Laporan" id="modul-perakaunan-transaksi" icon={FileText} defaultOpen={hash === 'modul-perakaunan-transaksi'}>
+            <Section number={11} title="Checklist Prioriti Operasi (Admin/Bendahari/Sub Bendahari)" id="checklist-priority" icon={CheckCircle2} defaultOpen={hash === 'checklist-priority'}>
+              <p><strong>Urutan kerja harian dicadangkan:</strong></p>
+              <ol className="list-decimal pl-6 space-y-1">
+                <li><strong>Reconcile Bank dahulu</strong> — kosongkan queue `Need Review/Unmatched` dan pastikan `difference = 0.00`.</li>
+                <li><strong>Semak transaksi pending verification</strong> — selaraskan dengan JuruAudit untuk pengesahan.</li>
+                <li><strong>Semak AR tertunggak</strong> — hantar peringatan ikut risiko/aging.</li>
+                <li><strong>Semak laporan ringkas</strong> — bulanan/AGM sebelum mesyuarat atau penutupan tempoh.</li>
+              </ol>
+              <p><strong>Tanda amaran yang perlu disiasat segera:</strong></p>
+              <ul className="list-disc pl-6 space-y-1">
+                <li>Statement status `ready_for_approval` tetapi masih ada unresolved item.</li>
+                <li>Difference reconciliation bukan sifar (`!= 0.00`).</li>
+                <li>Parser warning berulang untuk fail bank yang sama.</li>
+                <li>Peningkatan mendadak transaksi pending verification.</li>
+              </ul>
+            </Section>
+
+            <Section number={12} title="Modul Perakaunan – Transaksi & Laporan" id="modul-perakaunan-transaksi" icon={FileText} defaultOpen={hash === 'modul-perakaunan-transaksi'}>
               <p><strong>Transaksi Baru:</strong> Rekod wang masuk/keluar; kategori, akaun bank, jumlah, tarikh, penerangan; entri bergu automatik. <strong>Senarai Transaksi:</strong> Tapis; edit/padam hanya yang belum disahkan. <strong>Kategori & Akaun Bank:</strong> Urus kategori dan akaun. <strong>Laporan Bulanan/Tahunan/AGM:</strong> Pilih tahun/bulan; Penyata P&P, Kunci Kira-kira, Aliran Tunai, Imbangan Duga. Pengesahan: JuruAudit sahkan/tolak; hanya transaksi disahkan masuk laporan. Manual penuh: Manual Pengguna Modul Perakaunan.</p>
             </Section>
 
-            <Section number={12} title="AR (Akaun Belum Terima)" id="ar-akaun-belum-terima" icon={BarChart3} defaultOpen={hash === 'ar-akaun-belum-terima'}>
+            <Section number={13} title="AR (Akaun Belum Terima)" id="ar-akaun-belum-terima" icon={BarChart3} defaultOpen={hash === 'ar-akaun-belum-terima'}>
               <p><strong>Laluan:</strong> Menu → AR (Akaun Belum Terima). Dari sini klik <strong>Pergi ke Senarai Tertunggak</strong> untuk halaman penuh mengikut tingkatan.</p>
               <p><strong>Senarai Tertunggak mengikut Tingkatan</strong> (Laluan: /admin/ar-outstanding): Tab <strong>Tingkatan 1–5</strong>, pagination 20 per halaman. Setiap baris: Pelajar, No Matrik, Tertunggak (RM), Risiko, <strong>Status Notifikasi</strong> (merah = Belum dihantar, hijau = Sudah hantar), <strong>Jenis / Tarikh</strong> (E-mel atau Push + tarikh), butang <strong>Hantar Peringatan</strong>. Kad &quot;Urus E-mel & Push Notifikasi&quot; ada pautan ke E-mel Template dan butang <strong>Hantar Peringatan Pukal (Tingkatan X)</strong>.</p>
               <p><strong>Hantar satu per satu:</strong> Klik Hantar Peringatan pada baris → pilih E-mel sahaja atau Push sahaja → pilih template e-mel atau template push → Hantar. Status baris dikemas kini (hijau, jenis, tarikh).</p>
               <p><strong>Hantar pukal:</strong> Klik Hantar Peringatan Pukal → form: ringkasan bilangan penerima, pilih saluran (E-mel/Push), template, pilihan &quot;Hantar dalam kelompok 20 orang&quot; (disyorkan; 100 orang = 5 batch 20 dengan jeda 1 saat) → Setuju & Hantar. Sistem hantar dan kemas kini status semua pelajar. Pembalikan: untuk entri jurnal AR yang salah (Bendahari/Admin).</p>
             </Section>
 
-            <Section number={13} title="E-mel Template" id="emel-template" icon={Mail} defaultOpen={hash === 'emel-template'}>
+            <Section number={14} title="E-mel Template" id="emel-template" icon={Mail} defaultOpen={hash === 'emel-template'}>
               <p><strong>Laluan:</strong> Menu → E-mel Template</p>
               <p>Urus template e-mel: peringatan yuran, pengesahan bayaran, yuran baru, dll. Boleh disesuaikan <strong>ikut tingkatan</strong> (Umum, Tingkatan 1–5). Edit subjek dan badan; pembolehubah seperti <code>{'{{parent_name}}'}</code>, <code>{'{{total_outstanding}}'}</code>. Bila hantar peringatan (satu atau pukal) di Senarai Tertunggak, bendahari <strong>pilih template e-mel</strong> (cth. Peringatan Yuran Tertunggak) atau <strong>template push</strong> (Peringatan penuh/ringkas/mendesak); kandungan ikut template yang anda edit di sini.</p>
             </Section>
 
-            <Section number={14} title="Laporan" id="laporan" icon={FileBarChart} defaultOpen={hash === 'laporan'}>
+            <Section number={15} title="Laporan" id="laporan" icon={FileBarChart} defaultOpen={hash === 'laporan'}>
               <p><strong>Laluan:</strong> Menu → Laporan</p>
               <p>Akses pelbagai laporan: yuran, kewangan, pelajar. Pilih jenis dan parameter (tahun, tingkatan, tarikh); jana atau eksport.</p>
             </Section>
 
-            <Section number={15} title="Soalan Lazim – AR & Peringatan" id="faq-ar-peringatan" icon={HelpCircle} defaultOpen={hash === 'faq-ar-peringatan'}>
+            <Section number={16} title="Soalan Lazim – AR & Peringatan" id="faq-ar-peringatan" icon={HelpCircle} defaultOpen={hash === 'faq-ar-peringatan'}>
               <p><strong>Di mana hantar peringatan satu per satu?</strong> Menu → AR → Pergi ke Senarai Tertunggak. Pilih tab tingkatan, klik Hantar Peringatan pada baris pelajar → pilih E-mel atau Push, template → Hantar.</p>
               <p><strong>Boleh hantar kepada seluruh tingkatan sekali gus?</strong> Ya. Di Senarai Tertunggak, klik Hantar Peringatan Pukal (Tingkatan X). Pilih saluran, template, pilihan kelompok 20 orang → Setuju & Hantar. Sistem hantar kepada semua pelajar tertunggak dalam tingkatan itu.</p>
               <p><strong>Apa maksud &quot;Hantar dalam kelompok 20 orang&quot;?</strong> Sistem hantar batch 20 orang, jeda 1 saat, kemudian batch seterusnya (cth. 100 orang = 5 kelompok). Kurangkan beban pelayan. Jika tidak dicentang, semua dihantar berturut-turut.</p>

@@ -119,7 +119,7 @@ const PublicSedekahPage = () => {
             <motion.div initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }}>
               <div className="inline-flex items-center gap-2 px-5 py-2.5 bg-white/20 backdrop-blur rounded-full mb-6 border border-white/30">
                 <Heart className="text-pink-300 animate-pulse" size={20} />
-                <span className="text-sm font-semibold">Program Sedekah MRSMKU</span>
+                <span className="text-sm font-semibold">Program Tabung & Sumbangan MRSMKU</span>
               </div>
               <h1 className="text-5xl md:text-6xl font-extrabold font-heading mb-6 drop-shadow-lg">
                 Hulurkan <span className="text-amber-300">Sumbangan</span> Anda
@@ -169,7 +169,7 @@ const PublicSedekahPage = () => {
             className="flex flex-col md:flex-row items-start md:items-center justify-between gap-6 mb-10"
           >
             <div>
-              <h2 className="text-3xl font-extrabold bg-gradient-to-r from-teal-600 via-violet-600 to-fuchsia-500 bg-clip-text text-transparent font-heading">Kempen Sedekah</h2>
+              <h2 className="text-3xl font-extrabold bg-gradient-to-r from-teal-600 via-violet-600 to-fuchsia-500 bg-clip-text text-transparent font-heading">Kempen Tabung & Sumbangan</h2>
               <p className="text-slate-600 mt-1">Pilih kempen dan hulurkan sumbangan anda</p>
             </div>
             <div className="flex flex-wrap gap-2">

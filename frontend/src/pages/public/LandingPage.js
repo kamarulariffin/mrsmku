@@ -197,7 +197,10 @@ const LandingPage = () => {
               <Globe size={14} /> Muafakat <ExternalLink size={12} />
             </a>
             <div className="hidden lg:block w-px h-6 bg-slate-300 mx-1" />
-            <Button variant="ghost" onClick={() => navigate('/sedekah')} className="hidden sm:flex hover:bg-pink-50 hover:text-pink-600 text-sm" data-testid="nav-sedekah"><Heart size={18} className="mr-1" /> Sedekah</Button>
+            <Button variant="ghost" onClick={() => navigate('/daftar-institusi')} className="hidden md:flex hover:bg-cyan-50 hover:text-cyan-700 text-sm">
+              <Building size={16} className="mr-1" /> Daftar Institusi
+            </Button>
+            <Button variant="ghost" onClick={() => navigate('/sedekah')} className="hidden sm:flex hover:bg-pink-50 hover:text-pink-600 text-sm" data-testid="nav-sedekah"><Heart size={18} className="mr-1" /> Tabung & Sumbangan</Button>
             <Button variant="ghost" onClick={() => navigate('/login')} className="px-3 py-2 sm:px-4 sm:py-2.5 text-sm hover:bg-pastel-mint/50 hover:text-teal-600 min-h-[44px]" data-testid="login-btn">Log Masuk</Button>
             <button onClick={() => navigate('/register')} className="px-4 py-2.5 sm:px-5 sm:py-2.5 bg-gradient-to-r from-teal-500 via-violet-500 to-fuchsia-400 text-white font-semibold text-sm sm:text-base rounded-xl shadow-pastel-sm hover:shadow-pastel transition-all active:scale-[0.98] min-h-[44px]" data-testid="register-btn">Daftar</button>
           </div>
@@ -238,6 +241,14 @@ const LandingPage = () => {
                 data-testid="hero-login-btn"
               >
                 Log Masuk
+              </motion.button>
+              <motion.button
+                whileTap={{ scale: 0.98 }}
+                onClick={() => navigate('/daftar-institusi')}
+                className="w-full sm:w-auto px-6 py-3.5 sm:py-4 bg-cyan-50 text-cyan-700 font-semibold text-base rounded-xl sm:rounded-2xl shadow-sm border-2 border-cyan-200 hover:border-cyan-300 transition-all min-h-[48px] flex items-center justify-center gap-2"
+                data-testid="hero-register-institution-btn"
+              >
+                <Building size={18} /> Daftar Institusi
               </motion.button>
               {NOTIFICATION_SUPPORTED && notificationPermission === 'default' && (
                 <motion.button
@@ -298,7 +309,7 @@ const LandingPage = () => {
                   { icon: Users, text: 'Urus Data Anak', color: 'from-blue-500 to-cyan-500', bg: 'bg-blue-50' },
                   { icon: CreditCard, text: 'Bayar Yuran Online', color: 'from-emerald-500 to-teal-500', bg: 'bg-emerald-50' },
                   { icon: Bot, text: 'Pembantu AI 24/7', color: 'from-violet-500 to-fuchsia-400', bg: 'bg-pastel-lavender' },
-                  { icon: Heart, text: 'Sedekah & Sumbangan', color: 'from-pink-500 to-rose-500', bg: 'bg-pink-50' }
+                  { icon: Heart, text: 'Tabung & Sumbangan', color: 'from-pink-500 to-rose-500', bg: 'bg-pink-50' }
                 ].map((item, i) => (
                   <motion.div
                     key={i}
@@ -345,7 +356,7 @@ const LandingPage = () => {
               <div className="absolute top-0 right-0 w-64 sm:w-96 h-64 sm:h-96 bg-white/10 rounded-full -translate-y-1/2 translate-x-1/2 blur-3xl" />
               <div className="absolute bottom-0 left-0 w-48 sm:w-64 h-48 sm:h-64 bg-amber-400/20 rounded-full translate-y-1/2 -translate-x-1/2 blur-3xl" />
               <div className="relative text-center mb-6 sm:mb-8 lg:mb-10">
-                <h2 className="text-xl sm:text-2xl lg:text-3xl font-extrabold font-heading">Impak Sedekah Anda</h2>
+                <h2 className="text-xl sm:text-2xl lg:text-3xl font-extrabold font-heading">Impak Tabung & Sumbangan Anda</h2>
                 <p className="text-white/80 mt-1 sm:mt-2 text-sm sm:text-base lg:text-lg">Bersama membina masa depan pelajar {institution_name}</p>
               </div>
               <div className="relative grid grid-cols-2 md:grid-cols-4 gap-3 sm:gap-4 lg:gap-6">
@@ -397,7 +408,7 @@ const LandingPage = () => {
               { icon: Building, title: 'Pengurusan Warden', desc: 'Jadual bertugas & auto-assign aduan', color: 'from-teal-500 to-emerald-600', bg: 'bg-teal-50' },
               { icon: Stethoscope, title: 'Sick Bay', desc: 'Rekod kesihatan dan rawatan pelajar', color: 'from-red-500 to-pink-600', bg: 'bg-red-50' },
               { icon: Car, title: 'Keselamatan Kenderaan', desc: 'Sistem QR kawalan keluar masuk kenderaan ibu bapa dengan laporan kekerapan lawatan & ketepatan masa', color: 'from-slate-500 to-gray-700', bg: 'bg-slate-50' },
-              { icon: Heart, title: 'Sedekah & Derma', desc: 'Platform sumbangan dan kempen derma', color: 'from-rose-500 to-red-600', bg: 'bg-rose-50' },
+              { icon: Heart, title: 'Tabung & Sumbangan', desc: 'Platform sumbangan dan kempen derma', color: 'from-rose-500 to-red-600', bg: 'bg-rose-50' },
               { icon: Bus, title: `GBS ${institution_name}`, desc: 'Geng Bas Sekolah (GBS) - Tempah tiket bas untuk pulang bermalam', color: 'from-cyan-500 to-sky-600', bg: 'bg-cyan-50' },
               { icon: ShoppingCart, title: 'Koperasi Maktab', desc: 'Beli kit dan kelengkapan Maktab', color: 'from-lime-500 to-green-600', bg: 'bg-lime-50' },
               { icon: Calendar, title: 'Mesyuarat AGM', desc: 'Pengurusan AGM, kehadiran QR & pelaporan', color: 'from-amber-500 to-orange-600', bg: 'bg-amber-50' },
@@ -490,9 +501,9 @@ const LandingPage = () => {
           <div className="text-center mb-8 sm:mb-10 lg:mb-12">
             <div className="inline-flex items-center gap-2 px-3 py-1.5 sm:px-4 sm:py-2 bg-pink-100 rounded-full mb-3 sm:mb-4">
               <Heart className="text-pink-600" size={16} />
-              <span className="text-xs sm:text-sm font-medium text-pink-700">Program Sedekah</span>
+              <span className="text-xs sm:text-sm font-medium text-pink-700">Program Tabung & Sumbangan</span>
             </div>
-            <h2 className="text-xl sm:text-2xl lg:text-3xl font-bold text-primary-900 font-heading">Kempen Sedekah Aktif</h2>
+            <h2 className="text-xl sm:text-2xl lg:text-3xl font-bold text-primary-900 font-heading">Kempen Tabung & Sumbangan Aktif</h2>
             <p className="text-slate-600 mt-1 sm:mt-2 max-w-2xl mx-auto text-sm sm:text-base px-1">Hulurkan bantuan untuk pelajar dan institusi {institution_name}.</p>
           </div>
 
@@ -626,7 +637,7 @@ const LandingPage = () => {
                 <li><button onClick={() => navigate('/login')} className="text-slate-400 hover:text-pink-400 transition flex items-center gap-2 text-sm sm:text-base py-1"><ChevronRight size={16} />Log Masuk</button></li>
                 <li><button onClick={() => navigate('/register')} className="text-slate-400 hover:text-pink-400 transition flex items-center gap-2 text-sm sm:text-base py-1"><ChevronRight size={16} />Daftar Akaun</button></li>
                 <li><button onClick={() => navigate('/daftar-syarikat-bas')} className="text-slate-400 hover:text-cyan-400 transition flex items-center gap-2 text-sm sm:text-base py-1"><Bus size={16} />Daftar Syarikat Bas</button></li>
-                <li><button onClick={() => navigate('/sedekah')} className="text-slate-400 hover:text-pink-400 transition flex items-center gap-2 text-sm sm:text-base py-1"><ChevronRight size={16} />Program Sedekah</button></li>
+                <li><button onClick={() => navigate('/sedekah')} className="text-slate-400 hover:text-pink-400 transition flex items-center gap-2 text-sm sm:text-base py-1"><ChevronRight size={16} />Program Tabung & Sumbangan</button></li>
               </ul>
             </div>
             <div>

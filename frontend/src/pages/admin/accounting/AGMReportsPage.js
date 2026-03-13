@@ -186,7 +186,28 @@ export default function AGMReportsPage() {
     }
   };
 
+  const getQualityBadgeClass = (status) => {
+    if (status === 'critical') return 'bg-red-100 text-red-700 border-red-200';
+    if (status === 'warning') return 'bg-amber-100 text-amber-700 border-amber-200';
+    return 'bg-emerald-100 text-emerald-700 border-emerald-200';
+  };
+
+  const ensureAgmQualityForPublish = (channel = 'eksport') => {
+    const checks = Array.isArray(es?.quality_checks) ? es.quality_checks : [];
+    const criticalCount = checks.filter((check) => check?.status === 'critical').length;
+    const warningCount = checks.filter((check) => check?.status === 'warning').length;
+    if (criticalCount > 0 || es?.quality_status === 'critical') {
+      toast.error(`Laporan AGM belum boleh ${channel}: terdapat semakan kualiti kritikal.`);
+      return false;
+    }
+    if (warningCount > 0 || es?.quality_status === 'warning') {
+      toast.warning(`Amaran kualiti AGM dikesan. Sila semak sebelum ${channel} akhir.`);
+    }
+    return true;
+  };
+
   const handlePrint = () => {
+    if (!ensureAgmQualityForPublish('cetak')) return;
     window.print();
   };
 
@@ -210,12 +231,19 @@ export default function AGMReportsPage() {
       toast.error('Sila pilih tahun kewangan terlebih dahulu');
       return;
     }
+    if (!ensureAgmQualityForPublish('eksport PDF')) return;
 
     const doc = new jsPDF();
     const pageWidth = doc.internal.pageSize.getWidth();
     let yPos = 20;
     const endMonthYear = getReportEndMonthYear();
-    const headerRows = agmHeaderRows.length ? agmHeaderRows : ['LAPORAN PENYATA KEWANGAN', `BERAKHIR (${endMonthYear}).`];
+    const professionalHeader = es?.professional_header || {};
+    const reportReference =
+      professionalHeader.report_reference ||
+      `AGM-${String(es.financial_year || 'FY').replace(/\s+/g, '').replace(/\//g, '-')}`;
+    const headerRows = agmHeaderRows.length
+      ? agmHeaderRows
+      : [professionalHeader.document_title_ms || 'LAPORAN PENYATA KEWANGAN', `BERAKHIR (${endMonthYear}).`];
 
     try {
       const [leftLogoDataUrl, rightLogoDataUrl] = await Promise.all([
@@ -248,8 +276,21 @@ export default function AGMReportsPage() {
       doc.text(String(agmTemplate.header.right_title), pageWidth / 2, yPos, { align: 'center' });
       yPos += 7;
     }
+    if (professionalHeader.organization_name) {
+      doc.setFontSize(10);
+      doc.text(String(professionalHeader.organization_name), pageWidth / 2, yPos, { align: 'center' });
+      yPos += 6;
+    }
     doc.text(`Tahun Kewangan: ${es.financial_year}`, pageWidth / 2, yPos, { align: 'center' });
-    yPos += 15;
+    yPos += 6;
+    doc.setFontSize(9);
+    doc.text(`Rujukan Laporan: ${reportReference}`, pageWidth / 2, yPos, { align: 'center' });
+    yPos += 5;
+    if (professionalHeader.basis_note) {
+      doc.text(String(professionalHeader.basis_note), pageWidth / 2, yPos, { align: 'center' });
+      yPos += 5;
+    }
+    yPos += 4;
 
     // Executive Summary
     doc.setFontSize(14);
@@ -469,6 +510,7 @@ export default function AGMReportsPage() {
       if (agmFooterRows[1]) {
         doc.text(String(agmFooterRows[1]), 14, pageHeight - 10);
       }
+      doc.text(`Ref: ${reportReference}`, pageWidth - 14, pageHeight - 10, { align: 'right' });
       doc.text(`Dijana pada: ${new Date().toLocaleString('ms-MY')}`, 14, pageHeight - 6);
       doc.text(`Halaman ${i} / ${pageCount}`, pageWidth - 14, pageHeight - 6, { align: 'right' });
     }
@@ -483,17 +525,25 @@ export default function AGMReportsPage() {
       toast.error('Sila pilih tahun kewangan terlebih dahulu');
       return;
     }
+    if (!ensureAgmQualityForPublish('eksport Excel')) return;
 
     const wb = XLSX.utils.book_new();
 
     // Summary Sheet
     const endMonthYear = getReportEndMonthYear();
+    const professionalHeader = es?.professional_header || {};
+    const reportReference =
+      professionalHeader.report_reference ||
+      `AGM-${String(es.financial_year || 'FY').replace(/\s+/g, '').replace(/\//g, '-')}`;
     const summaryData = [
-      ['LAPORAN PENYATA KEWANGAN'],
+      [professionalHeader.document_title_ms || 'LAPORAN PENYATA KEWANGAN'],
       [`BERAKHIR (${endMonthYear}).`],
-      ['MUAFAKAT - Badan Pemaufakatan Pendidikan MARA Malaysia', ''],
+      [professionalHeader.organization_name || 'MUAFAKAT - Badan Pemaufakatan Pendidikan MARA Malaysia', ''],
+      ['Rujukan Laporan', reportReference],
       ['Tahun Kewangan', es.financial_year],
       ['Tarikh Dijana', new Date().toLocaleString('ms-MY')],
+      ['Status Kualiti AGM', (es.quality_status || 'pass').toUpperCase()],
+      ['Nota Standard', professionalHeader.standard_note || 'Format laporan accounting AGM profesional.'],
       [],
       ['RINGKASAN KEWANGAN'],
       ['Perkara', 'Amaun (RM)'],
@@ -603,6 +653,7 @@ export default function AGMReportsPage() {
       toast.error('Sila pilih tahun kewangan terlebih dahulu');
       return;
     }
+    if (!ensureAgmQualityForPublish('eksport Word')) return;
 
     const createTableRow = (cells, isHeader = false) => {
       return new TableRow({
@@ -618,7 +669,13 @@ export default function AGMReportsPage() {
 
     const sections = [];
     const endMonthYear = getReportEndMonthYear();
-    const headerRows = agmHeaderRows.length ? agmHeaderRows : ['LAPORAN PENYATA KEWANGAN', `BERAKHIR (${endMonthYear}).`];
+    const professionalHeader = es?.professional_header || {};
+    const reportReference =
+      professionalHeader.report_reference ||
+      `AGM-${String(es.financial_year || 'FY').replace(/\s+/g, '').replace(/\//g, '-')}`;
+    const headerRows = agmHeaderRows.length
+      ? agmHeaderRows
+      : [professionalHeader.document_title_ms || 'LAPORAN PENYATA KEWANGAN', `BERAKHIR (${endMonthYear}).`];
 
     // Logo (top, centered)
     try {
@@ -670,7 +727,22 @@ export default function AGMReportsPage() {
         spacing: { after: 120 },
       }),
       new Paragraph({
+        children: [new TextRun({ text: professionalHeader.organization_name || '', size: 20 })],
+        alignment: AlignmentType.CENTER,
+        spacing: { after: 80 },
+      }),
+      new Paragraph({
         children: [new TextRun({ text: `Tahun Kewangan: ${es.financial_year}`, size: 22 })],
+        alignment: AlignmentType.CENTER,
+        spacing: { after: 120 },
+      }),
+      new Paragraph({
+        children: [new TextRun({ text: `Rujukan Laporan: ${reportReference}`, size: 18 })],
+        alignment: AlignmentType.CENTER,
+        spacing: { after: 80 },
+      }),
+      new Paragraph({
+        children: [new TextRun({ text: professionalHeader.basis_note || '', italics: true, size: 18 })],
         alignment: AlignmentType.CENTER,
         spacing: { after: 300 },
       })
@@ -838,6 +910,7 @@ export default function AGMReportsPage() {
   const { leftBoxes: agmFooterLeftBoxes, rightBoxes: agmFooterRightBoxes } = getAllAgmFooterBoxes();
 
   const handlePrintFromPreview = () => {
+    if (!ensureAgmQualityForPublish('cetak')) return;
     setPrintPreviewMode(false);
     setTimeout(() => window.print(), 100);
   };
@@ -993,6 +1066,12 @@ export default function AGMReportsPage() {
                 </>
               )}
               <p className="text-sm text-gray-600">Tahun Kewangan: {es?.financial_year}</p>
+              {es?.professional_header?.report_reference && (
+                <p className="text-xs text-gray-500">Rujukan: {es.professional_header.report_reference}</p>
+              )}
+              {es?.professional_header?.basis_note && (
+                <p className="text-[11px] text-gray-500 mt-1">{es.professional_header.basis_note}</p>
+              )}
             </div>
           </div>
           <div className="text-right">
@@ -1055,6 +1134,55 @@ export default function AGMReportsPage() {
                 <div className={`bg-gradient-to-br ${es.net_surplus >= 0 ? 'from-emerald-500 to-emerald-600' : 'from-orange-500 to-orange-600'} text-white rounded-xl p-4`}>
                   <p className="text-emerald-100 text-sm">{es.net_surplus >= 0 ? 'Lebihan' : 'Kurangan'}</p>
                   <p className="text-2xl font-bold">RM {Math.abs(es.net_surplus).toLocaleString('ms-MY', { minimumFractionDigits: 2 })}</p>
+                </div>
+              </div>
+
+              <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+                <div className="rounded-xl border border-slate-200 bg-slate-50 p-4">
+                  <p className="text-sm font-semibold text-slate-800">Header Laporan Professional</p>
+                  <div className="mt-2 space-y-1 text-sm text-slate-700">
+                    <p>
+                      <span className="font-medium">Organisasi:</span>{' '}
+                      {es.professional_header?.organization_name || 'MUAFAKAT - Badan Pemaufakatan Pendidikan MARA Malaysia'}
+                    </p>
+                    <p>
+                      <span className="font-medium">Rujukan:</span>{' '}
+                      {es.professional_header?.report_reference || '-'}
+                    </p>
+                    <p>
+                      <span className="font-medium">Penyedia:</span>{' '}
+                      {es.professional_header?.prepared_by_name || 'Sistem'} ({es.professional_header?.prepared_by_role || 'system'})
+                    </p>
+                    <p className="text-xs text-slate-500">
+                      {es.professional_header?.standard_note || 'Format laporan accounting AGM profesional.'}
+                    </p>
+                  </div>
+                </div>
+
+                <div className="rounded-xl border border-slate-200 bg-white p-4">
+                  <div className="flex items-center justify-between gap-2">
+                    <p className="text-sm font-semibold text-slate-800">Kawalan Kualiti AGM</p>
+                    <span className={`px-2 py-1 rounded-full border text-xs ${getQualityBadgeClass(es.quality_status)}`}>
+                      {(es.quality_status || 'pass').toUpperCase()}
+                    </span>
+                  </div>
+                  {Array.isArray(es.quality_checks) && es.quality_checks.length > 0 ? (
+                    <div className="mt-2 space-y-2">
+                      {es.quality_checks.map((check, idx) => (
+                        <div key={`quality-check-${idx}`} className="rounded-lg border border-slate-200 bg-slate-50 p-2">
+                          <div className="flex items-center justify-between gap-2">
+                            <p className="text-xs font-semibold text-slate-800">{check.title}</p>
+                            <span className={`px-2 py-0.5 rounded-full border text-[10px] ${getQualityBadgeClass(check.status)}`}>
+                              {(check.status || 'pass').toUpperCase()}
+                            </span>
+                          </div>
+                          <p className="text-xs text-slate-600 mt-1">{check.detail}</p>
+                        </div>
+                      ))}
+                    </div>
+                  ) : (
+                    <p className="text-xs text-slate-600 mt-2">Tiada data quality check tambahan.</p>
+                  )}
                 </div>
               </div>
 

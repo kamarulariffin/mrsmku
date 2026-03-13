@@ -2,7 +2,7 @@ import React, { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { motion } from 'framer-motion';
 import {
-  Users, Heart, Wallet, Target, GraduationCap
+  Users, Heart, Wallet, Target, GraduationCap, Building
 } from 'lucide-react';
 import api from '../../services/api';
 import { Spinner, Button } from '../../components/common';
@@ -102,6 +102,23 @@ const PublicSedekahPage = () => {
             <span className="text-lg font-bold bg-gradient-to-r from-teal-600 to-violet-600 bg-clip-text text-transparent font-heading">Portal MRSMKU</span>
           </div>
           <div className="flex items-center gap-3">
+            <Button
+              variant="ghost"
+              onClick={() => navigate('/daftar-institusi')}
+              className="sm:hidden min-h-[40px] min-w-[40px] p-2 bg-cyan-50 border border-cyan-200 text-cyan-700 hover:bg-cyan-100"
+              aria-label="Daftar institusi baru"
+              data-testid="register-institution-mobile"
+            >
+              <Building size={18} />
+            </Button>
+            <Button
+              variant="ghost"
+              onClick={() => navigate('/daftar-institusi')}
+              className="hidden sm:flex bg-cyan-50 border border-cyan-200 text-cyan-700 hover:bg-cyan-100"
+              data-testid="register-institution-btn"
+            >
+              <Building size={16} className="mr-1" /> Daftar Institusi
+            </Button>
             <Button variant="ghost" onClick={() => navigate('/login')} className="hover:bg-pastel-mint/50 hover:text-teal-600" data-testid="login-btn">Log Masuk</Button>
             <button onClick={() => navigate('/register')} className="px-5 py-2.5 bg-gradient-to-r from-teal-500 via-violet-500 to-fuchsia-400 text-white font-semibold rounded-xl shadow-pastel-sm hover:shadow-pastel transition-all hover:scale-105" data-testid="register-btn">Daftar</button>
           </div>

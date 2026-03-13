@@ -197,7 +197,21 @@ const LandingPage = () => {
               <Globe size={14} /> Muafakat <ExternalLink size={12} />
             </a>
             <div className="hidden lg:block w-px h-6 bg-slate-300 mx-1" />
-            <Button variant="ghost" onClick={() => navigate('/daftar-institusi')} className="hidden md:flex hover:bg-cyan-50 hover:text-cyan-700 text-sm">
+            <Button
+              variant="ghost"
+              onClick={() => navigate('/daftar-institusi')}
+              className="md:hidden min-h-[40px] min-w-[40px] p-2 bg-cyan-50 border border-cyan-200 text-cyan-700 hover:bg-cyan-100"
+              aria-label="Daftar institusi baru"
+              data-testid="nav-register-institution-mobile"
+            >
+              <Building size={18} />
+            </Button>
+            <Button
+              variant="ghost"
+              onClick={() => navigate('/daftar-institusi')}
+              className="hidden md:flex bg-cyan-50 border border-cyan-200 text-cyan-700 hover:bg-cyan-100 text-sm"
+              data-testid="nav-register-institution-desktop"
+            >
               <Building size={16} className="mr-1" /> Daftar Institusi
             </Button>
             <Button variant="ghost" onClick={() => navigate('/sedekah')} className="hidden sm:flex hover:bg-pink-50 hover:text-pink-600 text-sm" data-testid="nav-sedekah"><Heart size={18} className="mr-1" /> Tabung & Sumbangan</Button>
@@ -636,6 +650,7 @@ const LandingPage = () => {
               <ul className="space-y-2.5 sm:space-y-3">
                 <li><button onClick={() => navigate('/login')} className="text-slate-400 hover:text-pink-400 transition flex items-center gap-2 text-sm sm:text-base py-1"><ChevronRight size={16} />Log Masuk</button></li>
                 <li><button onClick={() => navigate('/register')} className="text-slate-400 hover:text-pink-400 transition flex items-center gap-2 text-sm sm:text-base py-1"><ChevronRight size={16} />Daftar Akaun</button></li>
+                <li><button onClick={() => navigate('/daftar-institusi')} className="text-slate-400 hover:text-cyan-400 transition flex items-center gap-2 text-sm sm:text-base py-1"><Building size={16} />Daftar Institusi</button></li>
                 <li><button onClick={() => navigate('/daftar-syarikat-bas')} className="text-slate-400 hover:text-cyan-400 transition flex items-center gap-2 text-sm sm:text-base py-1"><Bus size={16} />Daftar Syarikat Bas</button></li>
                 <li><button onClick={() => navigate('/sedekah')} className="text-slate-400 hover:text-pink-400 transition flex items-center gap-2 text-sm sm:text-base py-1"><ChevronRight size={16} />Program Tabung & Sumbangan</button></li>
               </ul>

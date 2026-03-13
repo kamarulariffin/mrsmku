@@ -1669,6 +1669,7 @@ const App = () => {
             <Route path="/login" element={user ? <Navigate to={getDefaultRoute()} /> : <NewLoginPage />} />
             <Route path="/register" element={user ? <Navigate to="/dashboard" /> : <NewRegisterPage />} />
             <Route path="/daftar-institusi" element={user ? <Navigate to={getDefaultRoute()} /> : <InstitutionRegistrationWizardPage />} />
+            <Route path="/institusi/daftar" element={<Navigate to="/daftar-institusi" replace />} />
             <Route path="/forgot-password" element={user ? <Navigate to={getDefaultRoute()} /> : <NewForgotPasswordPage />} />
             <Route path="/reset-password" element={user ? <Navigate to={getDefaultRoute()} /> : <NewResetPasswordPage />} />
           

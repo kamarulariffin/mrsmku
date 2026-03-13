@@ -57,12 +57,16 @@ async def get_sync_status(current_user: dict = Depends(lambda: require_roles("su
     pelajar_without_religion = await db.users.count_documents({"role": "pelajar", "religion": {"$exists": False}})
     orphan_students = await db.students.count_documents({"parent_id": {"$exists": False}})
     
-    pipeline = [
-        {"$match": {"status": "approved"}},
-        {"$group": {"_id": "$form", "count": {"$sum": 1}}},
-        {"$sort": {"_id": 1}}
-    ]
-    by_form = await db.students.aggregate(pipeline).to_list(10)
+    form_counts = {}
+    async for student in db.students.find({"status": "approved"}):
+        form_value = student.get("form")
+        if form_value is None:
+            continue
+        form_counts[form_value] = form_counts.get(form_value, 0) + 1
+    by_form = sorted(
+        [{"_id": form_value, "count": count} for form_value, count in form_counts.items()],
+        key=lambda item: item["_id"],
+    )[:10]
     students_by_form = {str(item["_id"]): item["count"] for item in by_form}
     
     return {

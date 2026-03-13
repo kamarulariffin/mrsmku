@@ -16,6 +16,7 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from bson import ObjectId
+from services.id_normalizer import object_id_or_none
 
 try:
     from pywebpush import webpush, WebPushException
@@ -33,7 +34,7 @@ _get_db_func: Callable = None
 _get_current_user_func: Callable = None
 _log_audit_func: Callable = None
 
-# Cart persisted in MongoDB (payment_center_cart) so all modules use one troli
+# Cart persisted in runtime DB collection (payment_center_cart)
 CART_COLLECTION = "payment_center_cart"
 REMINDER_COLLECTION = "payment_reminders"
 REMINDER_PREFERENCE_COLLECTION = "payment_reminder_preferences"
@@ -89,6 +90,21 @@ async def log_audit(user, action, module, details):
         await _log_audit_func(user, action, module, details)
 
 
+def _id_value(value: Any) -> Any:
+    """Normalize ID-like inputs while supporting non-ObjectId IDs."""
+    if value is None:
+        return None
+    if isinstance(value, ObjectId):
+        return value
+    text = str(value)
+    try:
+        if ObjectId.is_valid(text):
+            return object_id_or_none(text)
+    except Exception:
+        pass
+    return text
+
+
 async def _invalidate_financial_dashboard_cache_safely(db, scope: str = "all") -> None:
     try:
         from routes.financial_dashboard import invalidate_financial_dashboard_cache
@@ -124,6 +140,122 @@ def _build_due_date_meta(value):
         return {"due_date": value or "", "days_to_due": None, "is_overdue": False}
     days_to_due = (parsed - datetime.now(timezone.utc).date()).days
     return {"due_date": parsed.isoformat(), "days_to_due": days_to_due, "is_overdue": days_to_due < 0}
+
+
+def _infer_yuran_invoice_status(yuran: Dict[str, Any], remaining_amount: float) -> str:
+    raw_status = str(yuran.get("status", "") or "").strip().lower()
+    if remaining_amount <= 0:
+        return "paid"
+    if raw_status in {"pending", "partial", "overdue"}:
+        return raw_status
+    paid_amount = float(yuran.get("paid_amount", 0) or 0)
+    return "partial" if paid_amount > 0 else "pending"
+
+
+def _derive_invoice_number_label(yuran: Dict[str, Any]) -> Dict[str, str]:
+    explicit_candidates = [
+        yuran.get("invoice_number"),
+        yuran.get("invoice_no"),
+        yuran.get("receipt_number"),
+        yuran.get("bill_number"),
+        yuran.get("reference_number"),
+        yuran.get("reference_no"),
+    ]
+    explicit = ""
+    for candidate in explicit_candidates:
+        normalized = str(candidate or "").strip()
+        if normalized:
+            explicit = normalized
+            break
+
+    if explicit:
+        return {"invoice_number": explicit, "invoice_number_label": explicit}
+
+    raw_id = str(yuran.get("_id") or yuran.get("id") or "").strip()
+    compact_id = "".join(ch for ch in raw_id if ch.isalnum()).upper()
+    if compact_id:
+        return {
+            "invoice_number": "",
+            "invoice_number_label": f"INV-{compact_id[-8:]}",
+        }
+    return {"invoice_number": "", "invoice_number_label": ""}
+
+
+YURAN_INVOICE_ITEM_TYPES = {"yuran", "yuran_partial", "yuran_installment", "yuran_two_payment"}
+
+
+def _derive_invoice_label_from_receipt_item(item: Dict[str, Any]) -> str:
+    metadata = item.get("metadata") or {}
+    candidates = [
+        metadata.get("invoice_number"),
+        metadata.get("invoice_number_label"),
+        item.get("invoice_number"),
+        item.get("invoice_number_label"),
+    ]
+    for candidate in candidates:
+        normalized = str(candidate or "").strip()
+        if normalized:
+            return normalized
+
+    item_type = str(item.get("item_type", "") or "").strip().lower()
+    if item_type not in YURAN_INVOICE_ITEM_TYPES:
+        return ""
+
+    raw_id = str(item.get("item_id") or item.get("yuran_id") or "").strip()
+    compact_id = "".join(ch for ch in raw_id if ch.isalnum()).upper()
+    if compact_id:
+        return f"INV-{compact_id[-8:]}"
+    return ""
+
+
+def _extract_receipt_invoice_numbers(items: Any) -> List[str]:
+    if not isinstance(items, list):
+        return []
+    labels: List[str] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        label = _derive_invoice_label_from_receipt_item(item)
+        if label and label not in labels:
+            labels.append(label)
+    return labels
+
+
+def _format_invoice_numbers_summary(invoice_numbers: List[str], max_visible: int = 3) -> str:
+    cleaned = [str(value or "").strip() for value in invoice_numbers if str(value or "").strip()]
+    if not cleaned:
+        return "-"
+    if len(cleaned) <= max_visible:
+        return ", ".join(cleaned)
+    return f"{', '.join(cleaned[:max_visible])} +{len(cleaned) - max_visible} lagi"
+
+
+def _build_yuran_cart_metadata(
+    yuran: Dict[str, Any],
+    extra_metadata: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    due_meta = _build_due_date_meta(yuran.get("due_date"))
+    total_amount = float(yuran.get("total_amount", 0) or 0)
+    paid_amount = float(yuran.get("paid_amount", 0) or 0)
+    remaining_amount = max(total_amount - paid_amount, 0)
+    invoice_meta = _derive_invoice_number_label(yuran)
+    metadata = {
+        "student_name": yuran.get("student_name", ""),
+        "student_id": str(yuran.get("student_id", "")),
+        "tingkatan": yuran.get("tingkatan", 0),
+        "set_name": yuran.get("set_yuran_nama", yuran.get("yuran_name", "Yuran Sekolah")),
+        "original_amount": total_amount,
+        "paid_amount": paid_amount,
+        "invoice_status": _infer_yuran_invoice_status(yuran, remaining_amount),
+        "invoice_number": invoice_meta["invoice_number"],
+        "invoice_number_label": invoice_meta["invoice_number_label"],
+        "due_date": due_meta["due_date"],
+        "days_to_due": due_meta["days_to_due"],
+        "is_overdue": due_meta["is_overdue"],
+    }
+    if extra_metadata:
+        metadata.update(extra_metadata)
+    return metadata
 
 
 def _is_valid_time_hhmm(value: str) -> bool:
@@ -191,7 +323,7 @@ def _build_user_id_candidates(user_id: Any) -> List[Any]:
     if isinstance(user_id, ObjectId):
         candidates.append(str(user_id))
     elif isinstance(user_id, str) and ObjectId.is_valid(user_id):
-        candidates.append(ObjectId(user_id))
+        candidates.append(_id_value(user_id))
     # Deduplicate without assuming hashability for all types.
     out: List[Any] = []
     for item in candidates:
@@ -930,7 +1062,7 @@ async def cancel_payment_reminder(
     db = get_db()
     candidate_ids = [reminder_id]
     if ObjectId.is_valid(reminder_id):
-        candidate_ids.insert(0, ObjectId(reminder_id))
+        candidate_ids.insert(0, _id_value(reminder_id))
 
     reminder = None
     for candidate_id in candidate_ids:
@@ -984,7 +1116,7 @@ async def add_to_cart(request: AddToCartRequest, current_user: dict = Depends(ge
     
     if request.item_type == "yuran":
         # Fetch from student_yuran
-        yuran = await db.student_yuran.find_one({"_id": ObjectId(request.item_id)})
+        yuran = await db.student_yuran.find_one({"_id": _id_value(request.item_id)})
         if not yuran:
             raise HTTPException(status_code=404, detail="Yuran tidak dijumpai")
         
@@ -999,18 +1131,12 @@ async def add_to_cart(request: AddToCartRequest, current_user: dict = Depends(ge
             "description": f"{yuran.get('student_name', '')} - Tingkatan {yuran.get('tingkatan', '')}",
             "amount": remaining,
             "quantity": 1,
-            "metadata": {
-                "student_name": yuran.get("student_name", ""),
-                "student_id": str(yuran.get("student_id", "")),
-                "tingkatan": yuran.get("tingkatan", 0),
-                "original_amount": yuran.get("total_amount", 0),
-                "paid_amount": yuran.get("paid_amount", 0)
-            }
+            "metadata": _build_yuran_cart_metadata(yuran),
         }
         
     elif request.item_type == "koperasi":
         # Fetch from koperasi products
-        product = await db.koperasi_products.find_one({"_id": ObjectId(request.item_id)})
+        product = await db.koperasi_products.find_one({"_id": _id_value(request.item_id)})
         if not product:
             raise HTTPException(status_code=404, detail="Produk tidak dijumpai")
         
@@ -1033,31 +1159,61 @@ async def add_to_cart(request: AddToCartRequest, current_user: dict = Depends(ge
         
     elif request.item_type == "bus":
         # Fetch from bus trips/bookings
-        trip = await db.bus_trips.find_one({"_id": ObjectId(request.item_id)})
+        trip = await db.bus_trips.find_one({"_id": _id_value(request.item_id)})
         if not trip:
             raise HTTPException(status_code=404, detail="Trip tidak dijumpai")
         
         if trip.get("available_seats", 0) < request.quantity:
             raise HTTPException(status_code=400, detail="Tempat duduk tidak mencukupi")
+
+        request_metadata = request.metadata or {}
+        route = None
+        if trip.get("route_id"):
+            route = await db.bus_routes.find_one({"_id": trip.get("route_id")})
+
+        drop_off_point = request_metadata.get("drop_off_point")
+        base_price = trip.get("price", 0)
+        if route:
+            base_price = route.get("base_price", base_price)
+
+        drop_off_price = base_price
+        route_drop_off_points = (route or {}).get("drop_off_points", []) if route else []
+        if drop_off_point:
+            matched_point = next(
+                (point for point in route_drop_off_points if point.get("location") == drop_off_point),
+                None
+            )
+            if route_drop_off_points and not matched_point:
+                raise HTTPException(status_code=400, detail="Lokasi turun tidak sah untuk trip ini")
+            if matched_point:
+                drop_off_price = matched_point.get("price", base_price)
+        elif route_drop_off_points:
+            first_point = route_drop_off_points[0]
+            drop_off_point = first_point.get("location") or ""
+            drop_off_price = first_point.get("price", base_price)
         
         item_details = {
             "item_type": "bus",
             "item_id": request.item_id,
             "name": f"Tiket Bas - {trip.get('route_name', 'Unknown')}",
             "description": f"Tarikh: {trip.get('departure_date', '')}",
-            "amount": trip.get("price", 0),
+            "amount": float(drop_off_price or 0),
             "quantity": request.quantity,
             "metadata": {
                 "route_name": trip.get("route_name", ""),
                 "departure_date": trip.get("departure_date", ""),
                 "departure_time": trip.get("departure_time", ""),
-                "student_id": request.metadata.get("student_id") if request.metadata else None
+                "student_id": request_metadata.get("student_id"),
+                "drop_off_point": drop_off_point or "",
+                "seat_preference": request_metadata.get("seat_preference"),
+                "leave_id": request_metadata.get("leave_id"),
+                "pulang_bermalam_id": request_metadata.get("pulang_bermalam_id"),
             }
         }
         
     elif request.item_type == "yuran_partial":
         # Partial yuran payment - selected items only
-        yuran = await db.student_yuran.find_one({"_id": ObjectId(request.item_id)})
+        yuran = await db.student_yuran.find_one({"_id": _id_value(request.item_id)})
         if not yuran:
             raise HTTPException(status_code=404, detail="Yuran tidak dijumpai")
         
@@ -1077,24 +1233,24 @@ async def add_to_cart(request: AddToCartRequest, current_user: dict = Depends(ge
             "description": f"{yuran.get('student_name', '')} - Tingkatan {yuran.get('tingkatan', '')}",
             "amount": total_amount,
             "quantity": 1,
-            "metadata": {
-                "student_name": yuran.get("student_name", ""),
-                "student_id": str(yuran.get("student_id", "")),
-                "tingkatan": yuran.get("tingkatan", 0),
-                "selected_items": selected_items,
-                "item_names": item_names
-            }
+            "metadata": _build_yuran_cart_metadata(
+                yuran,
+                {
+                    "selected_items": selected_items,
+                    "item_names": item_names,
+                },
+            ),
         }
         
     elif request.item_type == "infaq":
         # Fetch from tabung_campaigns first (Tabung & Sumbangan)
-        campaign = await db.tabung_campaigns.find_one({"_id": ObjectId(request.item_id)})
+        campaign = await db.tabung_campaigns.find_one({"_id": _id_value(request.item_id)})
         if not campaign:
             # Try infaq_campaigns
-            campaign = await db.infaq_campaigns.find_one({"_id": ObjectId(request.item_id)})
+            campaign = await db.infaq_campaigns.find_one({"_id": _id_value(request.item_id)})
         if not campaign:
             # Try donation_campaigns
-            campaign = await db.donation_campaigns.find_one({"_id": ObjectId(request.item_id)})
+            campaign = await db.donation_campaigns.find_one({"_id": _id_value(request.item_id)})
         
         if not campaign:
             raise HTTPException(status_code=404, detail="Kempen tidak dijumpai")
@@ -1146,13 +1302,27 @@ async def add_to_cart(request: AddToCartRequest, current_user: dict = Depends(ge
     # Check if item already in cart (for koperasi, bus - allow update quantity)
     existing_index = None
     for i, item in enumerate(cart["items"]):
-        if item["item_id"] == request.item_id and item["item_type"] == request.item_type:
+        if request.item_type == "bus":
+            request_metadata = request.metadata or {}
+            cart_metadata = item.get("metadata") or {}
+            same_bus_item = (
+                item.get("item_id") == request.item_id
+                and item.get("item_type") == request.item_type
+                and str(cart_metadata.get("student_id") or "") == str(request_metadata.get("student_id") or "")
+                and str(cart_metadata.get("drop_off_point") or "") == str(request_metadata.get("drop_off_point") or "")
+            )
+            if same_bus_item:
+                existing_index = i
+                break
+        elif item["item_id"] == request.item_id and item["item_type"] == request.item_type:
             existing_index = i
             break
     
     if existing_index is not None:
-        if request.item_type in ["koperasi", "bus"]:
+        if request.item_type == "koperasi":
             cart["items"][existing_index]["quantity"] += request.quantity
+        elif request.item_type == "bus":
+            raise HTTPException(status_code=400, detail="Trip ini sudah ada dalam troli untuk pelajar dipilih")
         else:
             raise HTTPException(status_code=400, detail="Item sudah ada dalam troli")
     else:
@@ -1254,7 +1424,7 @@ async def process_checkout(request: CheckoutRequest, current_user: dict = Depend
         try:
             if item["item_type"] == "yuran":
                 # Bayaran penuh - peruntukkan ke senarai item mengikut keutamaan (laporan detail)
-                yuran = await db.student_yuran.find_one({"_id": ObjectId(item["item_id"])})
+                yuran = await db.student_yuran.find_one({"_id": _id_value(item["item_id"])})
                 if yuran:
                     payment_reference = generate_payment_reference(item.get("item_type"), item.get("item_id"))
                     new_paid = yuran.get("paid_amount", 0) + item["amount"]
@@ -1270,7 +1440,7 @@ async def process_checkout(request: CheckoutRequest, current_user: dict = Depend
                     if items_list:
                         set_fields["items"] = items_list
                     await db.student_yuran.update_one(
-                        {"_id": ObjectId(item["item_id"])},
+                        {"_id": _id_value(item["item_id"])},
                         {
                             "$set": set_fields,
                             "$push": {
@@ -1291,7 +1461,7 @@ async def process_checkout(request: CheckoutRequest, current_user: dict = Depend
             
             elif item["item_type"] == "yuran_partial":
                 # Partial payment by selected items
-                yuran = await db.student_yuran.find_one({"_id": ObjectId(item["item_id"])})
+                yuran = await db.student_yuran.find_one({"_id": _id_value(item["item_id"])})
                 if yuran:
                     payment_reference = generate_payment_reference(item.get("item_type"), item.get("item_id"))
                     new_paid = yuran.get("paid_amount", 0) + item["amount"]
@@ -1308,7 +1478,7 @@ async def process_checkout(request: CheckoutRequest, current_user: dict = Depend
                             items[idx]["paid_date"] = payment_date.isoformat()
                     
                     await db.student_yuran.update_one(
-                        {"_id": ObjectId(item["item_id"])},
+                        {"_id": _id_value(item["item_id"])},
                         {
                             "$set": {
                                 "paid_amount": new_paid,
@@ -1331,7 +1501,7 @@ async def process_checkout(request: CheckoutRequest, current_user: dict = Depend
                             }
                         }
                     )
-                yuran = await db.student_yuran.find_one({"_id": ObjectId(item["item_id"])})
+                yuran = await db.student_yuran.find_one({"_id": _id_value(item["item_id"])})
                 desc = (
                     f"Bayaran Sebahagian Yuran {yuran.get('student_name', '')} - {yuran.get('set_yuran_nama', 'Yuran')}"
                     if yuran
@@ -1341,7 +1511,7 @@ async def process_checkout(request: CheckoutRequest, current_user: dict = Depend
             
             elif item["item_type"] in ("yuran_installment", "yuran_two_payment"):
                 policy_checkout = await _get_yuran_payment_policy(db)
-                yuran = await db.student_yuran.find_one({"_id": ObjectId(item["item_id"])})
+                yuran = await db.student_yuran.find_one({"_id": _id_value(item["item_id"])})
                 if yuran:
                     payment_reference = generate_payment_reference(item.get("item_type"), item.get("item_id"))
                     new_paid = yuran.get("paid_amount", 0) + item["amount"]
@@ -1369,7 +1539,7 @@ async def process_checkout(request: CheckoutRequest, current_user: dict = Depend
                     if items_list:
                         set_fields["items"] = items_list
                     await db.student_yuran.update_one(
-                        {"_id": ObjectId(item["item_id"])},
+                        {"_id": _id_value(item["item_id"])},
                         {
                             "$set": set_fields,
                             "$push": {
@@ -1388,7 +1558,7 @@ async def process_checkout(request: CheckoutRequest, current_user: dict = Depend
                             }
                         }
                     )
-                yuran = await db.student_yuran.find_one({"_id": ObjectId(item["item_id"])})
+                yuran = await db.student_yuran.find_one({"_id": _id_value(item["item_id"])})
                 desc = f"Bayaran ansuran yuran {yuran.get('student_name', '')} - {yuran.get('set_yuran_nama', 'Yuran')}" if yuran else "Bayaran ansuran yuran"
                 await _create_accounting_tx_from_payment(db, current_user, item, receipt_number, "yuran", desc)
                     
@@ -1396,7 +1566,7 @@ async def process_checkout(request: CheckoutRequest, current_user: dict = Depend
                 # Create koperasi order and update stock
                 order_doc = {
                     "user_id": current_user["_id"],
-                    "product_id": ObjectId(item["item_id"]),
+                    "product_id": _id_value(item["item_id"]),
                     "product_name": item["name"],
                     "quantity": item["quantity"],
                     "price": item["amount"],
@@ -1409,11 +1579,11 @@ async def process_checkout(request: CheckoutRequest, current_user: dict = Depend
                 await db.koperasi_orders.insert_one(order_doc)
                 
                 # Update stock: per-size (sizes_stock) or total
-                product = await db.koperasi_products.find_one({"_id": ObjectId(item["item_id"])})
+                product = await db.koperasi_products.find_one({"_id": _id_value(item["item_id"])})
                 size = (item.get("metadata") or {}).get("size")
                 if product and product.get("has_sizes") and size:
                     await db.koperasi_products.update_one(
-                        {"_id": ObjectId(item["item_id"])},
+                        {"_id": _id_value(item["item_id"])},
                         {"$inc": {"sizes_stock.$[elem].stock": -item["quantity"]}},
                         array_filters=[{"elem.size": size}]
                     )
@@ -1422,39 +1592,124 @@ async def process_checkout(request: CheckoutRequest, current_user: dict = Depend
                     if product and "total_stock" in product:
                         inc["total_stock"] = -item["quantity"]
                     await db.koperasi_products.update_one(
-                        {"_id": ObjectId(item["item_id"])},
+                        {"_id": _id_value(item["item_id"])},
                         {"$inc": inc}
                     )
                 await _create_accounting_tx_from_payment(db, current_user, item, receipt_number, "koperasi", f"Jualan koperasi - {item.get('name', '')}")
                 
             elif item["item_type"] == "bus":
-                # Create bus booking
+                # Create bus booking (validated against latest trip/student state)
+                bus_metadata = item.get("metadata", {}) or {}
+                student_id_raw = bus_metadata.get("student_id")
+                if not student_id_raw:
+                    raise HTTPException(status_code=400, detail="Maklumat pelajar tiket bas tidak lengkap")
+
+                student_id_value = _id_value(student_id_raw)
+                student = await db.students.find_one({"_id": student_id_value})
+                if not student:
+                    raise HTTPException(status_code=404, detail="Pelajar tidak dijumpai")
+
+                if current_user.get("role") == "parent":
+                    if str(student.get("parent_id")) != str(current_user.get("_id")):
+                        raise HTTPException(status_code=403, detail="Pelajar bukan di bawah akaun semasa")
+
+                trip_id_value = _id_value(item["item_id"])
+                trip = await db.bus_trips.find_one({"_id": trip_id_value})
+                if not trip:
+                    raise HTTPException(status_code=404, detail="Trip bas tidak dijumpai")
+                if trip.get("status") != "scheduled":
+                    raise HTTPException(status_code=400, detail="Trip bas tidak tersedia untuk checkout")
+
+                existing_booking = await db.bus_bookings.find_one({
+                    "trip_id": trip_id_value,
+                    "student_id": student_id_value,
+                    "status": {"$nin": ["cancelled"]}
+                })
+                if existing_booking:
+                    raise HTTPException(status_code=400, detail="Pelajar sudah mempunyai tempahan aktif untuk trip ini")
+
+                bus_doc = await db.buses.find_one({"_id": trip.get("bus_id")}) if trip.get("bus_id") else None
+                booked_count = await db.bus_bookings.count_documents({
+                    "trip_id": trip_id_value,
+                    "status": {"$nin": ["cancelled"]}
+                })
+                available_seats = trip.get("available_seats", bus_doc.get("total_seats", 0) if bus_doc else 0) - booked_count
+                requested_qty = max(int(item.get("quantity", 1) or 1), 1)
+                if available_seats < requested_qty:
+                    raise HTTPException(status_code=400, detail="Tempat duduk tidak mencukupi semasa checkout")
+
+                pulang_bermalam_id = bus_metadata.get("pulang_bermalam_id") or bus_metadata.get("leave_id")
+                pulang_bermalam_oid = None
+                if pulang_bermalam_id:
+                    try:
+                        pulang_bermalam_oid = _id_value(pulang_bermalam_id)
+                    except Exception:
+                        pulang_bermalam_oid = None
+
+                pulang_bermalam_approved = False
+                bus_settings = await db.settings.find_one({"type": "bus_booking"})
+                require_leave_approval = bool(bus_settings.get("require_leave_approval", False)) if bus_settings else False
+                departure_date = trip.get("departure_date", "")
+
+                if require_leave_approval:
+                    approved_leave = await db.hostel_records.find_one({
+                        "student_id": student_id_value,
+                        "kategori": "pulang_bermalam",
+                        "status": "approved",
+                        "$or": [
+                            {"tarikh_keluar": {"$lte": departure_date}, "tarikh_pulang": {"$gte": departure_date}},
+                            {"tarikh_keluar": departure_date}
+                        ]
+                    })
+                    if not approved_leave:
+                        raise HTTPException(status_code=400, detail="Kelulusan pulang bermalam diperlukan sebelum checkout tiket bas")
+                    pulang_bermalam_approved = True
+                    pulang_bermalam_oid = approved_leave.get("_id")
+                elif pulang_bermalam_oid:
+                    approved_leave = await db.hostel_records.find_one({
+                        "_id": pulang_bermalam_oid,
+                        "student_id": student_id_value,
+                        "kategori": "pulang_bermalam",
+                        "status": "approved"
+                    })
+                    pulang_bermalam_approved = approved_leave is not None
+
                 booking_doc = {
+                    "booking_number": f"BK-PMT-{uuid.uuid4().hex[:10].upper()}",
+                    "parent_id": current_user["_id"],
                     "user_id": current_user["_id"],
-                    "trip_id": ObjectId(item["item_id"]),
-                    "passengers": item["quantity"],
-                    "total_price": item["amount"] * item["quantity"],
+                    "trip_id": trip_id_value,
+                    "student_id": student_id_value,
+                    "drop_off_point": bus_metadata.get("drop_off_point", ""),
+                    "drop_off_price": item.get("amount", 0),
+                    "seat_preference": bus_metadata.get("seat_preference"),
+                    "assigned_seat": None,
+                    "passengers": requested_qty,
+                    "total_price": item["amount"] * requested_qty,
                     "status": "confirmed",
+                    "payment_status": "paid",
                     "receipt_number": receipt_number,
-                    "student_id": ObjectId(item["metadata"]["student_id"]) if item.get("metadata", {}).get("student_id") else None,
+                    "pulang_bermalam_id": pulang_bermalam_oid,
+                    "pulang_bermalam_approved": pulang_bermalam_approved,
+                    "notes": "Booking created via payment_center checkout",
                     "created_at": payment_date.isoformat()
                 }
                 await db.bus_bookings.insert_one(booking_doc)
                 
                 # Update available seats
                 await db.bus_trips.update_one(
-                    {"_id": ObjectId(item["item_id"])},
-                    {"$inc": {"available_seats": -item["quantity"]}}
+                    {"_id": trip_id_value},
+                    {"$inc": {"available_seats": -requested_qty}}
                 )
                 await _create_accounting_tx_from_payment(db, current_user, item, receipt_number, "bus", f"Tiket bas - {item.get('name', '')}")
                 
             elif item["item_type"] == "infaq":
                 # Create donation record in tabung_donations (sync with Tabung & Sumbangan)
-                campaign = await db.tabung_campaigns.find_one({"_id": ObjectId(item["item_id"])})
+                campaign = await db.tabung_campaigns.find_one({"_id": _id_value(item["item_id"])})
                 campaign_type = campaign.get("campaign_type", "amount") if campaign else "amount"
                 
                 donation_doc = {
-                    "campaign_id": ObjectId(item["item_id"]),
+                    "campaign_id": _id_value(item["item_id"]),
                     "campaign_title": item.get("name", "Kempen"),
                     "campaign_type": campaign_type,
                     "user_id": str(current_user["_id"]),
@@ -1479,7 +1734,7 @@ async def process_checkout(request: CheckoutRequest, current_user: dict = Depend
                 if campaign_type == "slot":
                     slots = item.get("metadata", {}).get("slots", 1)
                     await db.tabung_campaigns.update_one(
-                        {"_id": ObjectId(item["item_id"])},
+                        {"_id": _id_value(item["item_id"])},
                         {
                             "$inc": {"slots_sold": slots, "donor_count": 1},
                             "$set": {"updated_at": payment_date}
@@ -1487,7 +1742,7 @@ async def process_checkout(request: CheckoutRequest, current_user: dict = Depend
                     )
                 else:
                     await db.tabung_campaigns.update_one(
-                        {"_id": ObjectId(item["item_id"])},
+                        {"_id": _id_value(item["item_id"])},
                         {
                             "$inc": {"collected_amount": item["amount"], "donor_count": 1},
                             "$set": {"updated_at": payment_date}
@@ -1524,6 +1779,7 @@ async def process_checkout(request: CheckoutRequest, current_user: dict = Depend
     await clear_user_cart_db(db, user_id)
     # Log audit
     await log_audit(current_user, "CHECKOUT", "payment_center", f"Pembayaran RM{total_amount:.2f}, Resit: {receipt_number}")
+    receipt_invoice_numbers = _extract_receipt_invoice_numbers(cart["items"])
     
     return {
         "success": True,
@@ -1536,6 +1792,9 @@ async def process_checkout(request: CheckoutRequest, current_user: dict = Depend
             "payment_date": payment_date.isoformat(),
             "status": "completed",
             "items": cart["items"],
+            "invoice_numbers": receipt_invoice_numbers,
+            "invoice_count": len(receipt_invoice_numbers),
+            "primary_invoice_number": receipt_invoice_numbers[0] if receipt_invoice_numbers else "",
             "payer_name": current_user.get("full_name", ""),
             "payer_email": current_user.get("email", "")
         },
@@ -1564,6 +1823,7 @@ async def get_user_receipts(
     for r in receipts:
         # Include items info for filtering on frontend
         items = r.get("items", [])
+        invoice_numbers = _extract_receipt_invoice_numbers(items)
         result.append({
             "receipt_id": str(r["_id"]),
             "receipt_number": r.get("receipt_number", ""),
@@ -1572,6 +1832,9 @@ async def get_user_receipts(
             "payment_date": r.get("created_at", ""),
             "status": r.get("status", ""),
             "item_count": len(items),
+            "invoice_numbers": invoice_numbers,
+            "invoice_count": len(invoice_numbers),
+            "primary_invoice_number": invoice_numbers[0] if invoice_numbers else "",
             "items": items  # Include full items for filtering and display
         })
     
@@ -1589,7 +1852,7 @@ async def get_receipt_detail(receipt_id: str, current_user: dict = Depends(get_c
     db = get_db()
     
     try:
-        receipt = await db.payment_receipts.find_one({"_id": ObjectId(receipt_id)})
+        receipt = await db.payment_receipts.find_one({"_id": _id_value(receipt_id)})
     except:
         raise HTTPException(status_code=400, detail="ID resit tidak sah")
     
@@ -1600,6 +1863,9 @@ async def get_receipt_detail(receipt_id: str, current_user: dict = Depends(get_c
     if str(receipt["user_id"]) != str(current_user["_id"]) and current_user["role"] not in ["superadmin", "admin", "bendahari"]:
         raise HTTPException(status_code=403, detail="Akses ditolak")
     
+    receipt_items = receipt.get("items", [])
+    invoice_numbers = _extract_receipt_invoice_numbers(receipt_items)
+
     return {
         "receipt_id": str(receipt["_id"]),
         "receipt_number": receipt.get("receipt_number", ""),
@@ -1607,7 +1873,10 @@ async def get_receipt_detail(receipt_id: str, current_user: dict = Depends(get_c
         "payment_method": receipt.get("payment_method", ""),
         "payment_date": receipt.get("created_at", ""),
         "status": receipt.get("status", ""),
-        "items": receipt.get("items", []),
+        "items": receipt_items,
+        "invoice_numbers": invoice_numbers,
+        "invoice_count": len(invoice_numbers),
+        "primary_invoice_number": invoice_numbers[0] if invoice_numbers else "",
         "payer_name": receipt.get("payer_name", ""),
         "payer_email": receipt.get("payer_email", ""),
         "organization": {
@@ -1624,7 +1893,7 @@ async def download_receipt_pdf(receipt_id: str, current_user: dict = Depends(get
     db = get_db()
     
     try:
-        receipt = await db.payment_receipts.find_one({"_id": ObjectId(receipt_id)})
+        receipt = await db.payment_receipts.find_one({"_id": _id_value(receipt_id)})
     except:
         raise HTTPException(status_code=400, detail="ID resit tidak sah")
     
@@ -1665,9 +1934,21 @@ async def download_receipt_pdf(receipt_id: str, current_user: dict = Depends(get
         elements.append(Spacer(1, 10*mm))
         
         # Receipt Info
+        created_at_value = receipt.get("created_at")
+        if isinstance(created_at_value, datetime):
+            receipt_date = created_at_value.isoformat()[:10]
+        elif created_at_value:
+            receipt_date = str(created_at_value)[:10]
+        else:
+            receipt_date = ""
+
+        invoice_numbers = _extract_receipt_invoice_numbers(receipt.get("items", []))
+        invoice_numbers_summary = _format_invoice_numbers_summary(invoice_numbers, max_visible=4)
+
         info_data = [
             ["No. Resit:", receipt.get("receipt_number", "")],
-            ["Tarikh:", receipt.get("created_at", "")[:10] if receipt.get("created_at") else ""],
+            ["No. Invois:", invoice_numbers_summary],
+            ["Tarikh:", receipt_date],
             ["Nama Pembayar:", receipt.get("payer_name", "")],
             ["Email:", receipt.get("payer_email", "")],
             ["Kaedah Bayaran:", receipt.get("payment_method", "").upper()],
@@ -1688,31 +1969,37 @@ async def download_receipt_pdf(receipt_id: str, current_user: dict = Depends(get
         # Items Table
         elements.append(Paragraph("Butiran Pembayaran:", header_style))
         
-        items_header = ["Bil", "Perkara", "Kuantiti", "Jumlah (RM)"]
+        items_header = ["Bil", "Perkara", "No. Invois", "Kuantiti", "Jumlah (RM)"]
         items_data = [items_header]
         
         for i, item in enumerate(receipt.get("items", []), 1):
             qty = item.get("quantity", 1)
             amount = item.get("amount", 0) * qty
+            item_description = str(item.get("description", "") or "").strip()
+            item_title = str(item.get("name", "") or "").strip()
+            perkara_label = item_title if not item_description else f"{item_title}\n{item_description}"
+            item_invoice_label = _derive_invoice_label_from_receipt_item(item) or "-"
             items_data.append([
                 str(i),
-                f"{item.get('name', '')}\n{item.get('description', '')}",
+                perkara_label,
+                item_invoice_label,
                 str(qty),
                 f"{amount:.2f}"
             ])
         
         # Add total row
-        items_data.append(["", "", "JUMLAH:", f"RM {receipt.get('total_amount', 0):.2f}"])
+        items_data.append(["", "", "", "JUMLAH:", f"RM {receipt.get('total_amount', 0):.2f}"])
         
-        items_table = Table(items_data, colWidths=[15*mm, 95*mm, 25*mm, 35*mm])
+        items_table = Table(items_data, colWidths=[12*mm, 72*mm, 38*mm, 18*mm, 30*mm])
         items_table.setStyle(TableStyle([
             ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
             ('FONTNAME', (0, 1), (-1, -2), 'Helvetica'),
             ('FONTNAME', (0, -1), (-1, -1), 'Helvetica-Bold'),
             ('FONTSIZE', (0, 0), (-1, -1), 9),
             ('ALIGN', (0, 0), (0, -1), 'CENTER'),
-            ('ALIGN', (2, 0), (2, -1), 'CENTER'),
-            ('ALIGN', (3, 0), (3, -1), 'RIGHT'),
+            ('ALIGN', (3, 0), (3, -1), 'CENTER'),
+            ('ALIGN', (4, 0), (4, -1), 'RIGHT'),
+            ('VALIGN', (0, 0), (-1, -1), 'TOP'),
             ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#1e3a5f')),
             ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
             ('BACKGROUND', (0, -1), (-1, -1), colors.HexColor('#f0f9ff')),
@@ -1784,6 +2071,7 @@ async def get_pending_items(current_user: dict = Depends(get_current_user)):
             student_id = str(yuran.get("student_id", ""))
             child = child_map.get(student_id, {})
             due_meta = _build_due_date_meta(yuran.get("due_date"))
+            invoice_meta = _derive_invoice_number_label(yuran)
             
             student_religion = yuran.get("religion", child.get("religion", "Islam"))
             is_muslim = student_religion == "Islam"
@@ -1797,9 +2085,7 @@ async def get_pending_items(current_user: dict = Depends(get_current_user)):
             has_two_payment = within_deadline and remaining > 0 and payments_made < max_payments
             
             # Determine status - include fully paid students
-            status = yuran.get("status", "pending")
-            if remaining <= 0:
-                status = "paid"
+            status = _infer_yuran_invoice_status(yuran, float(remaining or 0))
             
             # Basic yuran info (summary view) - include ALL students
             yuran_entry = {
@@ -1814,6 +2100,9 @@ async def get_pending_items(current_user: dict = Depends(get_current_user)):
                 "tingkatan": yuran.get("tingkatan", 0),
                 "tahun": yuran.get("tahun", 0),
                 "status": status,
+                "invoice_status": status,
+                "invoice_number": invoice_meta["invoice_number"],
+                "invoice_number_label": invoice_meta["invoice_number_label"],
                 "has_two_payment": has_two_payment,
                 "student_religion": student_religion,
                 "due_date": due_meta["due_date"],
@@ -1958,6 +2247,9 @@ async def get_pending_items(current_user: dict = Depends(get_current_user)):
                         "total_amount": yuran.get("total_amount", 0),
                         "paid_amount": yuran.get("paid_amount", 0),
                         "balance": remaining,
+                        "invoice_status": status,
+                        "invoice_number": invoice_meta["invoice_number"],
+                        "invoice_number_label": invoice_meta["invoice_number_label"],
                         "items": all_items,  # ALL items including not applicable
                         "unpaid_items": unpaid_items,  # Only unpaid AND applicable for selection
                         "has_two_payment": has_two_payment,
@@ -1987,6 +2279,9 @@ async def get_pending_items(current_user: dict = Depends(get_current_user)):
                         "total_amount": total_amount_y,
                         "paid_amount": yuran.get("paid_amount", 0),
                         "balance": remaining,
+                        "invoice_status": status,
+                        "invoice_number": invoice_meta["invoice_number"],
+                        "invoice_number_label": invoice_meta["invoice_number_label"],
                         "due_date": due_meta["due_date"],
                         "days_to_due": due_meta["days_to_due"],
                         "is_overdue": due_meta["is_overdue"],
@@ -2105,7 +2400,7 @@ async def add_multiple_items_to_cart(
     cart = await get_user_cart(db, user_id)
     
     # Get the yuran record
-    yuran = await db.student_yuran.find_one({"_id": ObjectId(request.yuran_id)})
+    yuran = await db.student_yuran.find_one({"_id": _id_value(request.yuran_id)})
     if not yuran:
         raise HTTPException(status_code=404, detail="Yuran tidak dijumpai")
     
@@ -2136,14 +2431,13 @@ async def add_multiple_items_to_cart(
         "amount": total_selected,
         "quantity": 1,
         "cart_item_id": str(uuid.uuid4()),
-        "metadata": {
-            "student_name": yuran.get("student_name", ""),
-            "student_id": str(yuran.get("student_id", "")),
-            "tingkatan": yuran.get("tingkatan", 0),
-            "set_name": yuran.get("set_yuran_nama", ""),
-            "selected_items": selected_items,
-            "item_codes": request.item_codes
-        }
+        "metadata": _build_yuran_cart_metadata(
+            yuran,
+            {
+                "selected_items": selected_items,
+                "item_codes": request.item_codes,
+            },
+        ),
     }
     
     # Check if already in cart
@@ -2174,7 +2468,7 @@ async def add_two_payment_to_cart(
     
     user_id = str(current_user["_id"])
     cart = await get_user_cart(db, user_id)
-    yuran = await db.student_yuran.find_one({"_id": ObjectId(request.yuran_id)})
+    yuran = await db.student_yuran.find_one({"_id": _id_value(request.yuran_id)})
     if not yuran:
         raise HTTPException(status_code=404, detail="Yuran tidak dijumpai")
     
@@ -2210,13 +2504,13 @@ async def add_two_payment_to_cart(
         "amount": next_amount,
         "quantity": 1,
         "cart_item_id": str(uuid.uuid4()),
-        "metadata": {
-            "student_name": yuran.get("student_name", ""),
-            "student_id": str(yuran.get("student_id", "")),
-            "tingkatan": yuran.get("tingkatan", 0),
-            "payment_number": next_payment_num,
-            "max_payments": max_payments
-        }
+        "metadata": _build_yuran_cart_metadata(
+            yuran,
+            {
+                "payment_number": next_payment_num,
+                "max_payments": max_payments,
+            },
+        ),
     }
     
     existing = next((i for i in cart["items"] if i["item_id"] == request.yuran_id and i["item_type"] == "yuran_two_payment"), None)
@@ -2227,6 +2521,18 @@ async def add_two_payment_to_cart(
     total = sum(item["amount"] * item.get("quantity", 1) for item in cart["items"])
     await save_user_cart(db, user_id, cart)
     return {"message": f"Bayaran {next_payment_num}/{max_payments} ditambah ke troli", "cart": {"items": cart["items"], "total_amount": total, "item_count": len(cart["items"])}}
+
+
+@router.post("/cart/add-installment")
+async def add_installment_to_cart(
+    request: AddTwoPaymentRequest,
+    current_user: dict = Depends(get_current_user)
+):
+    """
+    Backward-compatible alias for legacy clients using /cart/add-installment.
+    Reuses current two-payment cart flow.
+    """
+    return await add_two_payment_to_cart(request=request, current_user=current_user)
 
 
 class UpdateCartItemRequest(BaseModel):
@@ -2265,12 +2571,12 @@ async def add_koperasi_kit_to_central_cart(
     db = get_db()
     user_id = str(current_user["_id"])
     student = await db.students.find_one({
-        "_id": ObjectId(student_id),
-        "$or": [{"parent_id": current_user["_id"]}, {"parent_id": ObjectId(str(current_user["_id"]))}]
+        "_id": _id_value(student_id),
+        "$or": [{"parent_id": current_user["_id"]}, {"parent_id": _id_value(str(current_user["_id"]))}]
     })
     if not student:
         raise HTTPException(status_code=404, detail="Pelajar tidak dijumpai")
-    kit = await db.koop_kits.find_one({"_id": ObjectId(kit_id), "is_active": True})
+    kit = await db.koop_kits.find_one({"_id": _id_value(kit_id), "is_active": True})
     if not kit:
         raise HTTPException(status_code=404, detail="Kit tidak dijumpai")
     products = await db.koop_products.find({"kit_id": str(kit_id), "is_active": True}).to_list(100)
@@ -2329,12 +2635,12 @@ async def add_koperasi_kit_with_sizes_to_central_cart(
     db = get_db()
     user_id = str(current_user["_id"])
     student = await db.students.find_one({
-        "_id": ObjectId(request.student_id),
-        "$or": [{"parent_id": current_user["_id"]}, {"parent_id": ObjectId(str(current_user["_id"]))}]
+        "_id": _id_value(request.student_id),
+        "$or": [{"parent_id": current_user["_id"]}, {"parent_id": _id_value(str(current_user["_id"]))}]
     })
     if not student:
         raise HTTPException(status_code=404, detail="Pelajar tidak dijumpai")
-    kit = await db.koop_kits.find_one({"_id": ObjectId(request.kit_id), "is_active": True})
+    kit = await db.koop_kits.find_one({"_id": _id_value(request.kit_id), "is_active": True})
     if not kit:
         raise HTTPException(status_code=404, detail="Kit tidak dijumpai")
     products = await db.koop_products.find({"kit_id": request.kit_id, "is_active": True}).to_list(100)

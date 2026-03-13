@@ -76,6 +76,29 @@ make app-check-ports-backend
 make app-start-clean
 make app-start-clean-dry-run
 make app-start-clean-backend
+make app-start-pgweb
+make app-start-pgweb-dry-run
+```
+
+## 2d. Pgweb (UI PostgreSQL)
+
+Jika anda mahu UI ringkas untuk lihat jadual/data PostgreSQL:
+
+```bash
+cd <PROJECT_ROOT>
+./start-pgweb.sh
+```
+
+Default akses:
+- Pgweb UI: http://localhost:8081
+- PostgreSQL DB: `localhost:5432`
+
+Opsyen contoh:
+
+```bash
+./start-pgweb.sh --listen 8082
+./start-pgweb.sh --open
+./start-pgweb.sh --dry-run
 ```
 
 ## 3. Log masuk

@@ -4,9 +4,10 @@ MRSMKU Smart360
 """
 from fastapi import APIRouter, HTTPException, Depends, Query
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from typing import List, Optional
+from typing import Any, List, Optional
 from datetime import datetime, timezone, timedelta
 from bson import ObjectId
+from services.id_normalizer import object_id_or_none
 import uuid
 
 from models.complaints import (
@@ -47,6 +48,57 @@ async def log_audit(user, action, module, details):
     """Log audit entry"""
     if _log_audit_func:
         await _log_audit_func(user, action, module, details)
+
+
+def _id_value(value: Any) -> Any:
+    """Normalize ID-like inputs while supporting non-ObjectId IDs."""
+    if value is None:
+        return None
+    if isinstance(value, ObjectId):
+        return value
+    text = str(value).strip()
+    try:
+        if ObjectId.is_valid(text):
+            return object_id_or_none(text)
+    except Exception:
+        pass
+    return text
+
+
+def _parse_iso_datetime(value: Any) -> Optional[datetime]:
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        try:
+            dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                return dt.replace(tzinfo=timezone.utc)
+            return dt
+        except Exception:
+            return None
+    return None
+
+
+def _response_delta_ms_from_audit(audit_log: Any) -> Optional[float]:
+    if not isinstance(audit_log, list) or len(audit_log) < 2:
+        return None
+    first = audit_log[0]
+    second = audit_log[1]
+    first_ts = first.get("timestamp") if isinstance(first, dict) else first
+    second_ts = second.get("timestamp") if isinstance(second, dict) else second
+    start_dt = _parse_iso_datetime(first_ts)
+    end_dt = _parse_iso_datetime(second_ts)
+    if start_dt is None or end_dt is None:
+        return None
+    delta_ms = (end_dt - start_dt).total_seconds() * 1000
+    if delta_ms < 0:
+        return None
+    return delta_ms
 
 
 def generate_complaint_number():
@@ -118,7 +170,7 @@ async def get_duty_warden_for_block(block_code: str):
     })
     
     if schedule:
-        warden = await get_db().users.find_one({"_id": ObjectId(schedule["warden_id"])})
+        warden = await get_db().users.find_one({"_id": _id_value(schedule["warden_id"])})
         if warden:
             return {
                 "warden_id": str(warden["_id"]),
@@ -225,7 +277,7 @@ async def create_complaint(
     # Create notification for assigned warden
     if assigned_warden:
         await get_db().notifications.insert_one({
-            "user_id": ObjectId(assigned_warden["warden_id"]),
+            "user_id": _id_value(assigned_warden["warden_id"]),
             "title": "Aduan Baru Diterima",
             "message": f"Aduan {complaint_doc['nombor_aduan']} telah diberikan kepada anda. Keutamaan: {COMPLAINT_PRIORITY_DISPLAY.get(complaint_data.tahap_keutamaan.value, '')}",
             "type": "action",
@@ -332,7 +384,7 @@ async def get_complaint_detail(
     current_user: dict = Depends(get_current_user)
 ):
     """Get complaint details with audit log and actions"""
-    complaint = await get_db().complaints.find_one({"_id": ObjectId(complaint_id)})
+    complaint = await get_db().complaints.find_one({"_id": _id_value(complaint_id)})
     if not complaint:
         raise HTTPException(status_code=404, detail="Aduan tidak dijumpai")
     
@@ -361,7 +413,7 @@ async def update_complaint_status(
     if role not in ["warden", "admin", "superadmin", "guru_asrama"]:
         raise HTTPException(status_code=403, detail="Tiada kebenaran untuk kemaskini status")
     
-    complaint = await get_db().complaints.find_one({"_id": ObjectId(complaint_id)})
+    complaint = await get_db().complaints.find_one({"_id": _id_value(complaint_id)})
     if not complaint:
         raise HTTPException(status_code=404, detail="Aduan tidak dijumpai")
     
@@ -394,7 +446,7 @@ async def update_complaint_status(
         }
     
     await get_db().complaints.update_one(
-        {"_id": ObjectId(complaint_id)},
+        {"_id": _id_value(complaint_id)},
         {
             "$set": update_data,
             "$push": {"audit_log": audit_entry}
@@ -422,7 +474,7 @@ async def update_complaint_status(
     
     await log_audit(current_user, "UPDATE_COMPLAINT_STATUS", "complaints", f"Aduan {complaint['nombor_aduan']} status: {status_update.status.value}")
     
-    updated = await get_db().complaints.find_one({"_id": ObjectId(complaint_id)})
+    updated = await get_db().complaints.find_one({"_id": _id_value(complaint_id)})
     return {"message": "Status berjaya dikemaskini", "complaint": serialize_complaint(updated, include_details=True)}
 
 
@@ -437,7 +489,7 @@ async def add_complaint_action(
     if role not in ["warden", "admin", "superadmin", "guru_asrama"]:
         raise HTTPException(status_code=403, detail="Tiada kebenaran untuk menambah tindakan")
     
-    complaint = await get_db().complaints.find_one({"_id": ObjectId(complaint_id)})
+    complaint = await get_db().complaints.find_one({"_id": _id_value(complaint_id)})
     if not complaint:
         raise HTTPException(status_code=404, detail="Aduan tidak dijumpai")
     
@@ -462,7 +514,7 @@ async def add_complaint_action(
     }
     
     await get_db().complaints.update_one(
-        {"_id": ObjectId(complaint_id)},
+        {"_id": _id_value(complaint_id)},
         {
             "$set": {"updated_at": now},
             "$push": {
@@ -485,7 +537,7 @@ async def add_complaint_action(
     
     await log_audit(current_user, "ADD_COMPLAINT_ACTION", "complaints", f"Tindakan untuk aduan {complaint['nombor_aduan']}")
     
-    updated = await get_db().complaints.find_one({"_id": ObjectId(complaint_id)})
+    updated = await get_db().complaints.find_one({"_id": _id_value(complaint_id)})
     return {"message": "Tindakan berjaya ditambah", "complaint": serialize_complaint(updated, include_details=True)}
 
 
@@ -500,7 +552,7 @@ async def submit_complaint_feedback(
     current_user: dict = Depends(get_current_user)
 ):
     """Submit feedback for a complaint - Only the complainant"""
-    complaint = await get_db().complaints.find_one({"_id": ObjectId(complaint_id)})
+    complaint = await get_db().complaints.find_one({"_id": _id_value(complaint_id)})
     if not complaint:
         raise HTTPException(status_code=404, detail="Aduan tidak dijumpai")
     
@@ -531,7 +583,7 @@ async def submit_complaint_feedback(
     }
     
     await get_db().complaints.update_one(
-        {"_id": ObjectId(complaint_id)},
+        {"_id": _id_value(complaint_id)},
         {
             "$set": {
                 "feedback": feedback_data,
@@ -545,7 +597,7 @@ async def submit_complaint_feedback(
     # Notify warden about feedback
     if complaint.get("warden_assigned"):
         await get_db().notifications.insert_one({
-            "user_id": ObjectId(complaint["warden_assigned"]),
+            "user_id": _id_value(complaint["warden_assigned"]),
             "title": "Maklum Balas Diterima",
             "message": f"Pengadu telah memberikan rating {rating}/5 untuk aduan {complaint['nombor_aduan']}",
             "type": "info",
@@ -571,20 +623,23 @@ async def get_trending_complaint_categories(
     if role not in ["warden", "admin", "superadmin"]:
         raise HTTPException(status_code=403, detail="Tiada kebenaran")
     
-    # Only count unresolved complaints
-    pipeline = [
-        {"$match": {"status": {"$nin": ["selesai", "ditutup"]}}},
-        {"$group": {
-            "_id": "$jenis_aduan",
-            "count": {"$sum": 1},
-            "complaint_ids": {"$push": {"$toString": "$_id"}},
-            "latest": {"$max": "$created_at"}
-        }},
-        {"$sort": {"count": -1}},
-        {"$limit": limit}
+    grouped = {}
+    async for complaint in get_db().complaints.find({"status": {"$nin": ["selesai", "ditutup"]}}):
+        complaint_type = complaint.get("jenis_aduan")
+        if not complaint_type:
+            continue
+        if complaint_type not in grouped:
+            grouped[complaint_type] = {"count": 0, "complaint_ids": [], "latest": None}
+        grouped[complaint_type]["count"] += 1
+        grouped[complaint_type]["complaint_ids"].append(str(complaint.get("_id", "")))
+        created_at = complaint.get("created_at")
+        if grouped[complaint_type]["latest"] is None or str(created_at) > str(grouped[complaint_type]["latest"]):
+            grouped[complaint_type]["latest"] = created_at
+
+    results = [
+        {"_id": complaint_type, **values}
+        for complaint_type, values in sorted(grouped.items(), key=lambda item: item[1]["count"], reverse=True)[:limit]
     ]
-    
-    results = await get_db().complaints.aggregate(pipeline).to_list(limit)
     
     trending = []
     for r in results:
@@ -738,23 +793,24 @@ async def get_dashboard_stats(
     unresolved_query = {**base_query, "status": {"$nin": ["selesai", "ditutup"]}}
     aduan_belum_selesai = await get_db().complaints.count_documents(unresolved_query)
     
-    # Complaints by category
-    pipeline = [
-        {"$match": base_query},
-        {"$group": {"_id": "$jenis_aduan", "count": {"$sum": 1}}}
-    ]
-    category_results = await get_db().complaints.aggregate(pipeline).to_list(100)
+    complaint_type_counts = {}
+    complaint_status_counts = {}
+    async for complaint in get_db().complaints.find(base_query):
+        complaint_type = complaint.get("jenis_aduan")
+        complaint_status = complaint.get("status")
+        if complaint_type:
+            complaint_type_counts[complaint_type] = complaint_type_counts.get(complaint_type, 0) + 1
+        if complaint_status:
+            complaint_status_counts[complaint_status] = complaint_status_counts.get(complaint_status, 0) + 1
+
+    category_results = [{"_id": key, "count": value} for key, value in complaint_type_counts.items()]
     aduan_ikut_kategori = {
         COMPLAINT_TYPE_DISPLAY.get(r["_id"], r["_id"]): r["count"] 
         for r in category_results
     }
     
     # Complaints by status
-    pipeline_status = [
-        {"$match": base_query},
-        {"$group": {"_id": "$status", "count": {"$sum": 1}}}
-    ]
-    status_results = await get_db().complaints.aggregate(pipeline_status).to_list(100)
+    status_results = [{"_id": key, "count": value} for key, value in complaint_status_counts.items()]
     aduan_ikut_status = {
         COMPLAINT_STATUS_DISPLAY.get(r["_id"], r["_id"]): r["count"] 
         for r in status_results
@@ -764,32 +820,28 @@ async def get_dashboard_stats(
     prestasi_respon = {}
     if role in ["admin", "superadmin"]:
         # Calculate average response time
-        pipeline_response = [
-            {"$match": {"status": {"$ne": "baru_dihantar"}}},
-            {"$project": {
-                "warden_name": 1,
-                "response_time": {
-                    "$subtract": [
-                        {"$dateFromString": {"dateString": {"$arrayElemAt": ["$audit_log.timestamp", 1]}}},
-                        {"$dateFromString": {"dateString": {"$arrayElemAt": ["$audit_log.timestamp", 0]}}}
-                    ]
-                }
-            }},
-            {"$group": {
-                "_id": "$warden_name",
-                "avg_response_ms": {"$avg": "$response_time"},
-                "total_handled": {"$sum": 1}
-            }}
-        ]
         try:
-            response_results = await get_db().complaints.aggregate(pipeline_response).to_list(100)
-            for r in response_results:
-                if r["_id"]:
-                    avg_hours = (r["avg_response_ms"] or 0) / (1000 * 60 * 60)
-                    prestasi_respon[r["_id"]] = {
-                        "avg_response_hours": round(avg_hours, 1),
-                        "total_handled": r["total_handled"]
-                    }
+            response_stats = {}
+            async for complaint in get_db().complaints.find({"status": {"$ne": "baru_dihantar"}}):
+                warden_name = complaint.get("warden_name")
+                if not warden_name:
+                    continue
+                response_delta_ms = _response_delta_ms_from_audit(complaint.get("audit_log"))
+                if response_delta_ms is None:
+                    continue
+                if warden_name not in response_stats:
+                    response_stats[warden_name] = {"total_ms": 0.0, "count": 0}
+                response_stats[warden_name]["total_ms"] += response_delta_ms
+                response_stats[warden_name]["count"] += 1
+
+            for warden_name, stats in response_stats.items():
+                if stats["count"] <= 0:
+                    continue
+                avg_hours = (stats["total_ms"] / stats["count"]) / (1000 * 60 * 60)
+                prestasi_respon[warden_name] = {
+                    "avg_response_hours": round(avg_hours, 1),
+                    "total_handled": stats["count"],
+                }
         except Exception:
             pass
     
@@ -839,13 +891,16 @@ async def get_monthly_report(
     kadar_penyelesaian = (resolved_count / jumlah_aduan * 100) if jumlah_aduan > 0 else 0
     
     # Most common complaint types
-    pipeline_types = [
-        {"$match": query},
-        {"$group": {"_id": "$jenis_aduan", "count": {"$sum": 1}}},
-        {"$sort": {"count": -1}},
-        {"$limit": 5}
-    ]
-    type_results = await get_db().complaints.aggregate(pipeline_types).to_list(5)
+    complaint_type_counts = {}
+    async for complaint in get_db().complaints.find(query):
+        complaint_type = complaint.get("jenis_aduan")
+        if complaint_type:
+            complaint_type_counts[complaint_type] = complaint_type_counts.get(complaint_type, 0) + 1
+    type_results = sorted(
+        [{"_id": complaint_type, "count": count} for complaint_type, count in complaint_type_counts.items()],
+        key=lambda row: row["count"],
+        reverse=True,
+    )[:5]
     jenis_aduan_kerap = [
         {"jenis": COMPLAINT_TYPE_DISPLAY.get(r["_id"], r["_id"]), "count": r["count"]}
         for r in type_results

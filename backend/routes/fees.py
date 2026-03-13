@@ -10,6 +10,7 @@ from fastapi import APIRouter, HTTPException, Depends
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 from bson import ObjectId
+from services.id_normalizer import object_id_or_none
 
 router = APIRouter(prefix="/api/fees", tags=["Fees"])
 security = HTTPBearer(auto_error=False)
@@ -47,10 +48,8 @@ def _as_object_id_if_valid(value):
     if isinstance(value, ObjectId):
         return value
     if isinstance(value, str):
-        try:
-            return ObjectId(value)
-        except Exception:
-            return value
+        oid = object_id_or_none(value)
+        return oid if oid is not None else value
     return value
 
 

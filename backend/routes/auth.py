@@ -2,9 +2,11 @@
 Authentication Routes - Login, Register, Impersonate, Forgot/Reset Password
 """
 import secrets
+import uuid
 from datetime import datetime, timezone, timedelta
 from typing import Optional, List
 from bson import ObjectId
+from services.id_normalizer import object_id_or_none
 
 from fastapi import APIRouter, HTTPException, Depends, Query
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -12,6 +14,10 @@ from pydantic import BaseModel, EmailStr, validator
 from passlib.context import CryptContext
 from jose import JWTError, jwt
 import os
+from services.tenant_enforcement import (
+    require_user_tenant_context,
+    stamp_tenant_fields as apply_tenant_fields,
+)
 
 # Config
 JWT_SECRET = os.environ.get("JWT_SECRET", "mrsm-secret-key")
@@ -135,6 +141,7 @@ class UserCreate(BaseModel):
     postcode: Optional[str] = None
     city: Optional[str] = None
     state: Optional[str] = None
+    tenant_code: Optional[str] = None
     children: Optional[List[ChildInfo]] = None
     
     @validator('full_name')
@@ -160,6 +167,11 @@ class UserCreate(BaseModel):
         if v:
             return validate_gender(v)
         return v
+
+    @validator('tenant_code')
+    def normalize_tenant_code(cls, v):
+        text = str(v or "").strip().lower()
+        return text or None
 
 
 class UserLogin(BaseModel):
@@ -205,6 +217,8 @@ class UserResponse(BaseModel):
     assigned_block: Optional[str] = None
     staff_id: Optional[str] = None
     matric_number: Optional[str] = None
+    tenant_id: Optional[str] = None
+    tenant_code: Optional[str] = None
     permissions: List[str] = []
     must_change_password: bool = False
     assigned_bus_id: Optional[str] = None  # for bus_driver: which bus they drive
@@ -224,11 +238,65 @@ def init_db(database, roles, role_permissions):
     ROLE_PERMISSIONS = role_permissions
 
 
+def _id_value(
+    value: object,
+    *,
+    strict: bool = False,
+    status_code: int = 400,
+    error_detail: str = "ID tidak sah",
+):
+    """Normalize ID-like inputs while supporting non-ObjectId IDs."""
+    if value is None:
+        if strict:
+            raise HTTPException(status_code=status_code, detail=error_detail)
+        return None
+    if isinstance(value, ObjectId):
+        return value
+    text = str(value).strip()
+    try:
+        if ObjectId.is_valid(text):
+            return object_id_or_none(text)
+    except Exception:
+        pass
+    if strict:
+        raise HTTPException(status_code=status_code, detail=error_detail)
+    return text
+
+
 def create_access_token(data: dict):
     to_encode = data.copy()
     expire = datetime.now(timezone.utc) + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     to_encode.update({"exp": expire})
     return jwt.encode(to_encode, JWT_SECRET, algorithm=JWT_ALGORITHM)
+
+
+async def _attach_user_tenant_context(user: Optional[dict]) -> Optional[dict]:
+    if not user:
+        return user
+    if user.get("tenant_id"):
+        if user.get("tenant_code"):
+            return user
+        tenant = await db.tenants.find_one({"_id": _id_value(user.get("tenant_id"))})
+        if tenant:
+            user["tenant_code"] = tenant.get("tenant_code", user.get("tenant_code"))
+        return user
+
+    user_id_text = str(user.get("_id", "")).strip()
+    if not user_id_text:
+        return user
+    memberships = await (
+        db.tenant_user_memberships.find(
+            {"user_id": user_id_text, "status": {"$in": ["active", "invited"]}}
+        )
+        .sort([("is_primary", -1), ("updated_at", -1), ("created_at", -1)])
+        .limit(1)
+        .to_list(1)
+    )
+    membership = memberships[0] if memberships else None
+    if membership:
+        user["tenant_id"] = membership.get("tenant_id")
+        user["tenant_code"] = membership.get("tenant_code")
+    return user
 
 
 async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
@@ -237,11 +305,18 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
         user_id = payload.get("sub")
         if not user_id:
             raise HTTPException(status_code=401, detail="Token tidak sah")
-        user = await db.users.find_one({"_id": ObjectId(user_id)})
+        user = await db.users.find_one({
+            "_id": _id_value(user_id, strict=True, status_code=401, error_detail="Token tidak sah")
+        })
         if not user:
             raise HTTPException(status_code=401, detail="Pengguna tidak dijumpai")
         if not user.get("is_active", True):
             raise HTTPException(status_code=403, detail="Akaun tidak aktif")
+        user = await _attach_user_tenant_context(user)
+        require_user_tenant_context(
+            user,
+            detail="Tenant context pengguna tidak lengkap. Sila hubungi superadmin institusi.",
+        )
         return user
     except JWTError:
         raise HTTPException(status_code=401, detail="Token tidak sah")
@@ -256,8 +331,13 @@ async def get_current_user_optional(credentials: Optional[HTTPAuthorizationCrede
         user_id = payload.get("sub")
         if not user_id:
             return None
-        user = await db.users.find_one({"_id": ObjectId(user_id)})
+        user = await db.users.find_one({"_id": _id_value(user_id)})
         if not user or not user.get("is_active", True):
+            return None
+        user = await _attach_user_tenant_context(user)
+        try:
+            require_user_tenant_context(user)
+        except HTTPException:
             return None
         return user
     except Exception:
@@ -273,15 +353,17 @@ def require_roles(*roles):
 
 
 async def log_audit(user: dict, action: str, module: str, details: str):
-    await db.audit_logs.insert_one({
+    doc = {
         "user_id": user["_id"],
         "user_name": user.get("full_name", "Unknown"),
         "user_role": user.get("role", "unknown"),
         "action": action,
         "module": module,
         "details": details,
-        "created_at": datetime.now(timezone.utc).isoformat()
-    })
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    apply_tenant_fields(doc, user)
+    await db.audit_logs.insert_one(doc)
 
 
 def serialize_user(user: dict) -> UserResponse:
@@ -301,6 +383,8 @@ def serialize_user(user: dict) -> UserResponse:
         assigned_block=user.get("assigned_block", user.get("block_assigned", "")),
         staff_id=user.get("staff_id"),
         matric_number=user.get("matric_number", user.get("matric", "")),
+        tenant_id=(str(v) if (v := user.get("tenant_id")) is not None else None),
+        tenant_code=user.get("tenant_code"),
         permissions=permissions if "*" not in permissions else ["*"],
         must_change_password=user.get("must_change_password", False),
         assigned_bus_id=str(user["assigned_bus_id"]) if user.get("assigned_bus_id") is not None else None
@@ -334,6 +418,13 @@ async def register(user_data: UserCreate):
     existing = await db.users.find_one({"email": user_data.email})
     if existing:
         raise HTTPException(status_code=400, detail="Email sudah didaftarkan")
+
+    tenant_doc = None
+    tenant_code = str(user_data.tenant_code or "").strip().lower()
+    if tenant_code:
+        tenant_doc = await db.tenants.find_one({"tenant_code": tenant_code, "status": "active"})
+        if not tenant_doc:
+            raise HTTPException(status_code=400, detail="tenant_code tidak sah atau institusi belum aktif")
     
     # Senarai Kelas dari ketetapan - kelas anak mesti dalam senarai
     valid_kelas = ["A", "B", "C", "D", "E", "F"]
@@ -367,8 +458,30 @@ async def register(user_data: UserCreate):
         "is_active": True,
         "created_at": datetime.now(timezone.utc).isoformat()
     }
+    if tenant_doc:
+        user_doc["tenant_id"] = str(tenant_doc.get("_id", ""))
+        user_doc["tenant_code"] = tenant_doc.get("tenant_code", tenant_code)
     result = await db.users.insert_one(user_doc)
     user_doc["_id"] = result.inserted_id
+    if tenant_doc:
+        await db.tenant_user_memberships.update_one(
+            {"tenant_id": str(tenant_doc.get("_id", "")), "user_id": str(result.inserted_id)},
+            {"$set": {
+                "tenant_id": str(tenant_doc.get("_id", "")),
+                "tenant_code": tenant_doc.get("tenant_code", tenant_code),
+                "user_id": str(result.inserted_id),
+                "email": user_data.email,
+                "role": "parent",
+                "status": "active",
+                "is_primary": True,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            },
+             "$setOnInsert": {
+                 "_id": uuid.uuid4().hex,
+                 "created_at": datetime.now(timezone.utc).isoformat(),
+             }},
+            upsert=True,
+        )
     
     user_id_str = str(result.inserted_id)
     qr_code = generate_user_qr_code_data(user_id_str)
@@ -414,6 +527,9 @@ async def register(user_data: UserCreate):
                 "parent_id": result.inserted_id,
                 "created_at": datetime.now(timezone.utc).isoformat()
             }
+            if tenant_doc:
+                student_doc["tenant_id"] = str(tenant_doc.get("_id", ""))
+                student_doc["tenant_code"] = tenant_doc.get("tenant_code", tenant_code)
             await db.students.insert_one(student_doc)
             children_registered.append(child.full_name)
         
@@ -522,7 +638,9 @@ async def impersonate_user(
     current_user: dict = Depends(require_roles("superadmin"))
 ):
     """SuperAdmin can impersonate any user"""
-    target_user = await db.users.find_one({"_id": ObjectId(request.user_id)})
+    target_user = await db.users.find_one({
+        "_id": _id_value(request.user_id, strict=True, status_code=400, error_detail="ID pengguna tidak sah")
+    })
     if not target_user:
         raise HTTPException(status_code=404, detail="Pengguna tidak dijumpai")
     

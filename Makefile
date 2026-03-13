@@ -5,6 +5,8 @@ DB_ENGINE ?= postgres
 BACKEND_DIR := $(PROJECT_ROOT)/backend
 CHECK_PORTS_SCRIPT := $(PROJECT_ROOT)/check-ports.sh
 START_CLEAN_SCRIPT := $(PROJECT_ROOT)/start-clean.sh
+START_PGWEB_SCRIPT := $(PROJECT_ROOT)/start-pgweb.sh
+PGWEB_LISTEN ?= 8081
 
 SYSTEMD_SCRIPTS_DIR := $(PROJECT_ROOT)/backend/deploy/systemd
 PROM_INSTALLER := $(SYSTEMD_SCRIPTS_DIR)/install_mrsm_prometheus_token_timer.sh
@@ -23,7 +25,7 @@ PG_RECONCILE_SOURCE ?= postgres
 PG_RECONCILE_COLLECTIONS ?= notifications audit_logs student_yuran yuran_payments accounting_categories accounting_transactions accounting_audit_logs accounting_journal_entries accounting_journal_lines tabung_campaigns tabung_donations financial_ledger
 
 .PHONY: help app-help prom-help pg-help \
-	app-check-ports app-check-ports-backend app-start-clean app-start-clean-dry-run app-start-clean-backend \
+	app-check-ports app-check-ports-backend app-start-clean app-start-clean-dry-run app-start-clean-backend app-start-pgweb app-start-pgweb-dry-run \
 	pg-cutover pg-cutover-reconcile pg-cutover-prune pg-parity pg-reconcile-dry-run pg-reconcile pg-reconcile-prune \
 	prom-install prom-install-dry-run \
 	prom-check prom-check-scrape prom-status prom-status-no-scrape \
@@ -40,9 +42,12 @@ app-help:
 	@echo "  make app-start-clean          # clean konflik port + start backend(single) + frontend"
 	@echo "  make app-start-clean-dry-run  # simulasi tindakan tanpa ubah sistem"
 	@echo "  make app-start-clean-backend  # clean konflik + start backend(single) sahaja"
+	@echo "  make app-start-pgweb          # start pgweb (default http://localhost:8081)"
+	@echo "  make app-start-pgweb-dry-run  # semak command pgweb tanpa start"
 	@echo ""
 	@echo "Optional overrides:"
 	@echo "  DB_ENGINE=postgres|hybrid|mongo"
+	@echo "  PGWEB_LISTEN=8081"
 
 prom-help:
 	@echo "MRSM Prometheus Token Refresh shortcuts:"
@@ -94,6 +99,12 @@ app-start-clean-dry-run:
 
 app-start-clean-backend:
 	DB_ENGINE="$(DB_ENGINE)" "$(START_CLEAN_SCRIPT)" --backend-only
+
+app-start-pgweb:
+	"$(START_PGWEB_SCRIPT)" --listen "$(PGWEB_LISTEN)"
+
+app-start-pgweb-dry-run:
+	"$(START_PGWEB_SCRIPT)" --listen "$(PGWEB_LISTEN)" --dry-run
 
 pg-cutover:
 	cd "$(BACKEND_DIR)" && ./scripts/cutover_core_to_postgres.sh

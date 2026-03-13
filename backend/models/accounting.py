@@ -4,7 +4,7 @@ Sistem Perakaunan MRSM Bersepadu dengan Kawalan Audit
 """
 
 from pydantic import BaseModel, Field
-from typing import Optional, List
+from typing import Optional, List, Dict, Any
 from datetime import datetime
 from enum import Enum
 
@@ -505,6 +505,9 @@ class AGMExecutiveSummaryResponse(BaseModel):
     # Catatan Penting
     highlights: List[str]
     recommendations: List[str]
+    quality_status: str = "pass"
+    quality_checks: List[Dict[str, Any]] = Field(default_factory=list)
+    professional_header: Dict[str, Any] = Field(default_factory=dict)
 
 
 # ==================== TRIAL BALANCE / IMBANGAN DUGA ====================

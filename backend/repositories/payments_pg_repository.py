@@ -9,6 +9,11 @@ from fastapi import HTTPException
 from models_sql.core_documents import CoreDocument
 from repositories.core_store import CoreStore
 from services.number_sequence_service import next_sequence_value
+from services.tenant_enforcement import (
+    assert_tenant_doc_access as enforce_tenant_doc_access,
+    stamp_tenant_fields as apply_tenant_fields,
+    tenant_scope_query as build_tenant_scope_query,
+)
 
 
 def _as_object_id_str(value: Any) -> str:
@@ -21,6 +26,26 @@ def _doc_with_id(row: CoreDocument) -> Dict[str, Any]:
     out = dict(row.document or {})
     out["_id"] = row.document_id
     return out
+
+
+def _tenant_scope_from_user(current_user: Dict[str, Any]) -> Dict[str, str]:
+    return build_tenant_scope_query(
+        current_user,
+        detail="Tenant context diperlukan untuk operasi pembayaran.",
+    )
+
+
+def _assert_tenant_doc_access(current_user: Dict[str, Any], doc: Optional[Dict[str, Any]], resource_name: str) -> None:
+    enforce_tenant_doc_access(current_user, doc, resource_name)
+
+
+def _stamp_tenant_fields(
+    doc: Dict[str, Any],
+    current_user: Dict[str, Any],
+    *,
+    fallback_doc: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    return apply_tenant_fields(doc, current_user, fallback_doc=fallback_doc)
 
 
 async def create_payment_with_transaction(
@@ -45,6 +70,7 @@ async def create_payment_with_transaction(
                 raise HTTPException(status_code=404, detail="Yuran tidak dijumpai. Sila gunakan /api/yuran/bayar/{student_yuran_id}")
 
             yuran = _doc_with_id(fee_row)
+            _assert_tenant_doc_access(current_user, yuran, "rekod yuran")
             student_id = _as_object_id_str(yuran.get("student_id"))
             student_row: Optional[CoreDocument] = None
             if student_id:
@@ -53,6 +79,7 @@ async def create_payment_with_transaction(
                     {"collection_name": "students", "document_id": student_id},
                 )
             student = _doc_with_id(student_row) if student_row else None
+            _assert_tenant_doc_access(current_user, student, "rekod pelajar")
 
             if current_user.get("role") == "parent" and student and str(student.get("parent_id")) != str(current_user.get("_id")):
                 raise HTTPException(status_code=403, detail="Akses ditolak")
@@ -87,6 +114,7 @@ async def create_payment_with_transaction(
                 "receipt_number": receipt_number,
                 "created_at": now_iso,
             }
+            _stamp_tenant_fields(payment_doc, current_user, fallback_doc=yuran)
 
             session.add(
                 CoreDocument(
@@ -127,6 +155,7 @@ async def create_payment_with_transaction(
                     "is_read": False,
                     "created_at": now_iso,
                 }
+                _stamp_tenant_fields(notif_doc, current_user, fallback_doc=yuran)
                 session.add(
                     CoreDocument(
                         collection_name="notifications",
@@ -146,6 +175,7 @@ async def create_payment_with_transaction(
                 "details": f"Bayar RM{amount} untuk {yuran.get('student_name', '')}",
                 "created_at": now_iso,
             }
+            _stamp_tenant_fields(audit_doc, current_user, fallback_doc=yuran)
             session.add(
                 CoreDocument(
                     collection_name="audit_logs",
@@ -157,8 +187,9 @@ async def create_payment_with_transaction(
     if core_store.is_mirror_mode():
         mongo_db = core_store.get_mongo_db()
         try:
+            tenant_scope = _tenant_scope_from_user(current_user)
             await mongo_db.payments.insert_one(
-                {
+                _stamp_tenant_fields({
                     "_id": ObjectId(payment_id),
                     "fee_id": ObjectId(fee_id) if len(fee_id) == 24 else fee_id,
                     "user_id": current_user.get("_id"),
@@ -167,10 +198,11 @@ async def create_payment_with_transaction(
                     "status": "completed",
                     "receipt_number": receipt_number,
                     "created_at": now_iso,
-                }
+                }, current_user, fallback_doc=yuran)
             )
+            yuran_mirror_filter = {"_id": ObjectId(fee_id) if len(fee_id) == 24 else fee_id, **tenant_scope}
             await mongo_db.student_yuran.update_one(
-                {"_id": ObjectId(fee_id) if len(fee_id) == 24 else fee_id},
+                yuran_mirror_filter,
                 {
                     "$set": {"paid_amount": new_paid_amount, "status": new_status, "updated_at": now_iso},
                     "$push": {
@@ -187,7 +219,7 @@ async def create_payment_with_transaction(
             )
             if student and student.get("parent_id"):
                 await mongo_db.notifications.insert_one(
-                    {
+                    _stamp_tenant_fields({
                         "_id": ObjectId(notif_id),
                         "user_id": student["parent_id"],
                         "title": "Pembayaran Berjaya",
@@ -195,10 +227,10 @@ async def create_payment_with_transaction(
                         "type": "success",
                         "is_read": False,
                         "created_at": now_iso,
-                    }
+                    }, current_user, fallback_doc=yuran)
                 )
             await mongo_db.audit_logs.insert_one(
-                {
+                _stamp_tenant_fields({
                     "_id": ObjectId(audit_id),
                     "user_id": current_user.get("_id"),
                     "user_name": current_user.get("full_name", "Unknown"),
@@ -207,7 +239,7 @@ async def create_payment_with_transaction(
                     "module": "payments",
                     "details": f"Bayar RM{amount} untuk {yuran.get('student_name', '')}",
                     "created_at": now_iso,
-                }
+                }, current_user, fallback_doc=yuran)
             )
         except Exception:
             # Mirror is best-effort during transition.

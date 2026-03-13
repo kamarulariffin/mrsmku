@@ -63,6 +63,29 @@ def require_roles(*roles):
     return role_checker
 
 
+@router.get("")
+@router.get("/")
+async def get_dashboard_root(current_user: dict = Depends(get_current_user)):
+    """
+    Backward-compatible dashboard root.
+    Auto-routes to role-specific dashboard payload.
+    """
+    role = current_user.get("role")
+    if role == "parent":
+        return await get_parent_dashboard(current_user)
+    if role in ("superadmin", "admin", "bendahari"):
+        return await get_admin_dashboard(current_user)
+    if role == "pelajar":
+        return await get_pelajar_dashboard(current_user)
+    if role == "warden":
+        return await get_warden_dashboard(current_user)
+    if role == "guard":
+        return await get_guard_dashboard(current_user)
+    if role in ("guru_kelas", "guru_homeroom"):
+        return await get_guru_dashboard(current_user)
+    raise HTTPException(status_code=403, detail="Akses ditolak untuk role ini")
+
+
 # ============ PARENT DASHBOARD ============
 
 @router.get("/parent")

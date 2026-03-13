@@ -8,6 +8,7 @@ from typing import Any, List, Optional
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 from bson import ObjectId
+from services.id_normalizer import object_id_or_none
 import qrcode
 
 router = APIRouter(prefix="/api/agm", tags=["AGM"])
@@ -174,6 +175,21 @@ def serialize_doc(doc):
     doc['id'] = str(doc.pop('_id'))
     return doc
 
+
+def _id_value(value: Any) -> Any:
+    """Normalize ID-like inputs while supporting non-ObjectId IDs."""
+    if value is None:
+        return None
+    if isinstance(value, ObjectId):
+        return value
+    text = str(value).strip()
+    try:
+        if ObjectId.is_valid(text):
+            return object_id_or_none(text)
+    except Exception:
+        pass
+    return text
+
 async def check_muafakat_fee_status(user_id: str) -> dict:
     """
     Check Muafakat fee status for all children of a parent user.
@@ -192,7 +208,7 @@ async def check_muafakat_fee_status(user_id: str) -> dict:
     
     try:
         # Find all children (students) of this parent
-        children = await _find_many("students", {"parent_id": ObjectId(user_id)})
+        children = await _find_many("students", {"parent_id": _id_value(user_id)})
         result["total_children"] = len(children)
         
         current_year = datetime.now().year
@@ -292,7 +308,7 @@ async def get_all_agm_events():
 async def get_agm_event(event_id: str):
     """Get single AGM event by ID"""
     try:
-        event = await _find_one("agm_events", {"_id": ObjectId(event_id)})
+        event = await _find_one("agm_events", {"_id": _id_value(event_id)})
         if not event:
             raise HTTPException(status_code=404, detail="Event tidak dijumpai")
         return {"event": serialize_doc(event)}
@@ -308,7 +324,7 @@ async def update_agm_event(event_id: str, event: AGMEventCreate):
         
         result = await _update_one(
             "agm_events",
-            {"_id": ObjectId(event_id)},
+            {"_id": _id_value(event_id)},
             {"$set": event_dict}
         )
         
@@ -323,7 +339,7 @@ async def update_agm_event(event_id: str, event: AGMEventCreate):
 async def delete_agm_event(event_id: str):
     """Delete AGM event"""
     try:
-        result = await _delete_one("agm_events", {"_id": ObjectId(event_id)})
+        result = await _delete_one("agm_events", {"_id": _id_value(event_id)})
         if result.deleted_count == 0:
             raise HTTPException(status_code=404, detail="Event tidak dijumpai")
         
@@ -508,7 +524,7 @@ async def update_attendee_status(attendee_id: str, status: str, kategori: Option
             
         result = await _update_one(
             "agm_attendees",
-            {"_id": ObjectId(attendee_id)},
+            {"_id": _id_value(attendee_id)},
             {"$set": update_data}
         )
         
@@ -543,7 +559,7 @@ async def get_event_agendas(event_id: str):
 async def delete_agenda(agenda_id: str):
     """Delete agenda item"""
     try:
-        result = await _delete_one("agm_agendas", {"_id": ObjectId(agenda_id)})
+        result = await _delete_one("agm_agendas", {"_id": _id_value(agenda_id)})
         if result.deleted_count == 0:
             raise HTTPException(status_code=404, detail="Agenda tidak dijumpai")
         return {"message": "Agenda berjaya dipadam"}
@@ -574,7 +590,7 @@ async def get_event_documents(event_id: str):
 async def delete_document(document_id: str):
     """Delete document"""
     try:
-        result = await _delete_one("agm_documents", {"_id": ObjectId(document_id)})
+        result = await _delete_one("agm_documents", {"_id": _id_value(document_id)})
         if result.deleted_count == 0:
             raise HTTPException(status_code=404, detail="Dokumen tidak dijumpai")
         return {"message": "Dokumen berjaya dipadam"}
@@ -588,7 +604,7 @@ async def get_event_report(event_id: str):
     """Get comprehensive report for an AGM event"""
     try:
         # Get event details
-        event = await _find_one("agm_events", {"_id": ObjectId(event_id)})
+        event = await _find_one("agm_events", {"_id": _id_value(event_id)})
         if not event:
             raise HTTPException(status_code=404, detail="Event tidak dijumpai")
         
@@ -794,7 +810,7 @@ async def get_agm_membership_status(user_id: str) -> dict:
 async def get_user_qr_code(user_id: str):
     """Get permanent QR code for a user"""
     try:
-        user = await _find_one("users", {"_id": ObjectId(user_id)})
+        user = await _find_one("users", {"_id": _id_value(user_id)})
         if not user:
             raise HTTPException(status_code=404, detail="Pengguna tidak dijumpai")
         
@@ -810,7 +826,7 @@ async def get_user_qr_code(user_id: str):
             # Save to user document
             await _update_one(
                 "users",
-                {"_id": ObjectId(user_id)},
+                {"_id": _id_value(user_id)},
                 {"$set": {
                     "qr_code": qr_code,
                     "qr_code_image": qr_code_image,
@@ -834,7 +850,7 @@ async def get_user_qr_code(user_id: str):
 async def get_user_agm_status(user_id: str):
     """Get AGM membership status for a user (based on Muafakat fee)"""
     try:
-        user = await _find_one("users", {"_id": ObjectId(user_id)})
+        user = await _find_one("users", {"_id": _id_value(user_id)})
         if not user:
             raise HTTPException(status_code=404, detail="Pengguna tidak dijumpai")
         
@@ -866,7 +882,7 @@ async def get_user_agm_status(user_id: str):
 async def get_user_profile_with_qr(user_id: str):
     """Get complete user profile with QR code and AGM status"""
     try:
-        user = await _find_one("users", {"_id": ObjectId(user_id)})
+        user = await _find_one("users", {"_id": _id_value(user_id)})
         if not user:
             raise HTTPException(status_code=404, detail="Pengguna tidak dijumpai")
         
@@ -880,7 +896,7 @@ async def get_user_profile_with_qr(user_id: str):
             
             await _update_one(
                 "users",
-                {"_id": ObjectId(user_id)},
+                {"_id": _id_value(user_id)},
                 {"$set": {
                     "qr_code": qr_code,
                     "qr_code_image": qr_code_image,
@@ -896,7 +912,7 @@ async def get_user_profile_with_qr(user_id: str):
         # Get children info if parent
         children = []
         if user.get("role") == "parent":
-            children_docs = await _find_many("students", {"parent_id": ObjectId(user_id)})
+            children_docs = await _find_many("students", {"parent_id": _id_value(user_id)})
             for child in children_docs:
                 children.append({
                     "id": str(child["_id"]),
@@ -944,12 +960,12 @@ async def scan_user_attendance(qr_code: str, event_id: str):
         user_id = qr_code.replace("MRSMKU-USER-", "")
         
         # Find user
-        user = await _find_one("users", {"_id": ObjectId(user_id)})
+        user = await _find_one("users", {"_id": _id_value(user_id)})
         if not user:
             raise HTTPException(status_code=404, detail="Pengguna tidak dijumpai")
         
         # Check if event exists
-        event = await _find_one("agm_events", {"_id": ObjectId(event_id)})
+        event = await _find_one("agm_events", {"_id": _id_value(event_id)})
         if not event:
             raise HTTPException(status_code=404, detail="Event AGM tidak dijumpai")
         

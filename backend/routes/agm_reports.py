@@ -6,9 +6,10 @@ Standard Accounting Reports for Presentation
 from fastapi import APIRouter, HTTPException, Depends, Query
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.responses import StreamingResponse
-from typing import Optional, List
+from typing import Optional, List, Dict, Any, Tuple
 from datetime import datetime, timezone
 from bson import ObjectId
+from services.id_normalizer import object_id_or_none
 import io
 
 from models.accounting import (
@@ -20,6 +21,7 @@ from models.accounting import (
     TrialBalanceItem,
     MALAY_MONTHS, TRANSACTION_TYPE_DISPLAY, BANK_ACCOUNT_TYPE_DISPLAY
 )
+from routes.accounting_financial_year_utils import ensure_current_financial_year
 
 router = APIRouter(prefix="/api/accounting-full/agm", tags=["AGM Reports"])
 security = HTTPBearer(auto_error=False)
@@ -61,9 +63,173 @@ def check_accounting_access(user):
 
 # ==================== HELPER FUNCTIONS ====================
 
+def _as_float(value: object) -> float:
+    try:
+        return float(value or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _safe_ratio(numerator: float, denominator: float) -> float:
+    if denominator <= 0:
+        return 0.0
+    return numerator / denominator
+
+
+def _build_professional_header(
+    *,
+    financial_year_name: str,
+    start_date: str,
+    end_date: str,
+    prepared_by_name: str,
+    prepared_by_role: str,
+) -> Dict[str, Any]:
+    now_local = datetime.now(timezone.utc).astimezone()
+    clean_year = str(financial_year_name or "").replace("/", "-").replace(" ", "")
+    reference = f"AGM-{clean_year or 'FY'}-{now_local.strftime('%Y%m%d%H%M')}"
+    return {
+        "organization_name": "MUAFAKAT - Badan Pemuafakatan Pendidikan MARA Malaysia",
+        "document_title_ms": "Laporan Penyata Kewangan Tahunan",
+        "document_title_en": "Annual Financial Statement Report",
+        "report_period_label": f"Bagi tempoh {start_date} hingga {end_date}",
+        "financial_year": financial_year_name,
+        "report_reference": reference,
+        "prepared_by_name": prepared_by_name or "Sistem Perakaunan",
+        "prepared_by_role": prepared_by_role or "system",
+        "prepared_at": now_local.strftime("%Y-%m-%d %H:%M"),
+        "basis_note": "Berdasarkan transaksi berstatus verified dan kawalan maker-checker.",
+        "standard_note": "Format pembentangan mengikut standard laporan accounting AGM profesional.",
+    }
+
+
+def _build_agm_quality_checks(
+    *,
+    opening_balance: float,
+    total_income: float,
+    total_expense: float,
+    closing_balance: float,
+    total_cash: float,
+    total_transactions: int,
+    verified_transactions: int,
+    pending_transactions: int,
+) -> Tuple[str, List[Dict[str, Any]]]:
+    checks: List[Dict[str, Any]] = []
+
+    recomputed_closing = round(opening_balance + total_income - total_expense, 2)
+    closing_gap = round(closing_balance - recomputed_closing, 2)
+    checks.append(
+        {
+            "code": "closing_balance_formula",
+            "title": "Formula baki akhir (opening + income - expense)",
+            "status": "pass" if abs(closing_gap) <= 0.01 else "critical",
+            "expected": recomputed_closing,
+            "actual": round(closing_balance, 2),
+            "detail": (
+                "Formula baki akhir seimbang."
+                if abs(closing_gap) <= 0.01
+                else f"Perbezaan formula baki akhir: RM {closing_gap:,.2f}"
+            ),
+        }
+    )
+
+    cash_gap = round(total_cash - closing_balance, 2)
+    checks.append(
+        {
+            "code": "cash_vs_closing_balance",
+            "title": "Kesepadanan jumlah tunai vs baki terkumpul",
+            "status": "pass" if abs(cash_gap) <= 0.01 else "warning",
+            "expected": round(closing_balance, 2),
+            "actual": round(total_cash, 2),
+            "detail": (
+                "Jumlah tunai konsisten dengan baki terkumpul."
+                if abs(cash_gap) <= 0.01
+                else (
+                    f"Jumlah tunai berbeza RM {cash_gap:,.2f}. "
+                    "Semak transaksi tanpa bank_account_id atau pelarasan manual."
+                )
+            ),
+        }
+    )
+
+    verified_ratio = _safe_ratio(float(verified_transactions), float(total_transactions)) * 100
+    verify_status = "pass"
+    if verified_ratio < 80:
+        verify_status = "critical"
+    elif verified_ratio < 95:
+        verify_status = "warning"
+    checks.append(
+        {
+            "code": "verified_ratio",
+            "title": "Peratus transaksi verified",
+            "status": verify_status,
+            "expected": ">= 95%",
+            "actual": f"{verified_ratio:.1f}%",
+            "detail": (
+                "Peratus transaksi verified memuaskan."
+                if verify_status == "pass"
+                else (
+                    "Peratus transaksi verified sederhana. Disyorkan semak baki transaksi pending."
+                    if verify_status == "warning"
+                    else "Peratus transaksi verified terlalu rendah untuk laporan AGM yang kukuh."
+                )
+            ),
+        }
+    )
+
+    pending_status = "pass"
+    if pending_transactions > 25:
+        pending_status = "critical"
+    elif pending_transactions > 0:
+        pending_status = "warning"
+    checks.append(
+        {
+            "code": "pending_transactions",
+            "title": "Baki transaksi pending",
+            "status": pending_status,
+            "expected": 0,
+            "actual": int(pending_transactions),
+            "detail": (
+                "Tiada transaksi pending."
+                if pending_status == "pass"
+                else (
+                    "Masih ada transaksi pending. Semak sebelum pembentangan AGM."
+                    if pending_status == "warning"
+                    else "Terlalu banyak transaksi pending. Risiko ketepatan laporan AGM adalah tinggi."
+                )
+            ),
+        }
+    )
+
+    has_critical = any(check["status"] == "critical" for check in checks)
+    has_warning = any(check["status"] == "warning" for check in checks)
+    if has_critical:
+        return "critical", checks
+    if has_warning:
+        return "warning", checks
+    return "pass", checks
+
+
+def _id_value(value: object, *, strict: bool = False, error_detail: str = "ID tidak sah"):
+    """Normalize ID-like inputs while supporting non-ObjectId IDs."""
+    if value is None:
+        if strict:
+            raise HTTPException(status_code=400, detail=error_detail)
+        return None
+    if isinstance(value, ObjectId):
+        return value
+    text = str(value).strip()
+    try:
+        if ObjectId.is_valid(text):
+            return object_id_or_none(text)
+    except Exception:
+        pass
+    if strict:
+        raise HTTPException(status_code=400, detail=error_detail)
+    return text
+
 async def get_financial_year_by_id(db, year_id: str):
     """Get financial year by ID"""
-    fy = await db.financial_years.find_one({"_id": ObjectId(year_id)})
+    fy = await db.financial_years.find_one({"_id": _id_value(year_id, strict=True, error_detail="ID tahun kewangan tidak sah")})
     if not fy:
         raise HTTPException(status_code=404, detail="Tahun kewangan tidak dijumpai")
     return fy
@@ -71,14 +237,7 @@ async def get_financial_year_by_id(db, year_id: str):
 
 async def get_current_financial_year(db):
     """Get current financial year"""
-    fy = await db.financial_years.find_one({"is_current": True})
-    if not fy:
-        today = datetime.now().strftime("%Y-%m-%d")
-        fy = await db.financial_years.find_one({
-            "start_date": {"$lte": today},
-            "end_date": {"$gte": today}
-        })
-    return fy
+    return await ensure_current_financial_year(db, auto_create=True)
 
 
 async def get_transactions_in_period(db, start_date: str, end_date: str, status: str = "verified"):
@@ -95,7 +254,7 @@ async def get_category_name(db, category_id: str) -> str:
     """Get category name by ID"""
     if not category_id:
         return "Lain-lain"
-    cat = await db.accounting_categories.find_one({"_id": ObjectId(category_id)})
+    cat = await db.accounting_categories.find_one({"_id": _id_value(category_id)})
     return cat.get("name", "Lain-lain") if cat else "Lain-lain"
 
 
@@ -106,7 +265,7 @@ async def get_opening_balances_for_year(db, financial_year_id: str):
     result = []
     total = 0
     for bal in balances:
-        acc = await db.bank_accounts.find_one({"_id": ObjectId(bal.get("bank_account_id"))})
+        acc = await db.bank_accounts.find_one({"_id": _id_value(bal.get("bank_account_id"))})
         acc_name = acc.get("name", "Akaun Tidak Diketahui") if acc else "Akaun Tidak Diketahui"
         amount = bal.get("amount", 0)
         result.append({
@@ -137,31 +296,29 @@ async def get_bank_account_balances(db, financial_year_id: str, end_date: str):
         opening = ob.get("amount", 0) if ob else 0
         
         # Get transactions for this account up to end_date
-        income_pipeline = [
-            {"$match": {
+        income = 0.0
+        async for row in db.accounting_transactions.find(
+            {
                 "bank_account_id": acc_id,
                 "type": "income",
                 "status": "verified",
                 "transaction_date": {"$lte": end_date},
-                "is_deleted": {"$ne": True}
-            }},
-            {"$group": {"_id": None, "total": {"$sum": "$amount"}}}
-        ]
-        income_result = await db.accounting_transactions.aggregate(income_pipeline).to_list(1)
-        income = income_result[0]["total"] if income_result else 0
-        
-        expense_pipeline = [
-            {"$match": {
+                "is_deleted": {"$ne": True},
+            }
+        ):
+            income += _as_float(row.get("amount"))
+
+        expense = 0.0
+        async for row in db.accounting_transactions.find(
+            {
                 "bank_account_id": acc_id,
                 "type": "expense",
                 "status": "verified",
                 "transaction_date": {"$lte": end_date},
-                "is_deleted": {"$ne": True}
-            }},
-            {"$group": {"_id": None, "total": {"$sum": "$amount"}}}
-        ]
-        expense_result = await db.accounting_transactions.aggregate(expense_pipeline).to_list(1)
-        expense = expense_result[0]["total"] if expense_result else 0
+                "is_deleted": {"$ne": True},
+            }
+        ):
+            expense += _as_float(row.get("amount"))
         
         balance = round(opening + income - expense, 2)
         
@@ -535,6 +692,24 @@ async def get_agm_executive_summary(
     total_transactions = await db.accounting_transactions.count_documents(all_tx_query)
     verified_transactions = await db.accounting_transactions.count_documents({**all_tx_query, "status": "verified"})
     pending_transactions = await db.accounting_transactions.count_documents({**all_tx_query, "status": "pending"})
+
+    professional_header = _build_professional_header(
+        financial_year_name=fy["name"],
+        start_date=start_date,
+        end_date=end_date,
+        prepared_by_name=user.get("full_name", ""),
+        prepared_by_role=user.get("role", ""),
+    )
+    quality_status, quality_checks = _build_agm_quality_checks(
+        opening_balance=round(opening_balance, 2),
+        total_income=round(total_income, 2),
+        total_expense=round(total_expense, 2),
+        closing_balance=round(closing_balance, 2),
+        total_cash=round(total_cash, 2),
+        total_transactions=total_transactions,
+        verified_transactions=verified_transactions,
+        pending_transactions=pending_transactions,
+    )
     
     # Previous year comparison
     prev_year_income = None
@@ -573,6 +748,11 @@ async def get_agm_executive_summary(
     
     if pending_transactions > 0:
         recommendations.append(f"Sahkan {pending_transactions} transaksi yang masih tertangguh")
+
+    if quality_status == "warning":
+        recommendations.append("Semak panel kawalan kualiti AGM dan selaraskan data sebelum eksport akhir.")
+    elif quality_status == "critical":
+        recommendations.append("TANGGUH eksport akhir AGM sehingga semua semakan kualiti kritikal diselesaikan.")
     
     if closing_balance > 0:
         recommendations.append("Dana mencukupi untuk operasi tahun hadapan")
@@ -605,7 +785,10 @@ async def get_agm_executive_summary(
         verified_transactions=verified_transactions,
         pending_transactions=pending_transactions,
         highlights=highlights,
-        recommendations=recommendations
+        recommendations=recommendations,
+        quality_status=quality_status,
+        quality_checks=quality_checks,
+        professional_header=professional_header,
     )
 
 

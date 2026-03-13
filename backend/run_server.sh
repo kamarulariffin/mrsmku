@@ -12,6 +12,7 @@ if [[ -n "${1:-}" ]]; then
   export DB_ENGINE="$1"
 fi
 export DB_ENGINE="${DB_ENGINE:-postgres}"
+export TENANT_ENFORCEMENT_MODE="${TENANT_ENFORCEMENT_MODE:-strict}"
 
 # Guna port 8001 jika 8000 sudah digunakan
 if lsof -i :8000 -sTCP:LISTEN -t >/dev/null 2>&1; then
@@ -25,6 +26,7 @@ fi
 echo "Starting backend pada http://localhost:$PORT"
 echo "API docs: http://localhost:$PORT/docs"
 echo "DB_ENGINE=$DB_ENGINE"
+echo "TENANT_ENFORCEMENT_MODE=$TENANT_ENFORCEMENT_MODE"
 if [[ "$DB_ENGINE" == "postgres" ]]; then
   echo "PostgreSQL-only mode aktif (semua koleksi melalui PostgreSQL)."
 elif [[ "$DB_ENGINE" == "hybrid" ]]; then

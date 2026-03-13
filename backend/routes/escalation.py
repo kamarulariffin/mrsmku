@@ -3,8 +3,9 @@ Modul Automasi SOP Asrama - Fasa 5
 Setiap escalation direkod dalam MongoDB, status real-time, linked to staff profiles.
 """
 from datetime import datetime, timezone
-from typing import Optional, List, Callable
+from typing import Any, Optional, List, Callable
 from bson import ObjectId
+from services.id_normalizer import object_id_or_none
 
 from fastapi import APIRouter, HTTPException, Depends, Query
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -38,6 +39,21 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
 async def log_audit(user, action, module, details):
     if _log_audit_func and user:
         await _log_audit_func(user, action, module, details)
+
+
+def _id_value(value: Any) -> Any:
+    """Normalize ID-like inputs while supporting non-ObjectId IDs."""
+    if value is None:
+        return None
+    if isinstance(value, ObjectId):
+        return value
+    text = str(value).strip()
+    try:
+        if ObjectId.is_valid(text):
+            return object_id_or_none(text)
+    except Exception:
+        pass
+    return text
 
 
 def require_warden_admin():
@@ -135,7 +151,7 @@ async def create_escalation(
         "updated_at": now_iso,
     }
     if body.student_id:
-        doc["student_id"] = ObjectId(body.student_id)
+        doc["student_id"] = _id_value(body.student_id)
         from services.hostel_data_sync import fetch_live_student
         student = await fetch_live_student(db, body.student_id)
         if student:
@@ -163,7 +179,7 @@ async def list_escalations(
     if level is not None:
         query["level"] = level
     if assigned_to:
-        query["assigned_to"] = ObjectId(assigned_to)
+        query["assigned_to"] = _id_value(assigned_to)
     if current_user.get("role") == "warden":
         query["$or"] = [
             {"assigned_to": current_user["_id"]},
@@ -222,16 +238,16 @@ async def update_escalation(
         if body.status == ESCALATION_STATUS_CLOSED:
             updates["closed_at"] = now_iso
     if body.assigned_to is not None:
-        updates["assigned_to"] = ObjectId(body.assigned_to) if body.assigned_to else None
+        updates["assigned_to"] = _id_value(body.assigned_to) if body.assigned_to else None
         if body.assigned_to:
-            staff = await db.users.find_one({"_id": ObjectId(body.assigned_to)})
+            staff = await db.users.find_one({"_id": _id_value(body.assigned_to)})
             updates["assigned_to_name"] = staff.get("full_name", "") if staff else ""
         else:
             updates["assigned_to_name"] = None
     if body.notes is not None:
         updates["notes"] = body.notes
     result = await db.escalation_logs.update_one(
-        {"_id": ObjectId(escalation_id)},
+        {"_id": _id_value(escalation_id)},
         {"$set": updates},
     )
     if result.matched_count == 0:
@@ -247,7 +263,7 @@ async def get_escalation(
 ):
     """Dapatkan satu rekod escalation."""
     db = get_db()
-    e = await db.escalation_logs.find_one({"_id": ObjectId(escalation_id)})
+    e = await db.escalation_logs.find_one({"_id": _id_value(escalation_id)})
     if not e:
         raise HTTPException(status_code=404, detail="Escalation tidak dijumpai")
     assigned_name = e.get("assigned_to_name")

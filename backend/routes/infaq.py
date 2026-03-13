@@ -5,6 +5,7 @@ Modul ini menguruskan kempen infaq berasaskan slot
 from datetime import datetime, timezone
 from typing import Optional, List
 from bson import ObjectId
+from services.id_normalizer import object_id_or_none
 import uuid
 
 
@@ -16,6 +17,20 @@ def serialize_doc(doc):
         return None
     doc["id"] = str(doc.pop("_id"))
     return doc
+
+
+def _to_object_id(value: str) -> Optional[ObjectId]:
+    if value is None:
+        return None
+    if isinstance(value, ObjectId):
+        return value
+    text = str(value).strip()
+    try:
+        if ObjectId.is_valid(text):
+            return object_id_or_none(text)
+    except Exception:
+        pass
+    return None
 
 
 # ============ CAMPAIGN MANAGEMENT ============
@@ -67,7 +82,10 @@ async def get_campaigns(db, status: Optional[str] = None, limit: int = 50):
 
 async def get_campaign(campaign_id: str, db):
     """Get single campaign with details"""
-    campaign = await db.infaq_campaigns.find_one({"_id": ObjectId(campaign_id)})
+    campaign_oid = _to_object_id(campaign_id)
+    if campaign_oid is None:
+        return None
+    campaign = await db.infaq_campaigns.find_one({"_id": campaign_oid})
     if not campaign:
         return None
     
@@ -103,6 +121,9 @@ async def get_campaign(campaign_id: str, db):
 
 async def update_campaign(campaign_id: str, data: dict, db):
     """Update campaign"""
+    campaign_oid = _to_object_id(campaign_id)
+    if campaign_oid is None:
+        return None
     update_data = {
         "updated_at": datetime.now(timezone.utc)
     }
@@ -115,7 +136,7 @@ async def update_campaign(campaign_id: str, data: dict, db):
             update_data[field] = data[field]
     
     result = await db.infaq_campaigns.update_one(
-        {"_id": ObjectId(campaign_id)},
+        {"_id": campaign_oid},
         {"$set": update_data}
     )
     
@@ -127,8 +148,11 @@ async def update_campaign(campaign_id: str, data: dict, db):
 
 async def delete_campaign(campaign_id: str, db):
     """Delete campaign (soft delete by changing status)"""
+    campaign_oid = _to_object_id(campaign_id)
+    if campaign_oid is None:
+        return False
     result = await db.infaq_campaigns.update_one(
-        {"_id": ObjectId(campaign_id)},
+        {"_id": campaign_oid},
         {"$set": {"status": "cancelled", "updated_at": datetime.now(timezone.utc)}}
     )
     return result.modified_count > 0
@@ -140,9 +164,12 @@ async def make_donation(data: dict, db, current_user: dict):
     """Process a slot donation"""
     campaign_id = data["campaign_id"]
     slots = data["slots"]
+    campaign_oid = _to_object_id(campaign_id)
+    if campaign_oid is None:
+        raise ValueError("Kempen tidak dijumpai")
     
     # Get campaign
-    campaign = await db.infaq_campaigns.find_one({"_id": ObjectId(campaign_id)})
+    campaign = await db.infaq_campaigns.find_one({"_id": campaign_oid})
     if not campaign:
         raise ValueError("Kempen tidak dijumpai")
     
@@ -168,7 +195,8 @@ async def make_donation(data: dict, db, current_user: dict):
         donor_name = "Penderma Tanpa Nama"
     else:
         # Get user's name
-        user = await db.users.find_one({"_id": ObjectId(current_user["id"])})
+        user_id = _to_object_id(current_user.get("id")) or current_user.get("id")
+        user = await db.users.find_one({"_id": user_id})
         donor_name = user.get("full_name", "Penderma") if user else "Penderma"
     
     # Create donation record
@@ -192,7 +220,7 @@ async def make_donation(data: dict, db, current_user: dict):
     
     # Update campaign slots_sold
     await db.infaq_campaigns.update_one(
-        {"_id": ObjectId(campaign_id)},
+        {"_id": campaign_oid},
         {
             "$inc": {"slots_sold": slots},
             "$set": {"updated_at": datetime.now(timezone.utc)}
@@ -200,10 +228,10 @@ async def make_donation(data: dict, db, current_user: dict):
     )
     
     # Check if campaign is now complete
-    updated_campaign = await db.infaq_campaigns.find_one({"_id": ObjectId(campaign_id)})
+    updated_campaign = await db.infaq_campaigns.find_one({"_id": campaign_oid})
     if updated_campaign["slots_sold"] >= updated_campaign["total_slots"]:
         await db.infaq_campaigns.update_one(
-            {"_id": ObjectId(campaign_id)},
+            {"_id": campaign_oid},
             {"$set": {"status": "completed"}}
         )
     
@@ -248,27 +276,22 @@ async def get_infaq_stats(db):
     active_campaigns = await db.infaq_campaigns.count_documents({"status": "active"})
     completed_campaigns = await db.infaq_campaigns.count_documents({"status": "completed"})
     
-    # Total donations and amount
-    pipeline = [
-        {
-            "$group": {
-                "_id": None,
-                "total_donations": {"$sum": 1},
-                "total_amount": {"$sum": "$amount"},
-                "total_slots": {"$sum": "$slots"}
-            }
-        }
-    ]
-    
-    result = await db.infaq_donations.aggregate(pipeline).to_list(1)
+    # Total donations and amount without aggregate()
+    total_donations = 0
+    total_amount = 0.0
+    total_slots = 0
+    async for d in db.infaq_donations.find({}):
+        total_donations += 1
+        total_amount += float(d.get("amount", 0) or 0)
+        total_slots += int(d.get("slots", 0) or 0)
     
     stats = {
         "total_campaigns": total_campaigns,
         "active_campaigns": active_campaigns,
         "completed_campaigns": completed_campaigns,
-        "total_donations": result[0]["total_donations"] if result else 0,
-        "total_amount": result[0]["total_amount"] if result else 0,
-        "total_slots_sold": result[0]["total_slots"] if result else 0
+        "total_donations": total_donations,
+        "total_amount": total_amount,
+        "total_slots_sold": total_slots,
     }
     
     # Unique donors
@@ -302,26 +325,21 @@ async def get_public_campaign(campaign_id: str, db):
 
 async def get_public_stats(db):
     """Get public statistics"""
-    pipeline = [
-        {"$match": {"status": {"$in": ["active", "completed"]}}},
-        {
-            "$group": {
-                "_id": None,
-                "total_collected": {"$sum": {"$multiply": ["$slots_sold", "$price_per_slot"]}},
-                "total_slots_sold": {"$sum": "$slots_sold"}
-            }
-        }
-    ]
-    
-    result = await db.infaq_campaigns.aggregate(pipeline).to_list(1)
+    total_collected = 0.0
+    total_slots_sold = 0
+    async for c in db.infaq_campaigns.find({"status": {"$in": ["active", "completed"]}}):
+        slots_sold = int(c.get("slots_sold", 0) or 0)
+        price_per_slot = float(c.get("price_per_slot", 0) or 0)
+        total_slots_sold += slots_sold
+        total_collected += (slots_sold * price_per_slot)
     
     active_count = await db.infaq_campaigns.count_documents({"status": "active"})
     unique_donors = await db.infaq_donations.distinct("user_id")
     total_donations = await db.infaq_donations.count_documents({})
     
     return {
-        "total_collected": result[0]["total_collected"] if result else 0,
-        "total_slots_sold": result[0]["total_slots_sold"] if result else 0,
+        "total_collected": total_collected,
+        "total_slots_sold": total_slots_sold,
         "total_campaigns": active_count,
         "unique_donors": len(unique_donors),
         "total_donations": total_donations

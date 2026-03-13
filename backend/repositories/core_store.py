@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import re
 from dataclasses import dataclass
 from datetime import datetime
@@ -25,6 +26,20 @@ def _to_comparable(value: Any) -> Any:
     if isinstance(value, datetime):
         return value.isoformat()
     return value
+
+
+def _to_sort_key(value: Any) -> Tuple[int, Any]:
+    """Build a stable sort key that tolerates mixed/None values."""
+    comparable = _to_comparable(value)
+    if comparable is None:
+        return (0, "")
+    if isinstance(comparable, bool):
+        return (1, int(comparable))
+    if isinstance(comparable, (int, float)):
+        return (2, float(comparable))
+    if isinstance(comparable, str):
+        return (3, comparable)
+    return (4, str(comparable))
 
 
 def _extract_path_values(value: Any, tokens: List[str]) -> List[Any]:
@@ -120,11 +135,21 @@ def _match_field(doc_value: Any, condition: Any) -> bool:
         if regex is not None:
             return _regex_matches(doc_value_cmp, str(regex), str(options))
         if "$in" in condition:
-            values = {_to_comparable(v) for v in condition["$in"]}
+            values = [_to_comparable(v) for v in condition["$in"]]
+            if isinstance(doc_value, list):
+                return any(_to_comparable(v) in values for v in doc_value)
             return doc_value_cmp in values
         if "$nin" in condition:
-            values = {_to_comparable(v) for v in condition["$nin"]}
+            values = [_to_comparable(v) for v in condition["$nin"]]
+            if isinstance(doc_value, list):
+                return all(_to_comparable(v) not in values for v in doc_value)
             return doc_value_cmp not in values
+        if "$size" in condition:
+            try:
+                expected_size = int(condition["$size"])
+            except Exception:
+                return False
+            return isinstance(doc_value, list) and len(doc_value) == expected_size
         if "$ne" in condition:
             return doc_value_cmp != _to_comparable(condition["$ne"])
         if "$exists" in condition:
@@ -181,6 +206,202 @@ def _matches_query(doc: Dict[str, Any], query: Optional[Dict[str, Any]]) -> bool
         if not _match_values(values, value, exists):
             return False
     return True
+
+
+def _get_scalar_value(doc: Dict[str, Any], path: str) -> Any:
+    values, exists = _get_field_values(doc, path)
+    if not exists or not values:
+        return None
+    return values[0]
+
+
+def _set_scalar_value(doc: Dict[str, Any], path: str, value: Any) -> None:
+    tokens = [token for token in str(path).split(".") if token]
+    if not tokens:
+        return
+
+    current: Any = doc
+    for token in tokens[:-1]:
+        if not isinstance(current, dict):
+            return
+        if token not in current or not isinstance(current[token], dict):
+            current[token] = {}
+        current = current[token]
+    if isinstance(current, dict):
+        current[tokens[-1]] = value
+
+
+def _to_datetime_value(value: Any) -> Optional[datetime]:
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, str):
+        text = value.replace("Z", "+00:00")
+        try:
+            return datetime.fromisoformat(text)
+        except ValueError:
+            return None
+    return None
+
+
+def _to_number_value(value: Any) -> float:
+    if value is None:
+        return 0.0
+    if isinstance(value, bool):
+        return float(int(value))
+    if isinstance(value, (int, float)):
+        return float(value)
+    try:
+        return float(value)
+    except Exception:
+        return 0.0
+
+
+def _eval_agg_expr(doc: Dict[str, Any], expr: Any) -> Any:
+    if isinstance(expr, str):
+        if expr.startswith("$"):
+            return _get_scalar_value(doc, expr[1:])
+        return expr
+
+    if isinstance(expr, dict):
+        if "$toObjectId" in expr:
+            raw = _eval_agg_expr(doc, expr["$toObjectId"])
+            if isinstance(raw, ObjectId):
+                return raw
+            if isinstance(raw, str) and _is_object_id_string(raw):
+                try:
+                    return ObjectId(raw)
+                except Exception:
+                    return raw
+            return raw
+        if "$year" in expr:
+            dt = _to_datetime_value(_eval_agg_expr(doc, expr["$year"]))
+            return dt.year if dt else None
+        if "$month" in expr:
+            dt = _to_datetime_value(_eval_agg_expr(doc, expr["$month"]))
+            return dt.month if dt else None
+        if "$dayOfMonth" in expr:
+            dt = _to_datetime_value(_eval_agg_expr(doc, expr["$dayOfMonth"]))
+            return dt.day if dt else None
+        if "$ifNull" in expr:
+            options = expr["$ifNull"]
+            if isinstance(options, list):
+                for option in options:
+                    value = _eval_agg_expr(doc, option)
+                    if value is not None:
+                        return value
+                return None
+            return _eval_agg_expr(doc, options)
+        if "$toString" in expr:
+            value = _eval_agg_expr(doc, expr["$toString"])
+            return None if value is None else str(value)
+        if "$multiply" in expr:
+            terms = expr["$multiply"]
+            if not isinstance(terms, list):
+                terms = [terms]
+            result = 1.0
+            for term in terms:
+                result *= _to_number_value(_eval_agg_expr(doc, term))
+            return result
+        if "$lte" in expr:
+            terms = expr["$lte"]
+            if isinstance(terms, list) and len(terms) == 2:
+                left = _to_comparable(_eval_agg_expr(doc, terms[0]))
+                right = _to_comparable(_eval_agg_expr(doc, terms[1]))
+                if left is None or right is None:
+                    return False
+                try:
+                    return left <= right
+                except Exception:
+                    return False
+            return False
+        if "$arrayElemAt" in expr:
+            terms = expr["$arrayElemAt"]
+            if isinstance(terms, list) and len(terms) == 2:
+                arr_expr, idx_expr = terms
+                arr_val: Any = None
+                if isinstance(arr_expr, str) and arr_expr.startswith("$"):
+                    values, exists = _get_field_values(doc, arr_expr[1:])
+                    if exists:
+                        if len(values) == 1 and isinstance(values[0], list):
+                            arr_val = values[0]
+                        else:
+                            arr_val = values
+                if arr_val is None:
+                    arr_val = _eval_agg_expr(doc, arr_expr)
+                if not isinstance(arr_val, list):
+                    return None
+                try:
+                    idx = int(_to_number_value(_eval_agg_expr(doc, idx_expr)))
+                except Exception:
+                    return None
+                if idx < 0:
+                    idx = len(arr_val) + idx
+                if 0 <= idx < len(arr_val):
+                    return arr_val[idx]
+            return None
+        if "$dateFromString" in expr:
+            spec = expr["$dateFromString"]
+            if isinstance(spec, dict):
+                date_value = _eval_agg_expr(doc, spec.get("dateString"))
+            else:
+                date_value = _eval_agg_expr(doc, spec)
+            return _to_datetime_value(date_value)
+        if "$subtract" in expr:
+            terms = expr["$subtract"]
+            if isinstance(terms, list) and len(terms) == 2:
+                left = _eval_agg_expr(doc, terms[0])
+                right = _eval_agg_expr(doc, terms[1])
+                left_dt = _to_datetime_value(left)
+                right_dt = _to_datetime_value(right)
+                if left_dt and right_dt:
+                    return (left_dt - right_dt).total_seconds() * 1000.0
+                return _to_number_value(left) - _to_number_value(right)
+            return None
+        if "$abs" in expr:
+            return abs(_to_number_value(_eval_agg_expr(doc, expr["$abs"])))
+
+        # Object expression (e.g. {"year": {"$year": ...}, "type": "$type"})
+        return {k: _eval_agg_expr(doc, v) for k, v in expr.items()}
+
+    return expr
+
+
+def _freeze_group_key(value: Any) -> Any:
+    if isinstance(value, dict):
+        return tuple((k, _freeze_group_key(v)) for k, v in sorted(value.items(), key=lambda item: item[0]))
+    if isinstance(value, list):
+        return tuple(_freeze_group_key(v) for v in value)
+    return _to_comparable(value)
+
+
+def _resolve_lookup_operand(doc: Dict[str, Any], operand: Any, variables: Dict[str, Any]) -> Any:
+    if isinstance(operand, str):
+        if operand.startswith("$$"):
+            return variables.get(operand[2:])
+        if operand.startswith("$"):
+            return _get_scalar_value(doc, operand[1:])
+        return operand
+    if isinstance(operand, dict) and "$toObjectId" in operand:
+        raw = _resolve_lookup_operand(doc, operand["$toObjectId"], variables)
+        if isinstance(raw, ObjectId):
+            return raw
+        if isinstance(raw, str) and _is_object_id_string(raw):
+            try:
+                return ObjectId(raw)
+            except Exception:
+                return raw
+    return operand
+
+
+def _eval_lookup_expr(doc: Dict[str, Any], expr: Any, variables: Dict[str, Any]) -> bool:
+    if isinstance(expr, dict) and "$eq" in expr:
+        terms = expr.get("$eq") or []
+        if not isinstance(terms, list) or len(terms) != 2:
+            return False
+        left = _resolve_lookup_operand(doc, terms[0], variables)
+        right = _resolve_lookup_operand(doc, terms[1], variables)
+        return _to_comparable(left) == _to_comparable(right)
+    return False
 
 
 def _parse_array_filters(array_filters: Optional[List[Dict[str, Any]]]) -> Dict[str, List[Tuple[str, Any]]]:
@@ -275,6 +496,18 @@ def _inc_value(current: Any, delta: Any) -> Any:
             return current
 
 
+def _matches_pull_condition(item: Any, condition: Any) -> bool:
+    if isinstance(condition, dict):
+        # Operator style condition for scalar array values, e.g. {"$in": [...]}
+        if any(str(k).startswith("$") for k in condition.keys()):
+            return _match_field(item, condition)
+        # Document-style condition for array of objects, e.g. {"filename": "..."}
+        if isinstance(item, dict):
+            return _matches_query(item, condition)
+        return False
+    return _to_comparable(item) == _to_comparable(condition)
+
+
 def _apply_path_op(
     target: Any,
     tokens: List[str],
@@ -356,6 +589,7 @@ def _apply_update_ops(
     update: Dict[str, Any],
     query: Optional[Dict[str, Any]] = None,
     array_filters: Optional[List[Dict[str, Any]]] = None,
+    is_upsert_insert: bool = False,
 ) -> Dict[str, Any]:
     out = dict(doc)
     normalized_update, merged_array_filters = _expand_positional_update_tokens(update, query, array_filters)
@@ -368,6 +602,15 @@ def _apply_update_ops(
             _apply_path_op(out, [t for t in key.split(".") if t], "set", v, parsed_array_filters)
         else:
             out[key] = v
+
+    if is_upsert_insert:
+        set_on_insert_data = normalized_update.get("$setOnInsert", {})
+        for k, v in set_on_insert_data.items():
+            key = str(k)
+            if "." in key or "$[" in key:
+                _apply_path_op(out, [t for t in key.split(".") if t], "set", v, parsed_array_filters)
+            else:
+                out[key] = v
 
     unset_data = normalized_update.get("$unset", {})
     for k in unset_data.keys():
@@ -401,6 +644,18 @@ def _apply_update_ops(
             existing = [] if existing is None else [existing]
         existing.extend(values_to_push)
         out[key] = existing
+
+    pull_data = normalized_update.get("$pull", {})
+    for k, v in pull_data.items():
+        key = str(k)
+        # Keep implementation intentionally simple for current usage:
+        # only top-level array fields are pulled in this migration phase.
+        if "." in key or "$[" in key:
+            continue
+        existing = out.get(key)
+        if not isinstance(existing, list):
+            continue
+        out[key] = [item for item in existing if not _matches_pull_condition(item, v)]
 
     inc_data = normalized_update.get("$inc", {})
     for k, v in inc_data.items():
@@ -436,12 +691,20 @@ class DeleteResult:
 
 
 class _CoreCursor:
-    def __init__(self, collection: "CoreCollection", query: Optional[Dict[str, Any]] = None):
+    def __init__(
+        self,
+        collection: "CoreCollection",
+        query: Optional[Dict[str, Any]] = None,
+        projection: Optional[Dict[str, Any]] = None,
+    ):
         self._collection = collection
         self._query = query or {}
+        self._projection = projection
         self._sort_spec: List[Tuple[str, int]] = []
         self._skip = 0
         self._limit: Optional[int] = None
+        self._iter_docs: Optional[List[Dict[str, Any]]] = None
+        self._iter_index = 0
 
     def sort(self, field: Any, direction: Optional[int] = None):
         if isinstance(field, list):
@@ -460,27 +723,97 @@ class _CoreCursor:
         self._limit = max(0, int(n))
         return self
 
-    async def to_list(self, n: int):
+    def _apply_projection(self, docs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        if not isinstance(self._projection, dict) or not self._projection:
+            return docs
+
+        include_fields = {k for k, v in self._projection.items() if bool(v) and k != "_id"}
+        exclude_fields = {k for k, v in self._projection.items() if (not bool(v)) and k != "_id"}
+        include_id = self._projection.get("_id", 1) not in (0, False)
+
+        projected: List[Dict[str, Any]] = []
+        for d in docs:
+            if include_fields:
+                out = {k: v for k, v in d.items() if k in include_fields}
+                if include_id and "_id" in d:
+                    out["_id"] = d["_id"]
+            elif exclude_fields:
+                out = {k: v for k, v in d.items() if k not in exclude_fields}
+                if not include_id:
+                    out.pop("_id", None)
+            else:
+                out = dict(d)
+                if not include_id:
+                    out.pop("_id", None)
+            projected.append(out)
+        return projected
+
+    async def _materialize_docs(self) -> List[Dict[str, Any]]:
         docs = await self._collection._find_docs(self._query)
+        docs = self._apply_projection(docs)
         if self._sort_spec:
             for field, direction in reversed(self._sort_spec):
                 docs.sort(
-                    key=lambda d: _to_comparable(_get_sort_value(d, field)),
+                    key=lambda d: _to_sort_key(_get_sort_value(d, field)),
                     reverse=(direction == -1),
                 )
         if self._skip:
             docs = docs[self._skip :]
+        return docs
+
+    async def to_list(self, n: Optional[int] = None, **kwargs):
+        docs = await self._materialize_docs()
+        if n is None:
+            n = kwargs.get("length")
+        if n is None:
+            n = len(docs)
         max_n = self._limit if self._limit is not None else int(n)
         docs = docs[: max_n if max_n is not None else len(docs)]
         return docs
+
+    def __aiter__(self):
+        self._iter_docs = None
+        self._iter_index = 0
+        return self
+
+    async def __anext__(self):
+        if self._iter_docs is None:
+            self._iter_docs = await self.to_list()
+        if self._iter_index >= len(self._iter_docs):
+            raise StopAsyncIteration
+        item = self._iter_docs[self._iter_index]
+        self._iter_index += 1
+        return item
 
 
 class _AggregateCursor:
     def __init__(self, collection: "CoreCollection", pipeline: Sequence[Dict[str, Any]]):
         self._collection = collection
         self._pipeline = list(pipeline or [])
+        self._iter_docs: Optional[List[Dict[str, Any]]] = None
+        self._iter_index = 0
 
-    async def to_list(self, n: int):
+    async def _get_lookup_docs(self, collection_name: str) -> List[Dict[str, Any]]:
+        # Prefer CoreStore lookup for Postgres-backed collections.
+        store = getattr(self._collection, "_store", None)
+        if store is not None:
+            target = store[collection_name]
+            if isinstance(target, CoreCollection):
+                return await target._find_docs({})
+            cursor = target.find({})
+            return await cursor.to_list(500000)
+
+        # Fallback to Mongo collection/database if available.
+        mongo_collection = getattr(self._collection, "_mongo_collection", None)
+        if mongo_collection is None:
+            return []
+        try:
+            target = mongo_collection.database[collection_name]
+            return await target.find({}).to_list(500000)
+        except Exception:
+            return []
+
+    async def to_list(self, n: Optional[int] = None, **kwargs):
         docs = await self._collection._find_docs({})
         current = docs
         for stage in self._pipeline:
@@ -488,41 +821,251 @@ class _AggregateCursor:
                 query = stage["$match"] or {}
                 current = [d for d in current if _matches_query(d, query)]
                 continue
+            if "$project" in stage:
+                spec = stage["$project"] or {}
+                if not isinstance(spec, dict):
+                    continue
+
+                projected: List[Dict[str, Any]] = []
+                include_id = not (("_id" in spec) and (spec.get("_id") in (0, False)))
+
+                for row in current:
+                    out: Dict[str, Any] = {}
+                    for out_field, out_expr in spec.items():
+                        if out_field == "_id" and out_expr in (0, False):
+                            continue
+                        if out_expr in (1, True):
+                            out[out_field] = _get_scalar_value(row, str(out_field))
+                            continue
+                        if out_expr in (0, False):
+                            continue
+                        out[out_field] = _eval_agg_expr(row, out_expr)
+
+                    if include_id and "_id" in row and "_id" not in out:
+                        out["_id"] = row["_id"]
+                    projected.append(out)
+
+                current = projected
+                continue
+            if "$addFields" in stage or "$set" in stage:
+                spec = stage.get("$addFields")
+                if spec is None:
+                    spec = stage.get("$set")
+                if not isinstance(spec, dict):
+                    continue
+                updated: List[Dict[str, Any]] = []
+                for row in current:
+                    out = dict(row)
+                    for out_field, out_expr in spec.items():
+                        _set_scalar_value(out, str(out_field), _eval_agg_expr(out, out_expr))
+                    updated.append(out)
+                current = updated
+                continue
+            if "$lookup" in stage:
+                spec = stage["$lookup"] or {}
+                from_collection = spec.get("from")
+                as_field = spec.get("as")
+                if not (from_collection and as_field):
+                    continue
+
+                foreign_docs = await self._get_lookup_docs(str(from_collection))
+                local_field = spec.get("localField")
+                foreign_field = spec.get("foreignField")
+
+                # Classic lookup form: localField + foreignField.
+                if local_field and foreign_field:
+                    index: Dict[Any, List[Dict[str, Any]]] = {}
+                    for row in foreign_docs:
+                        key = _to_comparable(_get_scalar_value(row, str(foreign_field)))
+                        index.setdefault(key, []).append(dict(row))
+
+                    joined: List[Dict[str, Any]] = []
+                    for row in current:
+                        local_key = _to_comparable(_get_scalar_value(row, str(local_field)))
+                        doc = dict(row)
+                        doc[str(as_field)] = index.get(local_key, [])
+                        joined.append(doc)
+                    current = joined
+                    continue
+
+                # Pipeline lookup form: let + pipeline + $expr ($eq) support.
+                pipeline = spec.get("pipeline") or []
+                let_bindings = spec.get("let") or {}
+                joined: List[Dict[str, Any]] = []
+                for row in current:
+                    variables: Dict[str, Any] = {
+                        str(var_name): _eval_agg_expr(row, var_expr)
+                        for var_name, var_expr in let_bindings.items()
+                    }
+
+                    matched_docs = [dict(fd) for fd in foreign_docs]
+                    for lookup_stage in pipeline:
+                        if "$match" not in lookup_stage:
+                            continue
+                        match_spec = lookup_stage["$match"] or {}
+                        expr = match_spec.get("$expr")
+                        plain_match = {k: v for k, v in match_spec.items() if k != "$expr"}
+                        if expr is not None:
+                            matched_docs = [
+                                fd for fd in matched_docs if _eval_lookup_expr(fd, expr, variables)
+                            ]
+                        if plain_match:
+                            matched_docs = [fd for fd in matched_docs if _matches_query(fd, plain_match)]
+
+                    doc = dict(row)
+                    doc[str(as_field)] = matched_docs
+                    joined.append(doc)
+                current = joined
+                continue
+            if "$unwind" in stage:
+                spec = stage["$unwind"]
+                preserve = False
+                if isinstance(spec, str):
+                    path = spec
+                elif isinstance(spec, dict):
+                    path = spec.get("path")
+                    preserve = bool(spec.get("preserveNullAndEmptyArrays"))
+                else:
+                    continue
+
+                if not path:
+                    continue
+                path = str(path)
+                if path.startswith("$"):
+                    path = path[1:]
+
+                expanded: List[Dict[str, Any]] = []
+                for row in current:
+                    value = _get_scalar_value(row, path)
+                    if isinstance(value, list):
+                        if value:
+                            for item in value:
+                                doc = copy.deepcopy(row)
+                                _set_scalar_value(doc, path, item)
+                                expanded.append(doc)
+                        elif preserve:
+                            doc = copy.deepcopy(row)
+                            _set_scalar_value(doc, path, None)
+                            expanded.append(doc)
+                        continue
+
+                    if value is None:
+                        if preserve:
+                            doc = copy.deepcopy(row)
+                            _set_scalar_value(doc, path, None)
+                            expanded.append(doc)
+                        continue
+
+                    # Scalar value behaves like a single unwind element.
+                    expanded.append(dict(row))
+                current = expanded
+                continue
             if "$group" in stage:
                 spec = stage["$group"]
                 gid_expr = spec.get("_id")
                 groups: Dict[Any, Dict[str, Any]] = {}
+                avg_meta: Dict[Any, Dict[str, List[float]]] = {}
                 for d in current:
-                    if isinstance(gid_expr, str) and gid_expr.startswith("$"):
-                        gid = d.get(gid_expr[1:])
-                    else:
-                        gid = gid_expr
-                    if gid not in groups:
-                        groups[gid] = {"_id": gid}
-                        for out_field in spec.keys():
+                    gid = _eval_agg_expr(d, gid_expr)
+                    gid_key = _freeze_group_key(gid)
+                    if gid_key not in groups:
+                        groups[gid_key] = {"_id": gid}
+                        for out_field, out_expr in spec.items():
                             if out_field != "_id":
-                                groups[gid][out_field] = 0
+                                if isinstance(out_expr, dict) and "$first" in out_expr:
+                                    groups[gid_key][out_field] = None
+                                elif isinstance(out_expr, dict) and "$max" in out_expr:
+                                    groups[gid_key][out_field] = None
+                                elif isinstance(out_expr, dict) and "$push" in out_expr:
+                                    groups[gid_key][out_field] = []
+                                elif isinstance(out_expr, dict) and "$avg" in out_expr:
+                                    groups[gid_key][out_field] = None
+                                    avg_meta.setdefault(gid_key, {})[out_field] = [0.0, 0.0]
+                                else:
+                                    groups[gid_key][out_field] = 0
                     for out_field, expr in spec.items():
                         if out_field == "_id":
                             continue
                         if isinstance(expr, dict) and "$sum" in expr:
-                            sum_expr = expr["$sum"]
-                            if isinstance(sum_expr, str) and sum_expr.startswith("$"):
-                                v = d.get(sum_expr[1:], 0) or 0
+                            v = _to_number_value(_eval_agg_expr(d, expr["$sum"]))
+                            groups[gid_key][out_field] += v
+                        elif (
+                            isinstance(expr, dict)
+                            and "$first" in expr
+                            and groups[gid_key].get(out_field) is None
+                        ):
+                            groups[gid_key][out_field] = _eval_agg_expr(d, expr["$first"])
+                        elif isinstance(expr, dict) and "$max" in expr:
+                            candidate = _eval_agg_expr(d, expr["$max"])
+                            existing = groups[gid_key].get(out_field)
+                            if existing is None:
+                                groups[gid_key][out_field] = candidate
                             else:
-                                v = sum_expr
-                            groups[gid][out_field] += v
+                                try:
+                                    if _to_comparable(candidate) > _to_comparable(existing):
+                                        groups[gid_key][out_field] = candidate
+                                except Exception:
+                                    pass
+                        elif isinstance(expr, dict) and "$push" in expr:
+                            groups[gid_key].setdefault(out_field, [])
+                            groups[gid_key][out_field].append(_eval_agg_expr(d, expr["$push"]))
+                        elif isinstance(expr, dict) and "$avg" in expr:
+                            value = _eval_agg_expr(d, expr["$avg"])
+                            if value is None:
+                                continue
+                            try:
+                                numeric = float(value)
+                            except Exception:
+                                continue
+                            field_meta = avg_meta.setdefault(gid_key, {}).setdefault(out_field, [0.0, 0.0])
+                            field_meta[0] += numeric
+                            field_meta[1] += 1.0
+                for gid_key, fields in avg_meta.items():
+                    row = groups.get(gid_key)
+                    if row is None:
+                        continue
+                    for out_field, (sum_value, count_value) in fields.items():
+                        row[out_field] = (sum_value / count_value) if count_value > 0 else None
                 current = list(groups.values())
                 continue
             if "$sort" in stage:
                 sort_spec = stage["$sort"]
                 for field, direction in reversed(list(sort_spec.items())):
                     current.sort(
-                        key=lambda d: _to_comparable(_get_sort_value(d, str(field))),
+                        key=lambda d: _to_sort_key(_get_sort_value(d, str(field))),
                         reverse=(int(direction) == -1),
                     )
                 continue
+            if "$limit" in stage:
+                try:
+                    current = current[: max(0, int(stage["$limit"]))]
+                except Exception:
+                    pass
+                continue
+            if "$count" in stage:
+                field_name = stage["$count"] or "count"
+                field_name = str(field_name)
+                current = [{field_name: len(current)}] if current else []
+                continue
+        if n is None:
+            n = kwargs.get("length")
+        if n is None:
+            n = len(current)
         return current[: int(n)]
+
+    def __aiter__(self):
+        self._iter_docs = None
+        self._iter_index = 0
+        return self
+
+    async def __anext__(self):
+        if self._iter_docs is None:
+            self._iter_docs = await self.to_list()
+        if self._iter_index >= len(self._iter_docs):
+            raise StopAsyncIteration
+        item = self._iter_docs[self._iter_index]
+        self._iter_index += 1
+        return item
 
 
 class CoreCollection:
@@ -532,11 +1075,13 @@ class CoreCollection:
         session_factory: async_sessionmaker[AsyncSession],
         mongo_collection=None,
         mirror_writes: bool = False,
+        store: Optional["CoreStore"] = None,
     ):
         self.collection_name = collection_name
         self._session_factory = session_factory
         self._mongo_collection = mongo_collection
         self._mirror_writes = mirror_writes
+        self._store = store
 
     async def _find_rows(self) -> List[CoreDocument]:
         async with self._session_factory() as session:
@@ -555,8 +1100,13 @@ class CoreCollection:
                 docs.append(_deserialize_from_storage(doc))
         return docs
 
-    def find(self, query: Optional[Dict[str, Any]] = None):
-        return _CoreCursor(self, query=query)
+    def find(
+        self,
+        query: Optional[Dict[str, Any]] = None,
+        projection: Optional[Dict[str, Any]] = None,
+        **_kwargs,
+    ):
+        return _CoreCursor(self, query=query, projection=projection)
 
     async def find_one(
         self,
@@ -568,7 +1118,7 @@ class CoreCollection:
         if sort:
             for field, direction in reversed(sort):
                 docs.sort(
-                    key=lambda d: _to_comparable(_get_sort_value(d, str(field))),
+                    key=lambda d: _to_sort_key(_get_sort_value(d, str(field))),
                     reverse=(int(direction) == -1),
                 )
         if not docs:
@@ -585,8 +1135,16 @@ class CoreCollection:
         docs = await self._find_docs(query)
         return len(docs)
 
-    async def distinct(self, field: str):
-        docs = await self._find_docs({})
+    async def distinct(
+        self,
+        field: str,
+        query: Optional[Dict[str, Any]] = None,
+        **kwargs,
+    ):
+        # Motor/PyMongo compatibility: allow both positional filter arg and filter= kwarg.
+        if query is None:
+            query = kwargs.get("filter")
+        docs = await self._find_docs(query or {})
         values = []
         seen = set()
         for d in docs:
@@ -672,7 +1230,13 @@ class CoreCollection:
                 for k, v in (query or {}).items():
                     if not k.startswith("$") and not isinstance(v, dict):
                         base_doc[k] = v
-                new_doc = _apply_update_ops(base_doc, update, query=query, array_filters=array_filters)
+                new_doc = _apply_update_ops(
+                    base_doc,
+                    update,
+                    query=query,
+                    array_filters=array_filters,
+                    is_upsert_insert=True,
+                )
                 raw_id = new_doc.get("_id")
                 doc_id = str(raw_id) if raw_id is not None else str(ObjectId())
                 new_doc["_id"] = doc_id
@@ -742,7 +1306,13 @@ class CoreCollection:
             for k, v in (query or {}).items():
                 if not k.startswith("$") and not isinstance(v, dict):
                     base_doc[k] = v
-            new_doc = _apply_update_ops(base_doc, update, query=query, array_filters=array_filters)
+            new_doc = _apply_update_ops(
+                base_doc,
+                update,
+                query=query,
+                array_filters=array_filters,
+                is_upsert_insert=True,
+            )
             raw_id = new_doc.get("_id")
             doc_id = str(raw_id) if raw_id is not None else str(ObjectId())
             new_doc["_id"] = doc_id
@@ -890,6 +1460,12 @@ class CoreStore:
         "financial_ledger",
         "payment_reminders",
         "payment_reminder_preferences",
+        "yuran_charge_jobs",
+        "institution_onboarding_requests",
+        "tenants",
+        "tenant_module_settings",
+        "tenant_user_memberships",
+        "tenant_onboarding_jobs",
     }
 
     def __init__(
@@ -923,6 +1499,7 @@ class CoreStore:
                 session_factory=self._session_factory,
                 mongo_collection=self._get_mongo_collection(name),
                 mirror_writes=self._mirror_writes,
+                store=self,
             )
             self._cache[name] = coll
             return coll

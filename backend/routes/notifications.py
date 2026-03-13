@@ -7,8 +7,9 @@ Features:
 - Announcements System
 """
 from datetime import datetime, timezone
-from typing import List, Optional
+from typing import Any, List, Optional
 from bson import ObjectId
+from services.id_normalizer import object_id_or_none
 
 from fastapi import APIRouter, HTTPException, Query, Body
 from pydantic import BaseModel, Field
@@ -58,6 +59,21 @@ def _created_at_str(v):
     return str(v)
 
 
+def _id_value(value: Any) -> Any:
+    """Normalize ID-like inputs while supporting non-ObjectId IDs."""
+    if value is None:
+        return None
+    if isinstance(value, ObjectId):
+        return value
+    text = str(value).strip()
+    try:
+        if ObjectId.is_valid(text):
+            return object_id_or_none(text)
+    except Exception:
+        pass
+    return text
+
+
 def serialize_notification(notif: dict) -> dict:
     return {
         "id": str(notif["_id"]),
@@ -99,7 +115,7 @@ async def create_notification(
     metadata: dict = None, sender_id = None, sender_name: str = None, sender_role: str = None
 ):
     notif = {
-        "user_id": ObjectId(user_id) if isinstance(user_id, str) else user_id,
+        "user_id": _id_value(user_id),
         "type": notification_type,
         "title": title,
         "message": message,
@@ -110,7 +126,7 @@ async def create_notification(
         "action_url": action_url,
         "action_label": "Lihat",
         "metadata": metadata or {},
-        "sender_id": ObjectId(sender_id) if sender_id else None,
+        "sender_id": _id_value(sender_id) if sender_id else None,
         "sender_name": sender_name,
         "sender_role": sender_role,
         "created_at": datetime.now(timezone.utc)
@@ -122,7 +138,7 @@ async def create_notification(
 
 async def send_push_to_user(db, user_id, title: str, body: str, url: str = None):
     subscriptions = await db.push_subscriptions.find({
-        "user_id": ObjectId(user_id) if isinstance(user_id, str) else user_id,
+        "user_id": _id_value(user_id),
         "is_active": True
     }).to_list(10)
     
@@ -144,7 +160,7 @@ async def send_push_to_user(db, user_id, title: str, body: str, url: str = None)
 
 async def log_email(db, user_id, email: str, subject: str, template: str, status: str, metadata: dict = None):
     await db.email_logs.insert_one({
-        "user_id": ObjectId(user_id) if user_id else None,
+        "user_id": _id_value(user_id) if user_id else None,
         "email": email,
         "subject": subject,
         "template": template,
@@ -198,7 +214,7 @@ async def get_unread_count(current_user: dict = Depends(lambda: _require_roles()
 @router.put("/mark-read")
 async def mark_notifications_read(data: NotificationMarkRead, current_user: dict = Depends(lambda: _require_roles())):
     db = _get_db()
-    notif_ids = [ObjectId(nid) for nid in data.notification_ids]
+    notif_ids = [_id_value(nid) for nid in data.notification_ids]
     result = await db.notifications.update_many(
         {"_id": {"$in": notif_ids}, "user_id": current_user["_id"]},
         {"$set": {"is_read": True, "read_at": datetime.now(timezone.utc)}}
@@ -219,7 +235,7 @@ async def mark_all_read(current_user: dict = Depends(lambda: _require_roles())):
 @router.delete("/{notification_id}")
 async def delete_notification(notification_id: str, current_user: dict = Depends(lambda: _require_roles())):
     db = _get_db()
-    result = await db.notifications.delete_one({"_id": ObjectId(notification_id), "user_id": current_user["_id"]})
+    result = await db.notifications.delete_one({"_id": _id_value(notification_id), "user_id": current_user["_id"]})
     if result.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Notifikasi tidak dijumpai")
     return {"status": "deleted"}
@@ -415,14 +431,14 @@ async def create_announcement(data: AnnouncementCreate, current_user: dict = Dep
 async def delete_announcement(announcement_id: str, current_user: dict = Depends(lambda: _require_roles("guru_kelas", "guru_homeroom", "superadmin", "admin"))):
     db = _get_db()
     
-    announcement = await db.announcements.find_one({"_id": ObjectId(announcement_id)})
+    announcement = await db.announcements.find_one({"_id": _id_value(announcement_id)})
     if not announcement:
         raise HTTPException(status_code=404, detail="Pengumuman tidak dijumpai")
     
     if current_user.get("role") in ["guru_kelas", "guru_homeroom"] and announcement["created_by"] != current_user["_id"]:
         raise HTTPException(status_code=403, detail="Akses ditolak")
     
-    await db.announcements.delete_one({"_id": ObjectId(announcement_id)})
+    await db.announcements.delete_one({"_id": _id_value(announcement_id)})
     return {"status": "deleted"}
 
 
@@ -450,7 +466,7 @@ async def send_quick_notification(
         students = await db.students.find(student_query).to_list(500)
         parent_ids = list(set([s.get("parent_id") for s in students if s.get("parent_id")]))
     else:
-        parent_ids = [ObjectId(pid) for pid in (target_parents or [])]
+        parent_ids = [_id_value(pid) for pid in (target_parents or [])]
     
     if not parent_ids:
         raise HTTPException(status_code=400, detail="Tiada ibu bapa untuk dihantar notifikasi")

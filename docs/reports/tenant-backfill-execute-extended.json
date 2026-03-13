@@ -1,0 +1,1090 @@
+{
+  "mode": "execute",
+  "collections_processed": 60,
+  "collections_skipped": [],
+  "totals": {
+    "records": 4609,
+    "already_valid": 4120,
+    "invalid_existing": 0,
+    "unresolved": 0,
+    "updates_planned": 489,
+    "updates_applied": 489
+  },
+  "collections": {
+    "tenant_user_memberships": {
+      "total": 32,
+      "already_valid": 32,
+      "invalid_existing": 0,
+      "unresolved": 0,
+      "updates_planned": 0,
+      "updates_applied": 0,
+      "source_counts": {},
+      "sample_unresolved_ids": [],
+      "sample_updated_ids": []
+    },
+    "tenant_module_settings": {
+      "total": 0,
+      "already_valid": 0,
+      "invalid_existing": 0,
+      "unresolved": 0,
+      "updates_planned": 0,
+      "updates_applied": 0,
+      "source_counts": {},
+      "sample_unresolved_ids": [],
+      "sample_updated_ids": []
+    },
+    "users": {
+      "total": 32,
+      "already_valid": 32,
+      "invalid_existing": 0,
+      "unresolved": 0,
+      "updates_planned": 0,
+      "updates_applied": 0,
+      "source_counts": {},
+      "sample_unresolved_ids": [],
+      "sample_updated_ids": []
+    },
+    "students": {
+      "total": 15,
+      "already_valid": 15,
+      "invalid_existing": 0,
+      "unresolved": 0,
+      "updates_planned": 0,
+      "updates_applied": 0,
+      "source_counts": {},
+      "sample_unresolved_ids": [],
+      "sample_updated_ids": []
+    },
+    "settings": {
+      "total": 13,
+      "already_valid": 13,
+      "invalid_existing": 0,
+      "unresolved": 0,
+      "updates_planned": 0,
+      "updates_applied": 0,
+      "source_counts": {},
+      "sample_unresolved_ids": [],
+      "sample_updated_ids": []
+    },
+    "rbac_config": {
+      "total": 14,
+      "already_valid": 0,
+      "invalid_existing": 0,
+      "unresolved": 0,
+      "updates_planned": 14,
+      "updates_applied": 14,
+      "source_counts": {
+        "default_tenant_fallback": 14
+      },
+      "sample_unresolved_ids": [],
+      "sample_updated_ids": [
+        "69ac78369c460ba1489114c1",
+        "69ac78369c460ba1489114c2",
+        "69ac78369c460ba1489114c3",
+        "69ac78369c460ba1489114c4",
+        "69ac78369c460ba1489114c5",
+        "69ac78369c460ba1489114c6",
+        "69ac78369c460ba1489114b9",
+        "69ac78369c460ba1489114ba",
+        "69ac78369c460ba1489114bb",
+        "69ac78369c460ba1489114bc",
+        "69ac78369c460ba1489114bd",
+        "69ac78369c460ba1489114be",
+        "69ac78369c460ba1489114bf",
+        "69ac78369c460ba1489114c0"
+      ]
+    },
+    "set_yuran": {
+      "total": 15,
+      "already_valid": 15,
+      "invalid_existing": 0,
+      "unresolved": 0,
+      "updates_planned": 0,
+      "updates_applied": 0,
+      "source_counts": {},
+      "sample_unresolved_ids": [],
+      "sample_updated_ids": []
+    },
+    "student_yuran": {
+      "total": 11,
+      "already_valid": 11,
+      "invalid_existing": 0,
+      "unresolved": 0,
+      "updates_planned": 0,
+      "updates_applied": 0,
+      "source_counts": {},
+      "sample_unresolved_ids": [],
+      "sample_updated_ids": []
+    },
+    "payments": {
+      "total": 0,
+      "already_valid": 0,
+      "invalid_existing": 0,
+      "unresolved": 0,
+      "updates_planned": 0,
+      "updates_applied": 0,
+      "source_counts": {},
+      "sample_unresolved_ids": [],
+      "sample_updated_ids": []
+    },
+    "yuran_payments": {
+      "total": 1,
+      "already_valid": 1,
+      "invalid_existing": 0,
+      "unresolved": 0,
+      "updates_planned": 0,
+      "updates_applied": 0,
+      "source_counts": {},
+      "sample_unresolved_ids": [],
+      "sample_updated_ids": []
+    },
+    "payment_center_cart": {
+      "total": 2,
+      "already_valid": 0,
+      "invalid_existing": 0,
+      "unresolved": 0,
+      "updates_planned": 2,
+      "updates_applied": 2,
+      "source_counts": {
+        "user_ref.user_id": 2
+      },
+      "sample_unresolved_ids": [],
+      "sample_updated_ids": [
+        "69b341b800b568fb368b0193",
+        "69b3504300b568fb368b019c"
+      ]
+    },
+    "payment_receipts": {
+      "total": 7,
+      "already_valid": 0,
+      "invalid_existing": 0,
+      "unresolved": 0,
+      "updates_planned": 7,
+      "updates_applied": 7,
+      "source_counts": {
+        "user_ref.user_id": 7
+      },
+      "sample_unresolved_ids": [],
+      "sample_updated_ids": [
+        "69acbcb8a095f843c91e9541",
+        "69b1ec89d52f40680041a7df",
+        "69b1ecf3d52f40680041a7f1",
+        "69b1eca1d52f40680041a7e8",
+        "69b1ed79c68a46dc24418694",
+        "69b1f10c93c05c2894b7e5e3",
+        "69b1ffb92a4122ffe235df41"
+      ]
+    },
+    "ar_print_jobs": {
+      "total": 1,
+      "already_valid": 0,
+      "invalid_existing": 0,
+      "unresolved": 0,
+      "updates_planned": 1,
+      "updates_applied": 1,
+      "source_counts": {
+        "user_ref.created_by": 1
+      },
+      "sample_unresolved_ids": [],
+      "sample_updated_ids": [
+        "69ad3e43cc81c895d9f4d8e8"
+      ]
+    },
+    "ar_notification_report_log": {
+      "total": 1,
+      "already_valid": 0,
+      "invalid_existing": 0,
+      "unresolved": 0,
+      "updates_planned": 1,
+      "updates_applied": 1,
+      "source_counts": {
+        "default_tenant_fallback": 1
+      },
+      "sample_unresolved_ids": [],
+      "sample_updated_ids": [
+        "69ad3e43cc81c895d9f4d8e9"
+      ]
+    },
+    "accounting_transactions": {
+      "total": 79,
+      "already_valid": 79,
+      "invalid_existing": 0,
+      "unresolved": 0,
+      "updates_planned": 0,
+      "updates_applied": 0,
+      "source_counts": {},
+      "sample_unresolved_ids": [],
+      "sample_updated_ids": []
+    },
+    "accounting_categories": {
+      "total": 17,
+      "already_valid": 17,
+      "invalid_existing": 0,
+      "unresolved": 0,
+      "updates_planned": 0,
+      "updates_applied": 0,
+      "source_counts": {},
+      "sample_unresolved_ids": [],
+      "sample_updated_ids": []
+    },
+    "bank_accounts": {
+      "total": 2,
+      "already_valid": 0,
+      "invalid_existing": 0,
+      "unresolved": 0,
+      "updates_planned": 2,
+      "updates_applied": 2,
+      "source_counts": {
+        "default_tenant_fallback": 2
+      },
+      "sample_unresolved_ids": [],
+      "sample_updated_ids": [
+        "69acbcb8a095f843c91e9544",
+        "69ad175da095f843c91e9553"
+      ]
+    },
+    "financial_years": {
+      "total": 1,
+      "already_valid": 0,
+      "invalid_existing": 0,
+      "unresolved": 0,
+      "updates_planned": 1,
+      "updates_applied": 1,
+      "source_counts": {
+        "default_tenant_fallback": 1
+      },
+      "sample_unresolved_ids": [],
+      "sample_updated_ids": [
+        "69b03c0b95611b763c45632c"
+      ]
+    },
+    "financial_ledger": {
+      "total": 2,
+      "already_valid": 2,
+      "invalid_existing": 0,
+      "unresolved": 0,
+      "updates_planned": 0,
+      "updates_applied": 0,
+      "source_counts": {},
+      "sample_unresolved_ids": [],
+      "sample_updated_ids": []
+    },
+    "accounting_audit_logs": {
+      "total": 91,
+      "already_valid": 91,
+      "invalid_existing": 0,
+      "unresolved": 0,
+      "updates_planned": 0,
+      "updates_applied": 0,
+      "source_counts": {},
+      "sample_unresolved_ids": [],
+      "sample_updated_ids": []
+    },
+    "accounting_period_locks": {
+      "total": 0,
+      "already_valid": 0,
+      "invalid_existing": 0,
+      "unresolved": 0,
+      "updates_planned": 0,
+      "updates_applied": 0,
+      "source_counts": {},
+      "sample_unresolved_ids": [],
+      "sample_updated_ids": []
+    },
+    "accounting_journal_entries": {
+      "total": 76,
+      "already_valid": 76,
+      "invalid_existing": 0,
+      "unresolved": 0,
+      "updates_planned": 0,
+      "updates_applied": 0,
+      "source_counts": {},
+      "sample_unresolved_ids": [],
+      "sample_updated_ids": []
+    },
+    "accounting_journal_lines": {
+      "total": 152,
+      "already_valid": 152,
+      "invalid_existing": 0,
+      "unresolved": 0,
+      "updates_planned": 0,
+      "updates_applied": 0,
+      "source_counts": {},
+      "sample_unresolved_ids": [],
+      "sample_updated_ids": []
+    },
+    "bank_reconciliation_profiles": {
+      "total": 15,
+      "already_valid": 0,
+      "invalid_existing": 0,
+      "unresolved": 0,
+      "updates_planned": 15,
+      "updates_applied": 15,
+      "source_counts": {
+        "user_ref.created_by": 15
+      },
+      "sample_unresolved_ids": [],
+      "sample_updated_ids": [
+        "69b27ae200b568fb368afc1d",
+        "69b27cb900b568fb368afc3c",
+        "69b2a20300b568fb368afcb0",
+        "69b27e9e00b568fb368afc66",
+        "69b2a78d00b568fb368afcdb",
+        "69b2b30f00b568fb368afd2d",
+        "69b2b32000b568fb368afd9f",
+        "69b2b33000b568fb368afe11",
+        "69b2b37400b568fb368afe83",
+        "69b2b38500b568fb368afef5",
+        "69b2b39700b568fb368aff67",
+        "69b2b67f00b568fb368affdd",
+        "69b2bbd600b568fb368b004f",
+        "69b2bc3a00b568fb368b00c1",
+        "69b2c02800b568fb368b0133"
+      ]
+    },
+    "bank_reconciliation_statements": {
+      "total": 32,
+      "already_valid": 0,
+      "invalid_existing": 0,
+      "unresolved": 0,
+      "updates_planned": 32,
+      "updates_applied": 32,
+      "source_counts": {
+        "user_ref.created_by": 32
+      },
+      "sample_unresolved_ids": [],
+      "sample_updated_ids": [
+        "69b27ae200b568fb368afc2c",
+        "69b27cb900b568fb368afc4b",
+        "69b27cb900b568fb368afc5a",
+        "69b27e9e00b568fb368afc75",
+        "69b26b53879897f24c44ce91",
+        "69b26b5f879897f24c44cec8",
+        "69b27e9f00b568fb368afc84",
+        "69b26b88879897f24c44cf2a",
+        "69b2a78e00b568fb368afcf9",
+        "69b2a20300b568fb368afcbf",
+        "69b2a20300b568fb368afcce",
+        "69b2a78d00b568fb368afcea",
+        "69b2b30f00b568fb368afd3c",
+        "69b2b30f00b568fb368afd4b",
+        "69b2b32000b568fb368afdae",
+        "69b2b32000b568fb368afdbd",
+        "69b2b33100b568fb368afe2f",
+        "69b2b33000b568fb368afe20",
+        "69b2b37400b568fb368afe92",
+        "69b2b37500b568fb368afea1"
+      ]
+    },
+    "bank_reconciliation_items": {
+      "total": 65,
+      "already_valid": 0,
+      "invalid_existing": 0,
+      "unresolved": 0,
+      "updates_planned": 65,
+      "updates_applied": 65,
+      "source_counts": {
+        "default_tenant_fallback": 65
+      },
+      "sample_unresolved_ids": [],
+      "sample_updated_ids": [
+        "69b27e9f00b568fb368afc85",
+        "69b27ae200b568fb368afc2f",
+        "69b27ae200b568fb368afc2d",
+        "69b27ae200b568fb368afc2e",
+        "69b27cb900b568fb368afc5b",
+        "69b27cb900b568fb368afc4c",
+        "69b27cb900b568fb368afc4d",
+        "69b27cb900b568fb368afc4e",
+        "69b27e9e00b568fb368afc77",
+        "69b27e9e00b568fb368afc78",
+        "69b27e9e00b568fb368afc76",
+        "69b26b53879897f24c44ce93",
+        "69b26b53879897f24c44ce92",
+        "69b26b5f879897f24c44ceca",
+        "69b26b5f879897f24c44cec9",
+        "69b26b88879897f24c44cf2c",
+        "69b26b88879897f24c44cf2b",
+        "69b2a20300b568fb368afcc1",
+        "69b2a20300b568fb368afccf",
+        "69b2a20300b568fb368afcc2"
+      ]
+    },
+    "tabung_campaigns": {
+      "total": 2,
+      "already_valid": 2,
+      "invalid_existing": 0,
+      "unresolved": 0,
+      "updates_planned": 0,
+      "updates_applied": 0,
+      "source_counts": {},
+      "sample_unresolved_ids": [],
+      "sample_updated_ids": []
+    },
+    "tabung_donations": {
+      "total": 3,
+      "already_valid": 3,
+      "invalid_existing": 0,
+      "unresolved": 0,
+      "updates_planned": 0,
+      "updates_applied": 0,
+      "source_counts": {},
+      "sample_unresolved_ids": [],
+      "sample_updated_ids": []
+    },
+    "donation_campaigns": {
+      "total": 4,
+      "already_valid": 0,
+      "invalid_existing": 0,
+      "unresolved": 0,
+      "updates_planned": 4,
+      "updates_applied": 4,
+      "source_counts": {
+        "default_tenant_fallback": 4
+      },
+      "sample_unresolved_ids": [],
+      "sample_updated_ids": [
+        "69ac78369c460ba14891153f",
+        "69ac78369c460ba148911540",
+        "69ac78369c460ba148911541",
+        "69ac78369c460ba148911542"
+      ]
+    },
+    "infaq_campaigns": {
+      "total": 1,
+      "already_valid": 0,
+      "invalid_existing": 0,
+      "unresolved": 0,
+      "updates_planned": 1,
+      "updates_applied": 1,
+      "source_counts": {
+        "user_ref.created_by": 1
+      },
+      "sample_unresolved_ids": [],
+      "sample_updated_ids": [
+        "69b224e3dbf676c6669a8ae6"
+      ]
+    },
+    "payment_reminders": {
+      "total": 2,
+      "already_valid": 2,
+      "invalid_existing": 0,
+      "unresolved": 0,
+      "updates_planned": 0,
+      "updates_applied": 0,
+      "source_counts": {},
+      "sample_unresolved_ids": [],
+      "sample_updated_ids": []
+    },
+    "payment_reminder_preferences": {
+      "total": 1,
+      "already_valid": 1,
+      "invalid_existing": 0,
+      "unresolved": 0,
+      "updates_planned": 0,
+      "updates_applied": 0,
+      "source_counts": {},
+      "sample_unresolved_ids": [],
+      "sample_updated_ids": []
+    },
+    "email_templates": {
+      "total": 5,
+      "already_valid": 0,
+      "invalid_existing": 0,
+      "unresolved": 0,
+      "updates_planned": 5,
+      "updates_applied": 5,
+      "source_counts": {
+        "default_tenant_fallback": 5
+      },
+      "sample_unresolved_ids": [],
+      "sample_updated_ids": [
+        "69ac78369c460ba1489114d0",
+        "69ac78369c460ba1489114d1",
+        "69ac78369c460ba1489114d2",
+        "69ac78369c460ba1489114d3",
+        "69ac78369c460ba1489114cf"
+      ]
+    },
+    "email_logs": {
+      "total": 1,
+      "already_valid": 0,
+      "invalid_existing": 0,
+      "unresolved": 0,
+      "updates_planned": 1,
+      "updates_applied": 1,
+      "source_counts": {
+        "user_ref.user_id": 1
+      },
+      "sample_unresolved_ids": [],
+      "sample_updated_ids": [
+        "69b1b1f5d52f40680041a758"
+      ]
+    },
+    "push_subscriptions": {
+      "total": 1,
+      "already_valid": 0,
+      "invalid_existing": 0,
+      "unresolved": 0,
+      "updates_planned": 1,
+      "updates_applied": 1,
+      "source_counts": {
+        "user_ref.user_id": 1
+      },
+      "sample_unresolved_ids": [],
+      "sample_updated_ids": [
+        "69b19de9d52f40680041a717"
+      ]
+    },
+    "push_logs": {
+      "total": 2,
+      "already_valid": 0,
+      "invalid_existing": 0,
+      "unresolved": 0,
+      "updates_planned": 2,
+      "updates_applied": 2,
+      "source_counts": {
+        "user_ref.user_id": 2
+      },
+      "sample_unresolved_ids": [],
+      "sample_updated_ids": [
+        "69b1afd9d52f40680041a738",
+        "69b1e5e1d52f40680041a79f"
+      ]
+    },
+    "pwa_device_tokens": {
+      "total": 4,
+      "already_valid": 0,
+      "invalid_existing": 0,
+      "unresolved": 0,
+      "updates_planned": 4,
+      "updates_applied": 4,
+      "source_counts": {
+        "user_ref.user_id": 4
+      },
+      "sample_unresolved_ids": [],
+      "sample_updated_ids": [
+        "69aff74cbdbdfc2c870adf35",
+        "69b0a00cd52f40680041a5a3",
+        "69b0a00cd52f40680041a5a2",
+        "69b22b98dbf676c6669a8b1c"
+      ]
+    },
+    "chatbox_faq": {
+      "total": 14,
+      "already_valid": 0,
+      "invalid_existing": 0,
+      "unresolved": 0,
+      "updates_planned": 14,
+      "updates_applied": 14,
+      "source_counts": {
+        "default_tenant_fallback": 14
+      },
+      "sample_unresolved_ids": [],
+      "sample_updated_ids": [
+        "69ac78369c460ba1489114db",
+        "69ac78369c460ba1489114dc",
+        "69ac78369c460ba1489114dd",
+        "69ac78369c460ba1489114de",
+        "69ac78369c460ba1489114d4",
+        "69ac78369c460ba1489114d5",
+        "69ac78369c460ba1489114d6",
+        "69ac78369c460ba1489114d7",
+        "69ac78369c460ba1489114d8",
+        "69ac78369c460ba1489114d9",
+        "69ac78369c460ba1489114da",
+        "69ac78369c460ba1489114df",
+        "69ac78369c460ba1489114e0",
+        "69ac78369c460ba1489114e1"
+      ]
+    },
+    "chatbox_responses": {
+      "total": 48,
+      "already_valid": 0,
+      "invalid_existing": 0,
+      "unresolved": 0,
+      "updates_planned": 48,
+      "updates_applied": 48,
+      "source_counts": {
+        "default_tenant_fallback": 48
+      },
+      "sample_unresolved_ids": [],
+      "sample_updated_ids": [
+        "69ac78369c460ba1489114e2",
+        "69ac78369c460ba1489114e3",
+        "69ac78369c460ba1489114e4",
+        "69ac78369c460ba1489114e5",
+        "69ac78369c460ba1489114e6",
+        "69ac78369c460ba1489114e7",
+        "69ac78369c460ba1489114e8",
+        "69ac78369c460ba1489114e9",
+        "69ac78369c460ba1489114ea",
+        "69ac78369c460ba1489114eb",
+        "69ac78369c460ba1489114ec",
+        "69ac78369c460ba1489114ed",
+        "69ac78369c460ba1489114ee",
+        "69ac78369c460ba1489114ef",
+        "69ac78369c460ba1489114f0",
+        "69ac78369c460ba1489114f1",
+        "69ac78369c460ba1489114f2",
+        "69ac78369c460ba1489114f3",
+        "69ac78369c460ba1489114f4",
+        "69ac78369c460ba1489114f5"
+      ]
+    },
+    "chatbox_suggestions": {
+      "total": 14,
+      "already_valid": 0,
+      "invalid_existing": 0,
+      "unresolved": 0,
+      "updates_planned": 14,
+      "updates_applied": 14,
+      "source_counts": {
+        "default_tenant_fallback": 14
+      },
+      "sample_unresolved_ids": [],
+      "sample_updated_ids": [
+        "69ac78369c460ba14891151b",
+        "69ac78369c460ba14891151c",
+        "69ac78369c460ba14891151d",
+        "69ac78369c460ba148911518",
+        "69ac78369c460ba148911519",
+        "69ac78369c460ba14891151a",
+        "69ac78369c460ba148911512",
+        "69ac78369c460ba148911513",
+        "69ac78369c460ba148911514",
+        "69ac78369c460ba148911515",
+        "69ac78369c460ba148911516",
+        "69ac78369c460ba148911517",
+        "69ac78369c460ba14891151e",
+        "69ac78369c460ba14891151f"
+      ]
+    },
+    "ai_chat_history": {
+      "total": 8,
+      "already_valid": 0,
+      "invalid_existing": 0,
+      "unresolved": 0,
+      "updates_planned": 8,
+      "updates_applied": 8,
+      "source_counts": {
+        "default_tenant_fallback": 8
+      },
+      "sample_unresolved_ids": [],
+      "sample_updated_ids": [
+        "69acb8caa095f843c91e953e",
+        "69acb8caa095f843c91e953f",
+        "69b036ca2c554c206dd7f564",
+        "69b02b960928b39acfa81a95",
+        "69b02b960928b39acfa81a96",
+        "69b036ca2c554c206dd7f563",
+        "69b33d7b00b568fb368b0190",
+        "69b33d7b00b568fb368b0191"
+      ]
+    },
+    "vendors": {
+      "total": 1,
+      "already_valid": 0,
+      "invalid_existing": 0,
+      "unresolved": 0,
+      "updates_planned": 1,
+      "updates_applied": 1,
+      "source_counts": {
+        "user_ref.created_by": 1
+      },
+      "sample_unresolved_ids": [],
+      "sample_updated_ids": [
+        "69b0453c95611b763c456355"
+      ]
+    },
+    "marketplace_settings": {
+      "total": 1,
+      "already_valid": 0,
+      "invalid_existing": 0,
+      "unresolved": 0,
+      "updates_planned": 1,
+      "updates_applied": 1,
+      "source_counts": {
+        "user_ref.updated_by": 1
+      },
+      "sample_unresolved_ids": [],
+      "sample_updated_ids": [
+        "69acb1e6a095f843c91e952f"
+      ]
+    },
+    "koperasi_settings": {
+      "total": 1,
+      "already_valid": 0,
+      "invalid_existing": 0,
+      "unresolved": 0,
+      "updates_planned": 1,
+      "updates_applied": 1,
+      "source_counts": {
+        "user_ref.updated_by": 1
+      },
+      "sample_unresolved_ids": [],
+      "sample_updated_ids": [
+        "69ad7a78d1d0052299bef409"
+      ]
+    },
+    "hostel_blocks": {
+      "total": 8,
+      "already_valid": 0,
+      "invalid_existing": 0,
+      "unresolved": 0,
+      "updates_planned": 8,
+      "updates_applied": 8,
+      "source_counts": {
+        "default_tenant_fallback": 8
+      },
+      "sample_unresolved_ids": [],
+      "sample_updated_ids": [
+        "69ac78369c460ba1489114c7",
+        "69ac78369c460ba1489114c8",
+        "69ac78369c460ba1489114c9",
+        "69ac78369c460ba1489114ca",
+        "69ac78369c460ba1489114cb",
+        "69ac78369c460ba1489114cc",
+        "69ac78369c460ba1489114cd",
+        "69ac78369c460ba1489114ce"
+      ]
+    },
+    "hostel_pbw_pbp_periods": {
+      "total": 1,
+      "already_valid": 0,
+      "invalid_existing": 0,
+      "unresolved": 0,
+      "updates_planned": 1,
+      "updates_applied": 1,
+      "source_counts": {
+        "user_ref.created_by": 1
+      },
+      "sample_unresolved_ids": [],
+      "sample_updated_ids": [
+        "69a0117f0cbc61b50fd7a60e"
+      ]
+    },
+    "offence_sections": {
+      "total": 7,
+      "already_valid": 0,
+      "invalid_existing": 0,
+      "unresolved": 0,
+      "updates_planned": 7,
+      "updates_applied": 7,
+      "source_counts": {
+        "default_tenant_fallback": 7
+      },
+      "sample_unresolved_ids": [],
+      "sample_updated_ids": [
+        "69aff45dfb35b55d711efe0f",
+        "69aff45dfb35b55d711efe10",
+        "69aff45dfb35b55d711efe11",
+        "69aff45dfb35b55d711efe12",
+        "69aff45dfb35b55d711efe13",
+        "69aff45dfb35b55d711efe14",
+        "69aff45dfb35b55d711efe15"
+      ]
+    },
+    "olat_categories": {
+      "total": 6,
+      "already_valid": 0,
+      "invalid_existing": 0,
+      "unresolved": 0,
+      "updates_planned": 6,
+      "updates_applied": 6,
+      "source_counts": {
+        "default_tenant_fallback": 6
+      },
+      "sample_unresolved_ids": [],
+      "sample_updated_ids": [
+        "69b09ce81b2f28489f2ebac3",
+        "69b09ce81b2f28489f2ebac1",
+        "69b09ce81b2f28489f2ebac0",
+        "69b09ce81b2f28489f2ebac5",
+        "69b09ce81b2f28489f2ebac4",
+        "69b09ce81b2f28489f2ebac2"
+      ]
+    },
+    "bus_companies": {
+      "total": 10,
+      "already_valid": 0,
+      "invalid_existing": 0,
+      "unresolved": 0,
+      "updates_planned": 10,
+      "updates_applied": 10,
+      "source_counts": {
+        "default_tenant_fallback": 4,
+        "user_ref.created_by": 6
+      },
+      "sample_unresolved_ids": [],
+      "sample_updated_ids": [
+        "69ac78369c460ba148911521",
+        "69ac78369c460ba148911522",
+        "69ac78369c460ba148911523",
+        "69ac78369c460ba148911524",
+        "69b1f10c93c05c2894b7e5d7",
+        "69b1ffb92a4122ffe235df34",
+        "69b20945c102a23acbe33fd3",
+        "69b20cfae9a9aa6504476fdb",
+        "69b20d4a916cbbe5f80bb5e0",
+        "69b21d9adbf676c6669a8a94"
+      ]
+    },
+    "buses": {
+      "total": 22,
+      "already_valid": 0,
+      "invalid_existing": 0,
+      "unresolved": 0,
+      "updates_planned": 22,
+      "updates_applied": 22,
+      "source_counts": {
+        "ref.company_id": 16,
+        "user_ref.created_by": 6
+      },
+      "sample_unresolved_ids": [],
+      "sample_updated_ids": [
+        "69ac78369c460ba148911525",
+        "69ac78369c460ba148911526",
+        "69ac78369c460ba148911527",
+        "69ac78369c460ba148911528",
+        "69ac78369c460ba148911529",
+        "69ac78369c460ba14891152a",
+        "69ac78369c460ba14891152b",
+        "69ac78369c460ba14891152c",
+        "69ac78369c460ba14891152d",
+        "69ac78369c460ba14891152e",
+        "69ac78369c460ba14891152f",
+        "69ac78369c460ba148911530",
+        "69ac78369c460ba148911531",
+        "69ac78369c460ba148911532",
+        "69ac78369c460ba148911533",
+        "69ac78369c460ba148911534",
+        "69b1f10c93c05c2894b7e5d9",
+        "69b1ffb92a4122ffe235df36",
+        "69b20945c102a23acbe33fd5",
+        "69b20cfae9a9aa6504476fdd"
+      ]
+    },
+    "bus_routes": {
+      "total": 17,
+      "already_valid": 0,
+      "invalid_existing": 0,
+      "unresolved": 0,
+      "updates_planned": 17,
+      "updates_applied": 17,
+      "source_counts": {
+        "ref.company_id": 10,
+        "user_ref.created_by": 7
+      },
+      "sample_unresolved_ids": [],
+      "sample_updated_ids": [
+        "69ac78369c460ba148911535",
+        "69ac78369c460ba148911536",
+        "69ac78369c460ba148911537",
+        "69ac78369c460ba148911538",
+        "69ac78369c460ba148911539",
+        "69ac78369c460ba14891153a",
+        "69ac78369c460ba14891153b",
+        "69ac78369c460ba14891153c",
+        "69ac78369c460ba14891153d",
+        "69ac78369c460ba14891153e",
+        "69b1f10c93c05c2894b7e5db",
+        "69b1ffb92a4122ffe235df38",
+        "69b20945c102a23acbe33fd7",
+        "69b20945c102a23acbe33fd9",
+        "69b20cfae9a9aa6504476fdf",
+        "69b20cfae9a9aa6504476fe1",
+        "69b21d9adbf676c6669a8a98"
+      ]
+    },
+    "bus_trips": {
+      "total": 40,
+      "already_valid": 0,
+      "invalid_existing": 0,
+      "unresolved": 0,
+      "updates_planned": 40,
+      "updates_applied": 40,
+      "source_counts": {
+        "user_ref.created_by": 40
+      },
+      "sample_unresolved_ids": [],
+      "sample_updated_ids": [
+        "69b22bbbdbf676c6669a8b35",
+        "69b22d0ddbf676c6669a8c3e",
+        "69b22bc8dbf676c6669a8b9f",
+        "69b22bc2dbf676c6669a8b6a",
+        "69b22d01dbf676c6669a8bd4",
+        "69b1f10c93c05c2894b7e5dd",
+        "69b1ffb92a4122ffe235df3a",
+        "69b20d4a916cbbe5f80bb5e9",
+        "69b218f1d341b04ac7280960",
+        "69b21d9adbf676c6669a8a9a",
+        "69b21dc6dbf676c6669a8aa3",
+        "69b22124dbf676c6669a8ad4",
+        "69b22d07dbf676c6669a8c09",
+        "69b22d83dbf676c6669a8c73",
+        "69b235b8dbf676c6669a8cdd",
+        "69b234b9dbf676c6669a8ca8",
+        "69b23804dbf676c6669a8d1a",
+        "69b23832dbf676c6669a8d55",
+        "69b23838dbf676c6669a8d90",
+        "69b2383fdbf676c6669a8dcb"
+      ]
+    },
+    "bus_bookings": {
+      "total": 4,
+      "already_valid": 0,
+      "invalid_existing": 0,
+      "unresolved": 0,
+      "updates_planned": 4,
+      "updates_applied": 4,
+      "source_counts": {
+        "user_ref.parent_id": 2,
+        "user_ref.user_id": 2
+      },
+      "sample_unresolved_ids": [],
+      "sample_updated_ids": [
+        "69b1f10c93c05c2894b7e5df",
+        "69b1f10c93c05c2894b7e5e4",
+        "69b1ffb92a4122ffe235df3d",
+        "69b1ffb92a4122ffe235df42"
+      ]
+    },
+    "bus_live_locations": {
+      "total": 35,
+      "already_valid": 0,
+      "invalid_existing": 0,
+      "unresolved": 0,
+      "updates_planned": 35,
+      "updates_applied": 35,
+      "source_counts": {
+        "ref.trip_id": 35
+      },
+      "sample_unresolved_ids": [],
+      "sample_updated_ids": [
+        "69b22bbcdbf676c6669a8b3b",
+        "69b22bc2dbf676c6669a8b70",
+        "69b22bc8dbf676c6669a8ba5",
+        "69b22d0ddbf676c6669a8c44",
+        "69b22d01dbf676c6669a8bda",
+        "69b21dc6dbf676c6669a8aa9",
+        "69b22d07dbf676c6669a8c0f",
+        "69b22124dbf676c6669a8ada",
+        "69b22d83dbf676c6669a8c79",
+        "69b235b9dbf676c6669a8ce3",
+        "69b23805dbf676c6669a8d20",
+        "69b234b9dbf676c6669a8cae",
+        "69b23833dbf676c6669a8d5b",
+        "69b23839dbf676c6669a8d96",
+        "69b2383fdbf676c6669a8dd1",
+        "69b2389fdbf676c6669a8e0c",
+        "69b239a0dbf676c6669a8e4e",
+        "69b239c6dbf676c6669a8e8b",
+        "69b239d0dbf676c6669a8ec8",
+        "69b239d7dbf676c6669a8f05"
+      ]
+    },
+    "scheduler_logs": {
+      "total": 93,
+      "already_valid": 0,
+      "invalid_existing": 0,
+      "unresolved": 0,
+      "updates_planned": 93,
+      "updates_applied": 93,
+      "source_counts": {
+        "default_tenant_fallback": 93
+      },
+      "sample_unresolved_ids": [],
+      "sample_updated_ids": [
+        "69b2475edbf676c6669a8f7d",
+        "69ada07fd1d0052299bef419",
+        "69b2556edbf676c6669a8f7e",
+        "69aca9bea095f843c91e9518",
+        "69adae8fd1d0052299bef41a",
+        "69acc5dea095f843c91e954b",
+        "69acb7cea095f843c91e953d",
+        "69acd3eea095f843c91e954c",
+        "69ace1fea095f843c91e954d",
+        "69acf00ea095f843c91e954e",
+        "69acfe1ea095f843c91e954f",
+        "69ad0c2ea095f843c91e9550",
+        "69ad1a3ea095f843c91e9555",
+        "69ad284ea095f843c91e9556",
+        "69ad365ea095f843c91e9557",
+        "69adbc9fd1d0052299bef41b",
+        "69adcaafd1d0052299bef41c",
+        "69add8bfd1d0052299bef433",
+        "69ad5dc2036400c99aca56eb",
+        "69ad6bd2036400c99aca56ec"
+      ]
+    },
+    "agm_events": {
+      "total": 1,
+      "already_valid": 0,
+      "invalid_existing": 0,
+      "unresolved": 0,
+      "updates_planned": 1,
+      "updates_applied": 1,
+      "source_counts": {
+        "default_tenant_fallback": 1
+      },
+      "sample_unresolved_ids": [],
+      "sample_updated_ids": [
+        "69b173ced52f40680041a63e"
+      ]
+    },
+    "notifications": {
+      "total": 116,
+      "already_valid": 116,
+      "invalid_existing": 0,
+      "unresolved": 0,
+      "updates_planned": 0,
+      "updates_applied": 0,
+      "source_counts": {},
+      "sample_unresolved_ids": [],
+      "sample_updated_ids": []
+    },
+    "audit_logs": {
+      "total": 3460,
+      "already_valid": 3460,
+      "invalid_existing": 0,
+      "unresolved": 0,
+      "updates_planned": 0,
+      "updates_applied": 0,
+      "source_counts": {},
+      "sample_unresolved_ids": [],
+      "sample_updated_ids": []
+    },
+    "tenant_onboarding_jobs": {
+      "total": 0,
+      "already_valid": 0,
+      "invalid_existing": 0,
+      "unresolved": 0,
+      "updates_planned": 0,
+      "updates_applied": 0,
+      "source_counts": {},
+      "sample_unresolved_ids": [],
+      "sample_updated_ids": []
+    },
+    "institution_onboarding_requests": {
+      "total": 0,
+      "already_valid": 0,
+      "invalid_existing": 0,
+      "unresolved": 0,
+      "updates_planned": 0,
+      "updates_applied": 0,
+      "source_counts": {},
+      "sample_unresolved_ids": [],
+      "sample_updated_ids": []
+    }
+  },
+  "generated_at": "2026-03-13T08:55:29.270188+00:00",
+  "database_url": "postgresql+psycopg://kamarulariffin@localhost:5432/mrsm_portal",
+  "default_tenant": {
+    "tenant_id": "tenant_legacy_main",
+    "tenant_code": "mrsm-main",
+    "exists_in_tenant_master": true,
+    "assign_unresolved_to_default": true,
+    "allow_nonexistent_default_tenant": false
+  }
+}

@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field
 from typing import Optional
 from datetime import datetime, timezone
 from bson import ObjectId
+from services.id_normalizer import object_id_or_none
 import os
 import uuid
 
@@ -42,6 +43,25 @@ async def _current_user_dep(credentials: HTTPAuthorizationCredentials = Depends(
 
 def get_db():
     return _get_db_func()
+
+
+def _id_value(value: object, *, strict: bool = False, error_detail: str = "ID tidak sah"):
+    """Normalize ID-like inputs while supporting non-ObjectId IDs."""
+    if value is None:
+        if strict:
+            raise HTTPException(status_code=400, detail=error_detail)
+        return None
+    if isinstance(value, ObjectId):
+        return value
+    text = str(value).strip()
+    try:
+        if ObjectId.is_valid(text):
+            return object_id_or_none(text)
+    except Exception:
+        pass
+    if strict:
+        raise HTTPException(status_code=400, detail=error_detail)
+    return text
 
 
 try:
@@ -136,10 +156,7 @@ async def update_faq(
 ):
     _require_admin(current_user)
     db = get_db()
-    try:
-        oid = ObjectId(faq_id)
-    except Exception:
-        raise HTTPException(status_code=400, detail="ID tidak sah")
+    oid = _id_value(faq_id, strict=True)
     update = {"updated_at": datetime.now(timezone.utc).isoformat()}
     if data.question is not None:
         update["question"] = data.question.strip()
@@ -161,10 +178,7 @@ async def delete_faq(
 ):
     _require_admin(current_user)
     db = get_db()
-    try:
-        oid = ObjectId(faq_id)
-    except Exception:
-        raise HTTPException(status_code=400, detail="ID tidak sah")
+    oid = _id_value(faq_id, strict=True)
     doc = await db.chatbox_faq.find_one({"_id": oid})
     if not doc:
         raise HTTPException(status_code=404, detail="FAQ tidak dijumpai")
@@ -196,10 +210,7 @@ async def upload_faq_attachment(
     if len(content) > MAX_FILE_SIZE:
         raise HTTPException(status_code=400, detail="Saiz fail melebihi 10MB")
     db = get_db()
-    try:
-        oid = ObjectId(faq_id)
-    except Exception:
-        raise HTTPException(status_code=400, detail="ID FAQ tidak sah")
+    oid = _id_value(faq_id, strict=True, error_detail="ID FAQ tidak sah")
     faq = await db.chatbox_faq.find_one({"_id": oid})
     if not faq:
         raise HTTPException(status_code=404, detail="FAQ tidak dijumpai")
@@ -235,10 +246,7 @@ async def delete_faq_attachment(
 ):
     _require_admin(current_user)
     db = get_db()
-    try:
-        oid = ObjectId(faq_id)
-    except Exception:
-        raise HTTPException(status_code=400, detail="ID tidak sah")
+    oid = _id_value(faq_id, strict=True)
     path = os.path.join(FAQ_UPLOAD_DIR, filename)
     if os.path.isfile(path):
         try:

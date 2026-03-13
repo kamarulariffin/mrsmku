@@ -1,0 +1,493 @@
+{
+  "mode": "execute",
+  "collections_processed": 21,
+  "collections_skipped": [],
+  "totals": {
+    "records": 4046,
+    "already_valid": 0,
+    "invalid_existing": 0,
+    "unresolved": 0,
+    "updates_planned": 4046,
+    "updates_applied": 4046
+  },
+  "collections": {
+    "tenant_user_memberships": {
+      "total": 0,
+      "already_valid": 0,
+      "invalid_existing": 0,
+      "unresolved": 0,
+      "updates_planned": 0,
+      "updates_applied": 0,
+      "source_counts": {},
+      "sample_unresolved_ids": [],
+      "sample_updated_ids": []
+    },
+    "tenant_module_settings": {
+      "total": 0,
+      "already_valid": 0,
+      "invalid_existing": 0,
+      "unresolved": 0,
+      "updates_planned": 0,
+      "updates_applied": 0,
+      "source_counts": {},
+      "sample_unresolved_ids": [],
+      "sample_updated_ids": []
+    },
+    "users": {
+      "total": 32,
+      "already_valid": 0,
+      "invalid_existing": 0,
+      "unresolved": 0,
+      "updates_planned": 32,
+      "updates_applied": 32,
+      "source_counts": {
+        "default_tenant_fallback": 32
+      },
+      "sample_unresolved_ids": [],
+      "sample_updated_ids": [
+        "699dd6d3e3f395343c5005e1",
+        "699dd6d4e3f395343c5005f0",
+        "699dd6d5e3f395343c5005f2",
+        "69add446d1d0052299bef422",
+        "69add446d1d0052299bef425",
+        "69add446d1d0052299bef424",
+        "699dd6d2e3f395343c5005dc",
+        "699dd6d2e3f395343c5005dd",
+        "699dd6d2e3f395343c5005de",
+        "699dd6d3e3f395343c5005df",
+        "699dd6d3e3f395343c5005e0",
+        "699dd6d3e3f395343c5005e2",
+        "699dd6d3e3f395343c5005e3",
+        "699dd6d3e3f395343c5005e4",
+        "699dd6d4e3f395343c5005e6",
+        "699dd6d4e3f395343c5005e8",
+        "699dd6d4e3f395343c5005ea",
+        "699dd6d4e3f395343c5005ec",
+        "699dd6d4e3f395343c5005ee",
+        "699dd6d5e3f395343c5005f4"
+      ]
+    },
+    "students": {
+      "total": 15,
+      "already_valid": 0,
+      "invalid_existing": 0,
+      "unresolved": 0,
+      "updates_planned": 15,
+      "updates_applied": 15,
+      "source_counts": {
+        "parent_user": 15
+      },
+      "sample_unresolved_ids": [],
+      "sample_updated_ids": [
+        "69a2b64a44e65164f33e5f43",
+        "69a2b8ea7bc2475f9f2dc121",
+        "69a2b64a44e65164f33e5f44",
+        "69a2b64a44e65164f33e5f45",
+        "69a2b8ea7bc2475f9f2dc122",
+        "69a2b8ea7bc2475f9f2dc123",
+        "69a2b8ea7bc2475f9f2dc124",
+        "69a2b8ea7bc2475f9f2dc125",
+        "69a2b8ea7bc2475f9f2dc126",
+        "69a2b8ea7bc2475f9f2dc127",
+        "69a2b8ea7bc2475f9f2dc128",
+        "69a2b8ea7bc2475f9f2dc129",
+        "69a2b8ea7bc2475f9f2dc12a",
+        "69a2b8ea7bc2475f9f2dc12b",
+        "69a2b64a44e65164f33e5f46"
+      ]
+    },
+    "set_yuran": {
+      "total": 15,
+      "already_valid": 0,
+      "invalid_existing": 0,
+      "unresolved": 0,
+      "updates_planned": 15,
+      "updates_applied": 15,
+      "source_counts": {
+        "created_by": 15
+      },
+      "sample_unresolved_ids": [],
+      "sample_updated_ids": [
+        "69a2b64b44e65164f33e5f47",
+        "69a2b64b44e65164f33e5f48",
+        "69a2b64b44e65164f33e5f49",
+        "69a2b64b44e65164f33e5f4a",
+        "69a2b64b44e65164f33e5f4b",
+        "69a2b64b44e65164f33e5f4c",
+        "69a2b64b44e65164f33e5f4d",
+        "69a2b64b44e65164f33e5f4e",
+        "69a2b64b44e65164f33e5f4f",
+        "69a2b64b44e65164f33e5f50",
+        "69a2b64b44e65164f33e5f52",
+        "69a2b64b44e65164f33e5f53",
+        "69a2b64b44e65164f33e5f54",
+        "69a2b64b44e65164f33e5f55",
+        "69a2b64b44e65164f33e5f51"
+      ]
+    },
+    "student_yuran": {
+      "total": 11,
+      "already_valid": 0,
+      "invalid_existing": 0,
+      "unresolved": 0,
+      "updates_planned": 11,
+      "updates_applied": 11,
+      "source_counts": {
+        "student": 11
+      },
+      "sample_unresolved_ids": [],
+      "sample_updated_ids": [
+        "69a2b64b44e65164f33e5f56",
+        "69a2b64b44e65164f33e5f58",
+        "69a2b64b44e65164f33e5f5a",
+        "69a2b64b44e65164f33e5f5b",
+        "69a2b64b44e65164f33e5f5c",
+        "69a2b8ea7bc2475f9f2dc12c",
+        "69a2b8ea7bc2475f9f2dc12d",
+        "69a2b8ea7bc2475f9f2dc12e",
+        "69a2b8ea7bc2475f9f2dc12f",
+        "69a2b64b44e65164f33e5f59",
+        "69a2b64b44e65164f33e5f57"
+      ]
+    },
+    "payments": {
+      "total": 0,
+      "already_valid": 0,
+      "invalid_existing": 0,
+      "unresolved": 0,
+      "updates_planned": 0,
+      "updates_applied": 0,
+      "source_counts": {},
+      "sample_unresolved_ids": [],
+      "sample_updated_ids": []
+    },
+    "yuran_payments": {
+      "total": 1,
+      "already_valid": 0,
+      "invalid_existing": 0,
+      "unresolved": 0,
+      "updates_planned": 1,
+      "updates_applied": 1,
+      "source_counts": {
+        "default_tenant_fallback": 1
+      },
+      "sample_unresolved_ids": [],
+      "sample_updated_ids": [
+        "69abc5d4b36cbe550e60f3ae"
+      ]
+    },
+    "accounting_transactions": {
+      "total": 79,
+      "already_valid": 0,
+      "invalid_existing": 0,
+      "unresolved": 0,
+      "updates_planned": 79,
+      "updates_applied": 79,
+      "source_counts": {
+        "created_by": 77,
+        "default_tenant_fallback": 2
+      },
+      "sample_unresolved_ids": [],
+      "sample_updated_ids": [
+        "69ac0bdf5e6342ef93f7a839",
+        "69ac0bdf5e6342ef93f7a845",
+        "69ac0bdf5e6342ef93f7a84b",
+        "69ac0bdf5e6342ef93f7a851",
+        "69ac26f99b5a985cb0212c45",
+        "69acbcb8a095f843c91e9543",
+        "69b1eca1d52f40680041a7e9",
+        "69b1ec89d52f40680041a7e0",
+        "69b1ecf3d52f40680041a7f2",
+        "69b1ed79c68a46dc24418695",
+        "69b27e9f00b568fb368afc7e",
+        "69b27ae200b568fb368afc26",
+        "69b27ae200b568fb368afc20",
+        "69b27cb900b568fb368afc3f",
+        "69b27cb900b568fb368afc45",
+        "69b27cb900b568fb368afc54",
+        "69b23bc1dbf676c6669a8f68",
+        "69b23c07dbf676c6669a8f74",
+        "69b27e9e00b568fb368afc6f",
+        "69b23c7f19bc415270cd1e69"
+      ]
+    },
+    "accounting_audit_logs": {
+      "total": 91,
+      "already_valid": 0,
+      "invalid_existing": 0,
+      "unresolved": 0,
+      "updates_planned": 91,
+      "updates_applied": 91,
+      "source_counts": {
+        "transaction": 89,
+        "default_tenant_fallback": 2
+      },
+      "sample_unresolved_ids": [],
+      "sample_updated_ids": [
+        "69ac0bdf5e6342ef93f7a83e",
+        "69ac0bdf5e6342ef93f7a846",
+        "69ac0bdf5e6342ef93f7a852",
+        "69ac26f99b5a985cb0212c46",
+        "69b27e9f00b568fb368afc82",
+        "69b26b53879897f24c44ce8f",
+        "69b27ae200b568fb368afc24",
+        "69b27ae200b568fb368afc2a",
+        "69b2b30f00b568fb368afd34",
+        "69b27cb900b568fb368afc43",
+        "69b27cb900b568fb368afc49",
+        "69b27e9e00b568fb368afc6d",
+        "69b27cb900b568fb368afc58",
+        "69b23bc1dbf676c6669a8f6c",
+        "69b23bc1dbf676c6669a8f6e",
+        "69b23c07dbf676c6669a8f7a",
+        "69b23c07dbf676c6669a8f78",
+        "69b27e9e00b568fb368afc73",
+        "69b23c9419bc415270cd1e7b",
+        "69b23c7f19bc415270cd1e6d"
+      ]
+    },
+    "accounting_period_locks": {
+      "total": 0,
+      "already_valid": 0,
+      "invalid_existing": 0,
+      "unresolved": 0,
+      "updates_planned": 0,
+      "updates_applied": 0,
+      "source_counts": {},
+      "sample_unresolved_ids": [],
+      "sample_updated_ids": []
+    },
+    "accounting_journal_entries": {
+      "total": 76,
+      "already_valid": 0,
+      "invalid_existing": 0,
+      "unresolved": 0,
+      "updates_planned": 76,
+      "updates_applied": 76,
+      "source_counts": {
+        "transaction": 76
+      },
+      "sample_unresolved_ids": [],
+      "sample_updated_ids": [
+        "69ac0bdf5e6342ef93f7a83b",
+        "69ac0bdf5e6342ef93f7a84c",
+        "69acbcb8a095f843c91e9545",
+        "69b27e9e00b568fb368afc6a",
+        "69b1eca1d52f40680041a7ea",
+        "69b1ec89d52f40680041a7e1",
+        "69b1ecf3d52f40680041a7f3",
+        "69b27e9e00b568fb368afc70",
+        "69b1ed79c68a46dc24418696",
+        "69b27ae200b568fb368afc21",
+        "69b27ae200b568fb368afc27",
+        "69b27cb900b568fb368afc40",
+        "69b27cb900b568fb368afc46",
+        "69b27cb900b568fb368afc55",
+        "69b23c07dbf676c6669a8f75",
+        "69b23bc1dbf676c6669a8f69",
+        "69b23c9419bc415270cd1e78",
+        "69b23c7f19bc415270cd1e6a",
+        "69b23c9f19bc415270cd1e88",
+        "69b23cd319bc415270cd1ea7"
+      ]
+    },
+    "accounting_journal_lines": {
+      "total": 152,
+      "already_valid": 0,
+      "invalid_existing": 0,
+      "unresolved": 0,
+      "updates_planned": 152,
+      "updates_applied": 152,
+      "source_counts": {
+        "journal_entry": 152
+      },
+      "sample_unresolved_ids": [],
+      "sample_updated_ids": [
+        "69ac0bdf5e6342ef93f7a83c",
+        "69ac0bdf5e6342ef93f7a83d",
+        "69ac0bdf5e6342ef93f7a84d",
+        "69ac0bdf5e6342ef93f7a84e",
+        "69acbcb8a095f843c91e9547",
+        "69acbcb8a095f843c91e9546",
+        "69b2b30c00b568fb368afd22",
+        "69b26b53879897f24c44ce8e",
+        "69b1ec89d52f40680041a7e3",
+        "69b1ecf3d52f40680041a7f5",
+        "69b2b30f00b568fb368afd32",
+        "69b1eca1d52f40680041a7eb",
+        "69b1ec89d52f40680041a7e2",
+        "69b1eca1d52f40680041a7ec",
+        "69b1ecf3d52f40680041a7f4",
+        "69b1ed79c68a46dc24418697",
+        "69b1ed79c68a46dc24418698",
+        "69b27ae200b568fb368afc22",
+        "69b27ae200b568fb368afc23",
+        "69b27ae200b568fb368afc28"
+      ]
+    },
+    "tabung_campaigns": {
+      "total": 2,
+      "already_valid": 0,
+      "invalid_existing": 0,
+      "unresolved": 0,
+      "updates_planned": 2,
+      "updates_applied": 2,
+      "source_counts": {
+        "created_by": 2
+      },
+      "sample_unresolved_ids": [],
+      "sample_updated_ids": [
+        "69ac0bdf5e6342ef93f7a840",
+        "69ac26f99b5a985cb0212c41"
+      ]
+    },
+    "tabung_donations": {
+      "total": 3,
+      "already_valid": 0,
+      "invalid_existing": 0,
+      "unresolved": 0,
+      "updates_planned": 3,
+      "updates_applied": 3,
+      "source_counts": {
+        "user": 3
+      },
+      "sample_unresolved_ids": [],
+      "sample_updated_ids": [
+        "69ac0bdf5e6342ef93f7a842",
+        "69ac0bdf5e6342ef93f7a84a",
+        "69ac26f99b5a985cb0212c43"
+      ]
+    },
+    "payment_reminders": {
+      "total": 2,
+      "already_valid": 0,
+      "invalid_existing": 0,
+      "unresolved": 0,
+      "updates_planned": 2,
+      "updates_applied": 2,
+      "source_counts": {
+        "user": 2
+      },
+      "sample_unresolved_ids": [],
+      "sample_updated_ids": [
+        "69acb38ea095f843c91e9537",
+        "69b1e5e1d52f40680041a79c"
+      ]
+    },
+    "payment_reminder_preferences": {
+      "total": 1,
+      "already_valid": 0,
+      "invalid_existing": 0,
+      "unresolved": 0,
+      "updates_planned": 1,
+      "updates_applied": 1,
+      "source_counts": {
+        "user": 1
+      },
+      "sample_unresolved_ids": [],
+      "sample_updated_ids": [
+        "69b1e5e1d52f40680041a79a"
+      ]
+    },
+    "notifications": {
+      "total": 116,
+      "already_valid": 0,
+      "invalid_existing": 0,
+      "unresolved": 0,
+      "updates_planned": 116,
+      "updates_applied": 116,
+      "source_counts": {
+        "user": 116
+      },
+      "sample_unresolved_ids": [],
+      "sample_updated_ids": [
+        "69b22b98dbf676c6669a8b1b",
+        "69b22bbedbf676c6669a8b4b",
+        "69b22b98dbf676c6669a8b1a",
+        "699ff6dcb965f92028dc4a2a",
+        "69ac0bdf5e6342ef93f7a847",
+        "69ac0bdf5e6342ef93f7a84f",
+        "69a2151305db85f8d0d70d89",
+        "69ac26f99b5a985cb0212c47",
+        "69acbcb8a095f843c91e9548",
+        "69b0a00cd52f40680041a5a4",
+        "69b02b960928b39acfa81a94",
+        "69b036ca2c554c206dd7f562",
+        "69b02b960928b39acfa81a93",
+        "69b036ca2c554c206dd7f561",
+        "69b22bbedbf676c6669a8b4a",
+        "69b22d0fdbf676c6669a8c54",
+        "69b10243d52f40680041a5d1",
+        "69b16306d52f40680041a624",
+        "69b17378d52f40680041a634",
+        "69b1805ed52f40680041a690"
+      ]
+    },
+    "audit_logs": {
+      "total": 3450,
+      "already_valid": 0,
+      "invalid_existing": 0,
+      "unresolved": 0,
+      "updates_planned": 3450,
+      "updates_applied": 3450,
+      "source_counts": {
+        "user": 3415,
+        "default_tenant_fallback": 35
+      },
+      "sample_unresolved_ids": [],
+      "sample_updated_ids": [
+        "69b03df895611b763c456341",
+        "69b226d6dbf676c6669a8aec",
+        "69b226d7dbf676c6669a8af2",
+        "69b22710dbf676c6669a8afa",
+        "69b22816dbf676c6669a8b00",
+        "69b22817dbf676c6669a8b02",
+        "69b2281fdbf676c6669a8b0b",
+        "69b22820dbf676c6669a8b0f",
+        "69b22b97dbf676c6669a8b16",
+        "69b26bb1dbf676c6669a8f80",
+        "69b22bb8dbf676c6669a8b20",
+        "69b22bbadbf676c6669a8b27",
+        "69b22bbadbf676c6669a8b2b",
+        "69b22bbbdbf676c6669a8b32",
+        "69b22bbcdbf676c6669a8b38",
+        "69b22bbcdbf676c6669a8b39",
+        "69b22bbedbf676c6669a8b49",
+        "69b226d6dbf676c6669a8aed",
+        "69b226d7dbf676c6669a8aef",
+        "69b226d7dbf676c6669a8af0"
+      ]
+    },
+    "tenant_onboarding_jobs": {
+      "total": 0,
+      "already_valid": 0,
+      "invalid_existing": 0,
+      "unresolved": 0,
+      "updates_planned": 0,
+      "updates_applied": 0,
+      "source_counts": {},
+      "sample_unresolved_ids": [],
+      "sample_updated_ids": []
+    },
+    "institution_onboarding_requests": {
+      "total": 0,
+      "already_valid": 0,
+      "invalid_existing": 0,
+      "unresolved": 0,
+      "updates_planned": 0,
+      "updates_applied": 0,
+      "source_counts": {},
+      "sample_unresolved_ids": [],
+      "sample_updated_ids": []
+    }
+  },
+  "generated_at": "2026-03-13T08:19:52.875088+00:00",
+  "database_url": "postgresql+psycopg://kamarulariffin@localhost:5432/mrsm_portal",
+  "default_tenant": {
+    "tenant_id": "tenant_legacy_main",
+    "tenant_code": "mrsm-main",
+    "exists_in_tenant_master": true,
+    "assign_unresolved_to_default": true,
+    "allow_nonexistent_default_tenant": false
+  }
+}

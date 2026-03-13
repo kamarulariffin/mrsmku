@@ -5,9 +5,10 @@ Sistem Perakaunan MRSM Bersepadu dengan Kawalan Audit Dalaman Malaysia
 
 from fastapi import APIRouter, HTTPException, Depends, Query, UploadFile, File
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from typing import Optional, List
+from typing import Any, Optional, List, Dict
 from datetime import datetime, timezone, timedelta
 from bson import ObjectId
+from services.id_normalizer import object_id_or_none
 import uuid
 
 from models.accounting import (
@@ -22,8 +23,15 @@ from models.accounting import (
 )
 from services.accounting_journal import (
     create_journal_for_transaction,
+    upsert_journal_for_transaction,
     update_journal_status_for_transaction,
     get_journal_entry_by_transaction_id,
+    mark_journal_void_for_transaction,
+)
+from services.tenant_enforcement import (
+    assert_tenant_doc_access as enforce_tenant_doc_access,
+    stamp_tenant_fields as apply_tenant_fields,
+    tenant_scope_query as build_tenant_scope_query,
 )
 
 router = APIRouter(prefix="/api/accounting-full", tags=["Accounting Full"])
@@ -58,6 +66,43 @@ def _merge_by_status(a: dict, b: dict) -> dict:
     return out
 
 
+def _as_float(value: Any) -> float:
+    try:
+        return float(value or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _as_int(value: Any) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _as_datetime(value: Any) -> Optional[datetime]:
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        try:
+            dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                return dt.replace(tzinfo=timezone.utc)
+            return dt
+        except Exception:
+            pass
+        try:
+            return datetime.strptime(text[:10], "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        except Exception:
+            return None
+    return None
+
+
 async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
     if not credentials:
         raise HTTPException(status_code=401, detail="Token diperlukan")
@@ -67,6 +112,49 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
 async def log_audit(user, action, module, details):
     if _log_audit_func and user:
         await _log_audit_func(user, action, module, details)
+
+
+def _id_value(value: Any) -> Any:
+    """Normalize ID-like inputs while supporting non-ObjectId IDs."""
+    if value is None:
+        return None
+    if isinstance(value, ObjectId):
+        return value
+    text = str(value)
+    try:
+        if ObjectId.is_valid(text):
+            return object_id_or_none(text)
+    except Exception:
+        pass
+    return text
+
+
+def _tenant_scope_query(user: Dict[str, Any]) -> Dict[str, Any]:
+    return build_tenant_scope_query(
+        user,
+        detail="Tenant context diperlukan untuk operasi accounting.",
+    )
+
+
+def _apply_tenant_scope(query: Dict[str, Any], user: Dict[str, Any]) -> Dict[str, Any]:
+    scoped = dict(query or {})
+    tenant_scope = _tenant_scope_query(user)
+    if tenant_scope:
+        scoped.update(tenant_scope)
+    return scoped
+
+
+def _assert_tenant_doc_access(user: Dict[str, Any], doc: Optional[Dict[str, Any]], resource_name: str) -> None:
+    enforce_tenant_doc_access(user, doc, resource_name)
+
+
+def _stamp_tenant_fields(
+    doc: Dict[str, Any],
+    user: Dict[str, Any],
+    *,
+    fallback_doc: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    return apply_tenant_fields(doc, user, fallback_doc=fallback_doc)
 
 
 async def _invalidate_financial_dashboard_cache_safely(db, scope: str = "all") -> None:
@@ -102,9 +190,9 @@ def check_accounting_access(user):
 
 async def log_accounting_audit(db, transaction_id, action, user, old_value=None, new_value=None, notes=None):
     """Log accounting-specific audit trail"""
-    transaction = await db.accounting_transactions.find_one({"_id": ObjectId(transaction_id)})
-    await db.accounting_audit_logs.insert_one({
-        "transaction_id": ObjectId(transaction_id),
+    transaction = await db.accounting_transactions.find_one(_apply_tenant_scope({"_id": _id_value(transaction_id)}, user))
+    audit_doc = {
+        "transaction_id": _id_value(transaction_id),
         "transaction_number": transaction.get("transaction_number", "-") if transaction else "-",
         "action": action,
         "old_value": old_value,
@@ -114,17 +202,19 @@ async def log_accounting_audit(db, transaction_id, action, user, old_value=None,
         "performed_by_role": user.get("role", ""),
         "performed_at": datetime.now(timezone.utc),
         "notes": notes
-    })
+    }
+    _stamp_tenant_fields(audit_doc, user, fallback_doc=transaction)
+    await db.accounting_audit_logs.insert_one(audit_doc)
 
 
-async def generate_transaction_number(db):
+async def generate_transaction_number(db, tenant_scope: Optional[Dict[str, Any]] = None):
     """Generate unique transaction number: TRX-YYYY-XXXX"""
     year = datetime.now().year
     prefix = f"TRX-{year}-"
     
     # Find latest transaction number for this year
     latest = await db.accounting_transactions.find_one(
-        {"transaction_number": {"$regex": f"^{prefix}"}},
+        {"transaction_number": {"$regex": f"^{prefix}"}, **(tenant_scope or {})},
         sort=[("transaction_number", -1)]
     )
     
@@ -140,12 +230,13 @@ async def generate_transaction_number(db):
     return f"{prefix}{new_num:04d}"
 
 
-async def check_period_locked(db, year: int, month: int):
+async def check_period_locked(db, year: int, month: int, tenant_scope: Optional[Dict[str, Any]] = None):
     """Check if a period is locked"""
     lock = await db.accounting_period_locks.find_one({
         "year": year,
         "month": month,
-        "is_locked": True
+        "is_locked": True,
+        **(tenant_scope or {}),
     })
     return lock is not None
 
@@ -162,7 +253,7 @@ async def list_categories(
     db = get_db()
     check_accounting_access(user)
     
-    query = {}
+    query = _tenant_scope_query(user)
     if type:
         query["type"] = type
     if not include_inactive:
@@ -174,7 +265,9 @@ async def list_categories(
     for cat in categories:
         parent_name = None
         if cat.get("parent_id"):
-            parent = await db.accounting_categories.find_one({"_id": ObjectId(cat["parent_id"])})
+            parent = await db.accounting_categories.find_one(
+                _apply_tenant_scope({"_id": _id_value(cat["parent_id"])}, user)
+            )
             parent_name = parent.get("name") if parent else None
         
         created_at = cat.get("created_at")
@@ -206,10 +299,12 @@ async def create_category(
     db = get_db()
     check_bendahari_access(user)
     
+    tenant_scope = _tenant_scope_query(user)
     # Check duplicate name
     existing = await db.accounting_categories.find_one({
         "name": data.name,
-        "type": data.type
+        "type": data.type,
+        **tenant_scope,
     })
     if existing:
         raise HTTPException(status_code=400, detail="Kategori dengan nama ini sudah wujud")
@@ -217,7 +312,7 @@ async def create_category(
     # Validate parent if provided
     parent_name = None
     if data.parent_id:
-        parent = await db.accounting_categories.find_one({"_id": ObjectId(data.parent_id)})
+        parent = await db.accounting_categories.find_one({"_id": _id_value(data.parent_id), **tenant_scope})
         if not parent:
             raise HTTPException(status_code=404, detail="Kategori induk tidak dijumpai")
         if parent["type"] != data.type:
@@ -236,6 +331,7 @@ async def create_category(
         "created_by": user["_id"],
         "created_by_name": user.get("full_name", "")
     }
+    _stamp_tenant_fields(doc, user)
     
     result = await db.accounting_categories.insert_one(doc)
     
@@ -265,7 +361,8 @@ async def update_category(
     db = get_db()
     check_bendahari_access(user)
     
-    category = await db.accounting_categories.find_one({"_id": ObjectId(category_id)})
+    tenant_scope = _tenant_scope_query(user)
+    category = await db.accounting_categories.find_one({"_id": _id_value(category_id), **tenant_scope})
     if not category:
         raise HTTPException(status_code=404, detail="Kategori tidak dijumpai")
     
@@ -275,7 +372,8 @@ async def update_category(
         existing = await db.accounting_categories.find_one({
             "name": data.name,
             "type": category["type"],
-            "_id": {"$ne": ObjectId(category_id)}
+            "_id": {"$ne": _id_value(category_id)},
+            **tenant_scope,
         })
         if existing:
             raise HTTPException(status_code=400, detail="Kategori dengan nama ini sudah wujud")
@@ -294,17 +392,17 @@ async def update_category(
         update_data["updated_at"] = datetime.now(timezone.utc)
         update_data["updated_by"] = user["_id"]
         await db.accounting_categories.update_one(
-            {"_id": ObjectId(category_id)},
+            {"_id": _id_value(category_id), **tenant_scope},
             {"$set": update_data}
         )
 
     await log_audit(user, "UPDATE_CATEGORY", "accounting", f"Kemaskini kategori: {category['name']}")
     
     # Fetch updated
-    updated = await db.accounting_categories.find_one({"_id": ObjectId(category_id)})
+    updated = await db.accounting_categories.find_one({"_id": _id_value(category_id), **tenant_scope})
     parent_name = None
     if updated.get("parent_id"):
-        parent = await db.accounting_categories.find_one({"_id": ObjectId(updated["parent_id"])})
+        parent = await db.accounting_categories.find_one({"_id": _id_value(updated["parent_id"]), **tenant_scope})
         parent_name = parent.get("name") if parent else None
     
     created_at = updated.get("created_at")
@@ -334,23 +432,24 @@ async def delete_category(
     db = get_db()
     check_bendahari_access(user)
     
-    category = await db.accounting_categories.find_one({"_id": ObjectId(category_id)})
+    tenant_scope = _tenant_scope_query(user)
+    category = await db.accounting_categories.find_one({"_id": _id_value(category_id), **tenant_scope})
     if not category:
         raise HTTPException(status_code=404, detail="Kategori tidak dijumpai")
     
     # Check if used in transactions
-    tx_count = await db.accounting_transactions.count_documents({"category_id": category_id})
+    tx_count = await db.accounting_transactions.count_documents({"category_id": category_id, **tenant_scope})
     if tx_count > 0:
         # Soft delete only
         await db.accounting_categories.update_one(
-            {"_id": ObjectId(category_id)},
+            {"_id": _id_value(category_id), **tenant_scope},
             {"$set": {"is_active": False, "deleted_at": datetime.now(timezone.utc)}}
         )
         await log_audit(user, "SOFT_DELETE_CATEGORY", "accounting", f"Nyahaktifkan kategori: {category['name']} ({tx_count} transaksi)")
         return {"message": f"Kategori dinyahaktifkan kerana terdapat {tx_count} transaksi berkaitan"}
     
     # Hard delete if no transactions
-    await db.accounting_categories.delete_one({"_id": ObjectId(category_id)})
+    await db.accounting_categories.delete_one({"_id": _id_value(category_id), **tenant_scope})
     await log_audit(user, "DELETE_CATEGORY", "accounting", f"Padam kategori: {category['name']}")
     
     return {"message": "Kategori berjaya dipadam"}
@@ -365,31 +464,36 @@ async def seed_default_categories(user: dict = Depends(get_current_user)):
     
     now = datetime.now(timezone.utc)
     created = 0
+    tenant_scope = _tenant_scope_query(user)
     
     for cat in DEFAULT_INCOME_CATEGORIES:
-        existing = await db.accounting_categories.find_one({"name": cat["name"], "type": "income"})
+        existing = await db.accounting_categories.find_one({"name": cat["name"], "type": "income", **tenant_scope})
         if not existing:
-            await db.accounting_categories.insert_one({
+            income_doc = {
                 **cat,
                 "type": "income",
                 "is_active": True,
                 "created_at": now,
                 "created_by": user["_id"],
                 "created_by_name": "System"
-            })
+            }
+            _stamp_tenant_fields(income_doc, user)
+            await db.accounting_categories.insert_one(income_doc)
             created += 1
     
     for cat in DEFAULT_EXPENSE_CATEGORIES:
-        existing = await db.accounting_categories.find_one({"name": cat["name"], "type": "expense"})
+        existing = await db.accounting_categories.find_one({"name": cat["name"], "type": "expense", **tenant_scope})
         if not existing:
-            await db.accounting_categories.insert_one({
+            expense_doc = {
                 **cat,
                 "type": "expense",
                 "is_active": True,
                 "created_at": now,
                 "created_by": user["_id"],
                 "created_by_name": "System"
-            })
+            }
+            _stamp_tenant_fields(expense_doc, user)
+            await db.accounting_categories.insert_one(expense_doc)
             created += 1
     
     return {"message": f"{created} kategori default berjaya dicipta"}
@@ -405,9 +509,10 @@ async def get_chart_of_accounts(
     """Senarai Akaun (COA): Aset = akaun bank, Hasil & Belanja = kategori. Untuk rujukan dan imbangan duga."""
     db = get_db()
     check_accounting_access(user)
+    tenant_scope = _tenant_scope_query(user)
     result = {"asset": [], "income": [], "expense": []}
     # Aset: bank accounts (kod 1xxx)
-    banks = await db.bank_accounts.find({"is_active": True}).sort("account_code", 1).to_list(100)
+    banks = await db.bank_accounts.find({"is_active": True, **tenant_scope}).sort("account_code", 1).to_list(100)
     for b in banks:
         if type_filter and type_filter != "asset":
             continue
@@ -419,7 +524,7 @@ async def get_chart_of_accounts(
             "description": b.get("description"),
         })
     # Hasil: income categories
-    inc = await db.accounting_categories.find({"type": "income", "is_active": True}).sort("account_code", 1).to_list(100)
+    inc = await db.accounting_categories.find({"type": "income", "is_active": True, **tenant_scope}).sort("account_code", 1).to_list(100)
     for c in inc:
         if type_filter and type_filter != "income":
             continue
@@ -431,7 +536,7 @@ async def get_chart_of_accounts(
             "description": c.get("description"),
         })
     # Belanja: expense categories
-    exp = await db.accounting_categories.find({"type": "expense", "is_active": True}).sort("account_code", 1).to_list(100)
+    exp = await db.accounting_categories.find({"type": "expense", "is_active": True, **tenant_scope}).sort("account_code", 1).to_list(100)
     for c in exp:
         if type_filter and type_filter != "expense":
             continue
@@ -453,12 +558,13 @@ async def migrate_transactions_to_journal(user: dict = Depends(get_current_user)
         raise HTTPException(status_code=403, detail="Akses ditolak")
     from services.accounting_journal import create_journal_for_transaction
     # Find transactions that don't have a journal entry
-    tx_cursor = db.accounting_transactions.find({"is_deleted": {"$ne": True}})
+    tenant_scope = _tenant_scope_query(user)
+    tx_cursor = db.accounting_transactions.find({"is_deleted": {"$ne": True}, **tenant_scope})
     created = 0
     errors = 0
     async for tx in tx_cursor:
         tx_id = str(tx["_id"])
-        existing = await db.accounting_journal_entries.find_one({"transaction_id": ObjectId(tx_id)})
+        existing = await db.accounting_journal_entries.find_one({"transaction_id": _id_value(tx_id), **tenant_scope})
         if existing:
             continue
         doc = {**tx, "category_id": str(tx.get("category_id", "")) if tx.get("category_id") else None}
@@ -481,6 +587,7 @@ async def list_transactions(
     type: Optional[str] = None,
     status: Optional[str] = None,
     category_id: Optional[str] = None,
+    bank_account_id: Optional[str] = None,
     module: Optional[str] = None,
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
@@ -493,13 +600,16 @@ async def list_transactions(
     db = get_db()
     check_accounting_access(user)
     
-    query = {}
+    tenant_scope = _tenant_scope_query(user)
+    query = dict(tenant_scope)
     if type:
         query["type"] = type
     if status:
         query["status"] = status
     if category_id:
         query["category_id"] = category_id
+    if bank_account_id:
+        query["bank_account_id"] = bank_account_id
     if module:
         query["source_ref.module"] = module
     
@@ -537,7 +647,10 @@ async def list_transactions(
     category_ids = list(set([t.get("category_id") for t in transactions if t.get("category_id")]))
     categories = {}
     if category_ids:
-        cats = await db.accounting_categories.find({"_id": {"$in": [ObjectId(c) for c in category_ids]}}).to_list(100)
+        cats = await db.accounting_categories.find({
+            "_id": {"$in": [_id_value(c) for c in category_ids]},
+            **tenant_scope,
+        }).to_list(100)
         categories = {str(c["_id"]): c["name"] for c in cats}
     
     result = []
@@ -601,8 +714,9 @@ async def create_transaction(
     db = get_db()
     check_bendahari_access(user)
     
+    tenant_scope = _tenant_scope_query(user)
     # Validate category
-    category = await db.accounting_categories.find_one({"_id": ObjectId(data.category_id)})
+    category = await db.accounting_categories.find_one({"_id": _id_value(data.category_id), **tenant_scope})
     if not category:
         raise HTTPException(status_code=404, detail="Kategori tidak dijumpai")
     if category["type"] != data.type:
@@ -611,7 +725,7 @@ async def create_transaction(
     # Validate bank account if provided
     bank_account_name = None
     if data.bank_account_id:
-        bank_acc = await db.bank_accounts.find_one({"_id": ObjectId(data.bank_account_id)})
+        bank_acc = await db.bank_accounts.find_one({"_id": _id_value(data.bank_account_id), **tenant_scope})
         if not bank_acc:
             raise HTTPException(status_code=404, detail="Akaun bank tidak dijumpai")
         if not bank_acc.get("is_active", True):
@@ -621,13 +735,13 @@ async def create_transaction(
     # Check period lock
     try:
         tx_date = datetime.strptime(data.transaction_date, "%Y-%m-%d")
-        if await check_period_locked(db, tx_date.year, tx_date.month):
+        if await check_period_locked(db, tx_date.year, tx_date.month, tenant_scope=tenant_scope):
             raise HTTPException(status_code=400, detail=f"Tempoh {MALAY_MONTHS.get(tx_date.month)} {tx_date.year} telah dikunci")
     except ValueError:
         raise HTTPException(status_code=400, detail="Format tarikh tidak sah (YYYY-MM-DD)")
     
     # Generate transaction number
-    tx_number = await generate_transaction_number(db)
+    tx_number = await generate_transaction_number(db, tenant_scope=tenant_scope)
     
     now = datetime.now(timezone.utc)
     doc = {
@@ -646,6 +760,7 @@ async def create_transaction(
         "created_by": user["_id"],
         "created_by_name": user.get("full_name", "")
     }
+    _stamp_tenant_fields(doc, user)
     
     result = await db.accounting_transactions.insert_one(doc)
     await _invalidate_financial_dashboard_cache_safely(db, scope="accounting")
@@ -685,17 +800,18 @@ async def get_transaction(
     db = get_db()
     check_accounting_access(user)
     
-    tx = await db.accounting_transactions.find_one({"_id": ObjectId(transaction_id)})
+    tenant_scope = _tenant_scope_query(user)
+    tx = await db.accounting_transactions.find_one({"_id": _id_value(transaction_id), **tenant_scope})
     if not tx:
         raise HTTPException(status_code=404, detail="Transaksi tidak dijumpai")
     
     # Get category
-    category = await db.accounting_categories.find_one({"_id": ObjectId(tx.get("category_id"))})
+    category = await db.accounting_categories.find_one({"_id": _id_value(tx.get("category_id")), **tenant_scope})
     category_name = category.get("name") if category else "Tidak Diketahui"
     
     # Get audit logs
     audit_logs = await db.accounting_audit_logs.find(
-        {"transaction_id": ObjectId(transaction_id)}
+        {"transaction_id": _id_value(transaction_id), **tenant_scope}
     ).sort("performed_at", -1).to_list(50)
     
     audit_log_list = []
@@ -757,14 +873,28 @@ async def get_transaction_journal(
     """Get double-entry journal (debit/credit lines) for a transaction. User-friendly for viewing entri bergu."""
     db = get_db()
     check_accounting_access(user)
+    tenant_scope = _tenant_scope_query(user)
     entry, lines = await get_journal_entry_by_transaction_id(db, transaction_id)
+    _assert_tenant_doc_access(user, entry, "entri jurnal")
     if not entry:
         return {"has_journal": False, "entry_number": None, "lines": [], "message": "Tiada entri jurnal untuk transaksi ini (mungkin dicipta sebelum entri bergu diaktifkan)."}
     # Resolve account names and codes
     bank_ids = [l["account_id"] for l in lines if l.get("account_type") == "bank"]
     cat_ids = [l["account_id"] for l in lines if l.get("account_type") == "category"]
-    banks = {str(a["_id"]): a for a in await db.bank_accounts.find({"_id": {"$in": [ObjectId(b) for b in bank_ids if b]}}).to_list(20)}
-    cats = {str(c["_id"]): c for c in await db.accounting_categories.find({"_id": {"$in": [ObjectId(c) for c in cat_ids if c]}}).to_list(20)}
+    banks = {
+        str(a["_id"]): a
+        for a in await db.bank_accounts.find({
+            "_id": {"$in": [_id_value(b) for b in bank_ids if b]},
+            **tenant_scope,
+        }).to_list(20)
+    }
+    cats = {
+        str(c["_id"]): c
+        for c in await db.accounting_categories.find({
+            "_id": {"$in": [_id_value(c) for c in cat_ids if c]},
+            **tenant_scope,
+        }).to_list(20)
+    }
     line_list = []
     for L in lines:
         atype = L.get("account_type", "")
@@ -814,7 +944,8 @@ async def update_transaction(
     db = get_db()
     check_bendahari_access(user)
     
-    tx = await db.accounting_transactions.find_one({"_id": ObjectId(transaction_id)})
+    tenant_scope = _tenant_scope_query(user)
+    tx = await db.accounting_transactions.find_one({"_id": _id_value(transaction_id), **tenant_scope})
     if not tx:
         raise HTTPException(status_code=404, detail="Transaksi tidak dijumpai")
     
@@ -825,7 +956,7 @@ async def update_transaction(
     if data.transaction_date:
         try:
             tx_date = datetime.strptime(data.transaction_date, "%Y-%m-%d")
-            if await check_period_locked(db, tx_date.year, tx_date.month):
+            if await check_period_locked(db, tx_date.year, tx_date.month, tenant_scope=tenant_scope):
                 raise HTTPException(status_code=400, detail=f"Tempoh {MALAY_MONTHS.get(tx_date.month)} {tx_date.year} telah dikunci")
         except ValueError:
             raise HTTPException(status_code=400, detail="Format tarikh tidak sah")
@@ -838,10 +969,23 @@ async def update_transaction(
     
     update_data = {}
     if data.category_id is not None:
-        category = await db.accounting_categories.find_one({"_id": ObjectId(data.category_id)})
+        category = await db.accounting_categories.find_one({"_id": _id_value(data.category_id), **tenant_scope})
         if not category:
             raise HTTPException(status_code=404, detail="Kategori tidak dijumpai")
+        if category.get("type") != tx.get("type"):
+            raise HTTPException(status_code=400, detail="Jenis transaksi tidak sepadan dengan kategori")
         update_data["category_id"] = data.category_id
+    if data.bank_account_id is not None:
+        bank_account_id = (data.bank_account_id or "").strip()
+        if not bank_account_id:
+            update_data["bank_account_id"] = None
+        else:
+            bank_acc = await db.bank_accounts.find_one({"_id": _id_value(bank_account_id), **tenant_scope})
+            if not bank_acc:
+                raise HTTPException(status_code=404, detail="Akaun bank tidak dijumpai")
+            if not bank_acc.get("is_active", True):
+                raise HTTPException(status_code=400, detail="Akaun bank tidak aktif")
+            update_data["bank_account_id"] = bank_account_id
     if data.amount is not None:
         update_data["amount"] = data.amount
     if data.transaction_date is not None:
@@ -857,9 +1001,21 @@ async def update_transaction(
         update_data["updated_at"] = datetime.now(timezone.utc)
         update_data["updated_by"] = user["_id"]
         await db.accounting_transactions.update_one(
-            {"_id": ObjectId(transaction_id)},
+            {"_id": _id_value(transaction_id), **tenant_scope},
             {"$set": update_data}
         )
+        updated_tx = await db.accounting_transactions.find_one({"_id": _id_value(transaction_id), **tenant_scope})
+        if updated_tx:
+            journal_doc = {
+                **updated_tx,
+                "category_id": str(updated_tx.get("category_id", "")) if updated_tx.get("category_id") else None,
+                "bank_account_id": str(updated_tx.get("bank_account_id", "")) if updated_tx.get("bank_account_id") else None,
+            }
+            try:
+                await upsert_journal_for_transaction(db, transaction_id, journal_doc)
+            except Exception as exc:
+                if _log_audit_func and user:
+                    await _log_audit_func(user, "JOURNAL_SYNC_ERROR", "accounting", str(exc))
         await _invalidate_financial_dashboard_cache_safely(db, scope="accounting")
         
         await log_accounting_audit(
@@ -881,7 +1037,8 @@ async def delete_transaction(
     db = get_db()
     check_bendahari_access(user)
     
-    tx = await db.accounting_transactions.find_one({"_id": ObjectId(transaction_id)})
+    tenant_scope = _tenant_scope_query(user)
+    tx = await db.accounting_transactions.find_one({"_id": _id_value(transaction_id), **tenant_scope})
     if not tx:
         raise HTTPException(status_code=404, detail="Transaksi tidak dijumpai")
     
@@ -890,13 +1047,23 @@ async def delete_transaction(
     
     # Soft delete
     await db.accounting_transactions.update_one(
-        {"_id": ObjectId(transaction_id)},
+        {"_id": _id_value(transaction_id), **tenant_scope},
         {"$set": {
             "is_deleted": True,
             "deleted_at": datetime.now(timezone.utc),
             "deleted_by": user["_id"]
         }}
     )
+    try:
+        await mark_journal_void_for_transaction(
+            db,
+            transaction_id,
+            voided_by=user["_id"],
+            note=f"Transaction {tx.get('transaction_number', transaction_id)} soft-deleted while pending.",
+        )
+    except Exception as exc:
+        if _log_audit_func and user:
+            await _log_audit_func(user, "JOURNAL_VOID_ERROR", "accounting", str(exc))
     await _invalidate_financial_dashboard_cache_safely(db, scope="accounting")
     
     await log_audit(user, "DELETE_TRANSACTION", "accounting", f"Padam transaksi {tx.get('transaction_number')}")
@@ -916,7 +1083,8 @@ async def verify_transaction(
     db = get_db()
     check_juruaudit_access(user)
     
-    tx = await db.accounting_transactions.find_one({"_id": ObjectId(transaction_id)})
+    tenant_scope = _tenant_scope_query(user)
+    tx = await db.accounting_transactions.find_one({"_id": _id_value(transaction_id), **tenant_scope})
     if not tx:
         raise HTTPException(status_code=404, detail="Transaksi tidak dijumpai")
     
@@ -928,7 +1096,7 @@ async def verify_transaction(
     
     now = datetime.now(timezone.utc)
     await db.accounting_transactions.update_one(
-        {"_id": ObjectId(transaction_id)},
+        {"_id": _id_value(transaction_id), **tenant_scope},
         {"$set": {
             "status": data.status,
             "verified_at": now,
@@ -940,6 +1108,14 @@ async def verify_transaction(
     await _invalidate_financial_dashboard_cache_safely(db, scope="accounting")
     # Sync status to double-entry journal
     try:
+        updated_tx = await db.accounting_transactions.find_one({"_id": _id_value(transaction_id), **tenant_scope})
+        if updated_tx:
+            journal_doc = {
+                **updated_tx,
+                "category_id": str(updated_tx.get("category_id", "")) if updated_tx.get("category_id") else None,
+                "bank_account_id": str(updated_tx.get("bank_account_id", "")) if updated_tx.get("bank_account_id") else None,
+            }
+            await upsert_journal_for_transaction(db, transaction_id, journal_doc)
         await update_journal_status_for_transaction(
             db, transaction_id, data.status,
             verified_by=user["_id"], verified_at=now
@@ -957,14 +1133,16 @@ async def verify_transaction(
     await log_audit(user, "VERIFY_TRANSACTION", "accounting", f"Transaksi {tx.get('transaction_number')} {status_text}")
     
     # Notify creator
-    await db.notifications.insert_one({
+    verify_notification_doc = {
         "user_id": tx.get("created_by"),
         "title": f"Transaksi {status_text.title()}",
         "message": f"Transaksi {tx.get('transaction_number')} telah {status_text} oleh JuruAudit.",
         "type": "info" if data.status == "verified" else "warning",
         "is_read": False,
         "created_at": now.isoformat()
-    })
+    }
+    _stamp_tenant_fields(verify_notification_doc, user, fallback_doc=tx)
+    await db.notifications.insert_one(verify_notification_doc)
     
     return {"message": f"Transaksi berjaya {status_text}"}
 
@@ -979,7 +1157,8 @@ async def get_pending_verification(
     db = get_db()
     check_juruaudit_access(user)
     
-    query = {"status": "pending", "is_deleted": {"$ne": True}}
+    tenant_scope = _tenant_scope_query(user)
+    query = {"status": "pending", "is_deleted": {"$ne": True}, **tenant_scope}
     total = await db.accounting_transactions.count_documents(query)
     skip = (page - 1) * limit
     
@@ -993,7 +1172,10 @@ async def get_pending_verification(
     category_ids = list(set([t.get("category_id") for t in transactions if t.get("category_id")]))
     categories = {}
     if category_ids:
-        cats = await db.accounting_categories.find({"_id": {"$in": [ObjectId(c) for c in category_ids]}}).to_list(100)
+        cats = await db.accounting_categories.find({
+            "_id": {"$in": [_id_value(c) for c in category_ids]},
+            **tenant_scope,
+        }).to_list(100)
         categories = {str(c["_id"]): c["name"] for c in cats}
     
     result = []
@@ -1038,7 +1220,7 @@ async def list_period_locks(
     db = get_db()
     check_juruaudit_access(user)
     
-    query = {}
+    query = _tenant_scope_query(user)
     if year:
         query["year"] = year
     
@@ -1074,20 +1256,70 @@ async def lock_period(
     db = get_db()
     check_juruaudit_access(user)
     
+    tenant_scope = _tenant_scope_query(user)
     # Check if already locked
     existing = await db.accounting_period_locks.find_one({
         "year": data.year,
-        "month": data.month
+        "month": data.month,
+        **tenant_scope,
     })
     
     if existing and existing.get("is_locked"):
         raise HTTPException(status_code=400, detail="Tempoh ini sudah dikunci")
+
+    date_prefix = f"{data.year}-{data.month:02d}"
+    pending_count = await db.accounting_transactions.count_documents(
+        {
+            "transaction_date": {"$regex": f"^{date_prefix}"},
+            "status": "pending",
+            "is_deleted": {"$ne": True},
+            **tenant_scope,
+        }
+    )
+    if pending_count > 0:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Terdapat {pending_count} transaksi berstatus menunggu. "
+                "Sahkan atau tolak transaksi sebelum tempoh dikunci."
+            ),
+        )
+
+    # Ensure all verified transactions in this period have synchronized journal entries.
+    sync_errors = 0
+    verified_cursor = db.accounting_transactions.find(
+        {
+            "transaction_date": {"$regex": f"^{date_prefix}"},
+            "status": "verified",
+            "is_deleted": {"$ne": True},
+            **tenant_scope,
+        }
+    )
+    async for tx in verified_cursor:
+        tx_id = str(tx.get("_id"))
+        tx_doc = {
+            **tx,
+            "category_id": str(tx.get("category_id", "")) if tx.get("category_id") else None,
+            "bank_account_id": str(tx.get("bank_account_id", "")) if tx.get("bank_account_id") else None,
+        }
+        try:
+            await upsert_journal_for_transaction(db, tx_id, tx_doc)
+        except Exception:
+            sync_errors += 1
+    if sync_errors > 0:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Terdapat {sync_errors} transaksi gagal sync ke jurnal. "
+                "Sila semak jurnal sebelum kunci tempoh."
+            ),
+        )
     
     now = datetime.now(timezone.utc)
     
     if existing:
         await db.accounting_period_locks.update_one(
-            {"_id": existing["_id"]},
+            {"_id": existing["_id"], **tenant_scope},
             {"$set": {
                 "is_locked": True,
                 "locked_at": now,
@@ -1097,7 +1329,7 @@ async def lock_period(
             }}
         )
     else:
-        await db.accounting_period_locks.insert_one({
+        lock_doc = {
             "year": data.year,
             "month": data.month,
             "is_locked": True,
@@ -1105,13 +1337,17 @@ async def lock_period(
             "locked_by": user["_id"],
             "locked_by_name": user.get("full_name", ""),
             "notes": data.notes
-        })
+        }
+        _stamp_tenant_fields(lock_doc, user)
+        await db.accounting_period_locks.insert_one(lock_doc)
     
-    # Update all pending transactions in this period to locked
+    # Retain backward compatibility for historical records that may still use status=locked.
+    # Under current flow, pending entries are blocked above before lock is applied.
     await db.accounting_transactions.update_many(
         {
             "transaction_date": {"$regex": f"^{data.year}-{data.month:02d}"},
-            "status": "pending"
+            "status": "pending",
+            **tenant_scope,
         },
         {"$set": {"status": "locked"}}
     )
@@ -1133,12 +1369,13 @@ async def unlock_period(
     if user["role"] != "superadmin":
         raise HTTPException(status_code=403, detail="Hanya Superadmin boleh membuka kunci tempoh")
     
-    lock = await db.accounting_period_locks.find_one({"year": year, "month": month})
+    tenant_scope = _tenant_scope_query(user)
+    lock = await db.accounting_period_locks.find_one({"year": year, "month": month, **tenant_scope})
     if not lock or not lock.get("is_locked"):
         raise HTTPException(status_code=404, detail="Tempoh tidak dikunci")
     
     await db.accounting_period_locks.update_one(
-        {"_id": lock["_id"]},
+        {"_id": lock["_id"], **tenant_scope},
         {"$set": {
             "is_locked": False,
             "unlocked_at": datetime.now(timezone.utc),
@@ -1150,7 +1387,8 @@ async def unlock_period(
     await db.accounting_transactions.update_many(
         {
             "transaction_date": {"$regex": f"^{year}-{month:02d}"},
-            "status": "locked"
+            "status": "locked",
+            **tenant_scope,
         },
         {"$set": {"status": "pending"}}
     )
@@ -1173,13 +1411,15 @@ async def get_monthly_report(
     db = get_db()
     check_accounting_access(user)
     
+    tenant_scope = _tenant_scope_query(user)
     date_prefix = f"{year}-{month:02d}"
     
     # Get verified transactions only
     query = {
         "transaction_date": {"$regex": f"^{date_prefix}"},
         "status": "verified",
-        "is_deleted": {"$ne": True}
+        "is_deleted": {"$ne": True},
+        **tenant_scope,
     }
     
     transactions = await db.accounting_transactions.find(query).to_list(1000)
@@ -1204,7 +1444,10 @@ async def get_monthly_report(
     all_cat_ids = list(set(list(income_by_category.keys()) + list(expense_by_category.keys())))
     categories = {}
     if all_cat_ids:
-        cats = await db.accounting_categories.find({"_id": {"$in": [ObjectId(c) for c in all_cat_ids if c]}}).to_list(100)
+        cats = await db.accounting_categories.find({
+            "_id": {"$in": [_id_value(c) for c in all_cat_ids if c]},
+            **tenant_scope,
+        }).to_list(100)
         categories = {str(c["_id"]): c["name"] for c in cats}
     
     # Format category breakdown
@@ -1218,23 +1461,26 @@ async def get_monthly_report(
     ]
     
     # Check lock status
-    lock = await db.accounting_period_locks.find_one({"year": year, "month": month})
+    lock = await db.accounting_period_locks.find_one({"year": year, "month": month, **tenant_scope})
     is_locked = lock.get("is_locked", False) if lock else False
     
     # Count by status
     total_count = await db.accounting_transactions.count_documents({
         "transaction_date": {"$regex": f"^{date_prefix}"},
-        "is_deleted": {"$ne": True}
+        "is_deleted": {"$ne": True},
+        **tenant_scope,
     })
     verified_count = await db.accounting_transactions.count_documents({
         "transaction_date": {"$regex": f"^{date_prefix}"},
         "status": "verified",
-        "is_deleted": {"$ne": True}
+        "is_deleted": {"$ne": True},
+        **tenant_scope,
     })
     pending_count = await db.accounting_transactions.count_documents({
         "transaction_date": {"$regex": f"^{date_prefix}"},
         "status": "pending",
-        "is_deleted": {"$ne": True}
+        "is_deleted": {"$ne": True},
+        **tenant_scope,
     })
     
     return MonthlyReportResponse(
@@ -1262,12 +1508,14 @@ async def get_annual_report(
     db = get_db()
     check_accounting_access(user)
     
+    tenant_scope = _tenant_scope_query(user)
     date_prefix = f"{year}-"
     
     query = {
         "transaction_date": {"$regex": f"^{date_prefix}"},
         "status": "verified",
-        "is_deleted": {"$ne": True}
+        "is_deleted": {"$ne": True},
+        **tenant_scope,
     }
     
     transactions = await db.accounting_transactions.find(query).to_list(10000)
@@ -1301,7 +1549,10 @@ async def get_annual_report(
     all_cat_ids = list(set(list(income_by_category.keys()) + list(expense_by_category.keys())))
     categories = {}
     if all_cat_ids:
-        cats = await db.accounting_categories.find({"_id": {"$in": [ObjectId(c) for c in all_cat_ids if c]}}).to_list(100)
+        cats = await db.accounting_categories.find({
+            "_id": {"$in": [_id_value(c) for c in all_cat_ids if c]},
+            **tenant_scope,
+        }).to_list(100)
         categories = {str(c["_id"]): c["name"] for c in cats}
     
     income_breakdown = [
@@ -1343,8 +1594,9 @@ async def get_balance_sheet(
     db = get_db()
     check_accounting_access(user)
     
+    tenant_scope = _tenant_scope_query(user)
     # Get all verified transactions
-    query = {"status": "verified", "is_deleted": {"$ne": True}}
+    query = {"status": "verified", "is_deleted": {"$ne": True}, **tenant_scope}
     transactions = await db.accounting_transactions.find(query).to_list(50000)
     
     total_income = 0
@@ -1400,64 +1652,68 @@ async def get_dashboard_stats(
     db = get_db()
     check_accounting_access(user)
     
+    tenant_scope = _tenant_scope_query(user)
     now = datetime.now(timezone.utc)
     current_month = f"{now.year}-{now.month:02d}"
     
     # Current month stats
     month_query = {
         "transaction_date": {"$regex": f"^{current_month}"},
-        "is_deleted": {"$ne": True}
+        "is_deleted": {"$ne": True},
+        **tenant_scope,
     }
     
-    month_income = await db.accounting_transactions.aggregate([
-        {"$match": {**month_query, "type": "income", "status": "verified"}},
-        {"$group": {"_id": None, "total": {"$sum": "$amount"}}}
-    ]).to_list(1)
-    
-    month_expense = await db.accounting_transactions.aggregate([
-        {"$match": {**month_query, "type": "expense", "status": "verified"}},
-        {"$group": {"_id": None, "total": {"$sum": "$amount"}}}
-    ]).to_list(1)
+    month_income_total = 0.0
+    async for tx in db.accounting_transactions.find({**month_query, "type": "income", "status": "verified"}):
+        month_income_total += _as_float(tx.get("amount"))
+
+    month_expense_total = 0.0
+    async for tx in db.accounting_transactions.find({**month_query, "type": "expense", "status": "verified"}):
+        month_expense_total += _as_float(tx.get("amount"))
     
     pending_count = await db.accounting_transactions.count_documents({
         "status": "pending",
-        "is_deleted": {"$ne": True}
+        "is_deleted": {"$ne": True},
+        **tenant_scope,
     })
     
     # All time totals
-    all_income = await db.accounting_transactions.aggregate([
-        {"$match": {"type": "income", "status": "verified", "is_deleted": {"$ne": True}}},
-        {"$group": {"_id": None, "total": {"$sum": "$amount"}}}
-    ]).to_list(1)
+    all_income_total = 0.0
+    async for tx in db.accounting_transactions.find({
+        "type": "income",
+        "status": "verified",
+        "is_deleted": {"$ne": True},
+        **tenant_scope,
+    }):
+        all_income_total += _as_float(tx.get("amount"))
+
+    all_expense_total = 0.0
+    async for tx in db.accounting_transactions.find({
+        "type": "expense",
+        "status": "verified",
+        "is_deleted": {"$ne": True},
+        **tenant_scope,
+    }):
+        all_expense_total += _as_float(tx.get("amount"))
     
-    all_expense = await db.accounting_transactions.aggregate([
-        {"$match": {"type": "expense", "status": "verified", "is_deleted": {"$ne": True}}},
-        {"$group": {"_id": None, "total": {"$sum": "$amount"}}}
-    ]).to_list(1)
-    
-    total_transactions = await db.accounting_transactions.count_documents({"is_deleted": {"$ne": True}})
+    total_transactions = await db.accounting_transactions.count_documents({
+        "is_deleted": {"$ne": True},
+        **tenant_scope,
+    })
     
     return {
         "current_month": {
             "month": now.month,
             "month_name": MALAY_MONTHS.get(now.month, str(now.month)),
             "year": now.year,
-            "income": round(month_income[0]["total"], 2) if month_income else 0,
-            "expense": round(month_expense[0]["total"], 2) if month_expense else 0,
-            "net": round(
-                (month_income[0]["total"] if month_income else 0) -
-                (month_expense[0]["total"] if month_expense else 0),
-                2
-            )
+            "income": round(month_income_total, 2),
+            "expense": round(month_expense_total, 2),
+            "net": round(month_income_total - month_expense_total, 2),
         },
         "all_time": {
-            "income": round(all_income[0]["total"], 2) if all_income else 0,
-            "expense": round(all_expense[0]["total"], 2) if all_expense else 0,
-            "balance": round(
-                (all_income[0]["total"] if all_income else 0) -
-                (all_expense[0]["total"] if all_expense else 0),
-                2
-            )
+            "income": round(all_income_total, 2),
+            "expense": round(all_expense_total, 2),
+            "balance": round(all_income_total - all_expense_total, 2),
         },
         "pending_verification": pending_count,
         "total_transactions": total_transactions
@@ -1478,9 +1734,9 @@ async def list_audit_logs(
     db = get_db()
     check_juruaudit_access(user)
     
-    query = {}
+    query = _tenant_scope_query(user)
     if transaction_id:
-        query["transaction_id"] = ObjectId(transaction_id)
+        query["transaction_id"] = _id_value(transaction_id)
     if action:
         query["action"] = action
     
@@ -1498,6 +1754,12 @@ async def list_audit_logs(
         performed_at = log.get("performed_at")
         if isinstance(performed_at, datetime):
             performed_at = performed_at.isoformat()
+        old_value = log.get("old_value")
+        new_value = log.get("new_value")
+        if old_value is not None and not isinstance(old_value, dict):
+            old_value = {"value": old_value}
+        if new_value is not None and not isinstance(new_value, dict):
+            new_value = {"value": new_value}
         
         result.append(AccountingAuditLogResponse(
             id=str(log["_id"]),
@@ -1505,8 +1767,8 @@ async def list_audit_logs(
             transaction_number=log.get("transaction_number", "-"),
             action=log.get("action", ""),
             action_display=AUDIT_ACTION_DISPLAY.get(log.get("action"), log.get("action", "")),
-            old_value=log.get("old_value"),
-            new_value=log.get("new_value"),
+            old_value=old_value,
+            new_value=new_value,
             performed_by=str(log.get("performed_by", "")),
             performed_by_name=log.get("performed_by_name", ""),
             performed_by_role=log.get("performed_by_role", ""),
@@ -1537,6 +1799,7 @@ async def get_accounting_summary(
     Access: superadmin, admin, bendahari, sub_bendahari, juruaudit
     """
     db = get_db()
+    tenant_scope = _tenant_scope_query(user)
     
     allowed_roles = ALL_ACCOUNTING_ROLES
     if user["role"] not in allowed_roles:
@@ -1559,32 +1822,29 @@ async def get_accounting_summary(
         except Exception:
             pass
 
+    tenant_modules_doc = None
+    if tenant_scope:
+        tenant_modules_doc = await db.tenant_module_settings.find_one(tenant_scope)
     config = await db.settings.find_one({"type": "module_settings"})
-    modules_config = config.get("modules", {}) if config else {}
+    modules_config = tenant_modules_doc.get("modules", {}) if tenant_modules_doc else (config.get("modules", {}) if config else {})
     koperasi_enabled = modules_config.get("koperasi", {}).get("enabled", True)
     marketplace_enabled = modules_config.get("marketplace", {}).get("enabled", True)
     
     # ============ MUAFAKAT ACCOUNT ============
-    muafakat_query = {"commission_type": "muafakat"}
+    muafakat_query = {"commission_type": "muafakat", **tenant_scope}
     if date_query:
         muafakat_query["created_at"] = date_query
     
-    muafakat_pipeline = [
-        {"$match": muafakat_query},
-        {"$group": {
-            "_id": "$status",
-            "total": {"$sum": "$commission_amount"},
-            "count": {"$sum": 1}
-        }}
-    ]
-    muafakat_results = await db.commission_records.aggregate(muafakat_pipeline).to_list(10)
-    
     muafakat_summary = {"confirmed": 0, "pending": 0, "paid_out": 0, "cancelled": 0}
     muafakat_counts = {"confirmed": 0, "pending": 0, "paid_out": 0, "cancelled": 0}
-    for r in muafakat_results:
-        if r["_id"] in muafakat_summary:
-            muafakat_summary[r["_id"]] = round(r["total"], 2)
-            muafakat_counts[r["_id"]] = r["count"]
+    async for row in db.commission_records.find(muafakat_query):
+        status = row.get("status")
+        if status not in muafakat_summary:
+            continue
+        muafakat_summary[status] += _as_float(row.get("commission_amount"))
+        muafakat_counts[status] += 1
+    for status in muafakat_summary:
+        muafakat_summary[status] = round(muafakat_summary[status], 2)
     
     muafakat_total = muafakat_summary["confirmed"] + muafakat_summary["paid_out"]
     
@@ -1595,26 +1855,27 @@ async def get_accounting_summary(
     merch_stock_value = 0
     merch_stock_items = 0
     if marketplace_enabled:
-        merch_query = {}
+        merch_query = dict(tenant_scope)
         if date_query:
             merch_query["created_at"] = date_query
-        merch_pipeline = [
-            {"$match": {**merch_query, "status": {"$ne": "cancelled"}}},
-            {"$group": {"_id": "$status", "total": {"$sum": "$total_amount"}, "count": {"$sum": 1}}}
-        ]
-        merch_results = await db.merchandise_orders.aggregate(merch_pipeline).to_list(10)
-        for r in merch_results:
-            merch_by_status[r["_id"]] = {"amount": round(r["total"], 2), "count": r["count"]}
-            if r["_id"] in ["paid", "processing", "ready", "delivered"]:
-                merch_total_sales += r["total"]
-            merch_total_orders += r["count"]
-        merch_inventory_pipeline = [
-            {"$match": {"is_active": True}},
-            {"$group": {"_id": None, "total_stock_value": {"$sum": {"$multiply": ["$price", "$stock"]}}, "total_items": {"$sum": "$stock"}}}
-        ]
-        merch_inventory = await db.merchandise_products.aggregate(merch_inventory_pipeline).to_list(1)
-        merch_stock_value = merch_inventory[0]["total_stock_value"] if merch_inventory else 0
-        merch_stock_items = merch_inventory[0]["total_items"] if merch_inventory else 0
+        async for row in db.merchandise_orders.find({**merch_query, "status": {"$ne": "cancelled"}}):
+            status = row.get("status")
+            amount = _as_float(row.get("total_amount"))
+            if status not in merch_by_status:
+                merch_by_status[status] = {"amount": 0.0, "count": 0}
+            merch_by_status[status]["amount"] += amount
+            merch_by_status[status]["count"] += 1
+            if status in ["paid", "processing", "ready", "delivered"]:
+                merch_total_sales += amount
+            merch_total_orders += 1
+        for status in list(merch_by_status.keys()):
+            merch_by_status[status]["amount"] = round(merch_by_status[status]["amount"], 2)
+
+        async for row in db.merchandise_products.find({"is_active": True, **tenant_scope}):
+            price = _as_float(row.get("price"))
+            stock = _as_int(row.get("stock"))
+            merch_stock_value += (price * stock)
+            merch_stock_items += stock
     
     # ============ KOPERASI ACCOUNT (termasuk PUM) ============
     koop_by_status = {}
@@ -1628,57 +1889,55 @@ async def get_accounting_summary(
     pum_stock_value = 0
     pum_stock_items = 0
     if koperasi_enabled:
-        koop_query = {}
+        koop_query = dict(tenant_scope)
         if date_query:
             koop_query["created_at"] = date_query
-        koop_pipeline = [
-            {"$match": {**koop_query, "status": {"$ne": "cancelled"}}},
-            {"$group": {"_id": "$status", "total": {"$sum": "$total_amount"}, "count": {"$sum": 1}}}
-        ]
-        koop_results = await db.koop_orders.aggregate(koop_pipeline).to_list(10)
-        for r in koop_results:
-            koop_by_status[r["_id"]] = {"amount": round(r["total"], 2), "count": r["count"]}
-            if r["_id"] in ["paid", "processing", "ready", "collected"]:
-                koop_total_sales += r["total"]
-            koop_total_orders += r["count"]
-        koop_commission_query = {"commission_type": "koperasi"}
+        async for row in db.koop_orders.find({**koop_query, "status": {"$ne": "cancelled"}}):
+            status = row.get("status")
+            amount = _as_float(row.get("total_amount"))
+            if status not in koop_by_status:
+                koop_by_status[status] = {"amount": 0.0, "count": 0}
+            koop_by_status[status]["amount"] += amount
+            koop_by_status[status]["count"] += 1
+            if status in ["paid", "processing", "ready", "collected"]:
+                koop_total_sales += amount
+            koop_total_orders += 1
+        for status in list(koop_by_status.keys()):
+            koop_by_status[status]["amount"] = round(koop_by_status[status]["amount"], 2)
+
+        koop_commission_query = {"commission_type": "koperasi", **tenant_scope}
         if date_query:
             koop_commission_query["created_at"] = date_query
-        koop_commission_pipeline = [
-            {"$match": {**koop_commission_query, "status": {"$in": ["confirmed", "paid_out"]}}},
-            {"$group": {"_id": None, "total": {"$sum": "$commission_amount"}}}
-        ]
-        koop_commission_result = await db.commission_records.aggregate(koop_commission_pipeline).to_list(1)
-        koop_commission_earned = koop_commission_result[0]["total"] if koop_commission_result else 0
-        pum_query = {}
+        async for row in db.commission_records.find({**koop_commission_query, "status": {"$in": ["confirmed", "paid_out"]}}):
+            koop_commission_earned += _as_float(row.get("commission_amount"))
+
+        pum_query = dict(tenant_scope)
         if date_query:
             pum_query["created_at"] = date_query
-        pum_pipeline = [
-            {"$match": {**pum_query, "status": {"$ne": "cancelled"}}},
-            {"$group": {"_id": "$status", "total": {"$sum": "$total_amount"}, "count": {"$sum": 1}}}
-        ]
-        pum_results = await db.pum_orders.aggregate(pum_pipeline).to_list(10)
-        for r in pum_results:
-            pum_by_status[r["_id"]] = {"amount": round(r["total"], 2), "count": r["count"]}
-            if r["_id"] in ["paid", "processing", "shipped", "delivered"]:
-                pum_total_sales += r["total"]
-            pum_total_orders += r["count"]
-        pum_commission_query = {"commission_type": "pum"}
+        async for row in db.pum_orders.find({**pum_query, "status": {"$ne": "cancelled"}}):
+            status = row.get("status")
+            amount = _as_float(row.get("total_amount"))
+            if status not in pum_by_status:
+                pum_by_status[status] = {"amount": 0.0, "count": 0}
+            pum_by_status[status]["amount"] += amount
+            pum_by_status[status]["count"] += 1
+            if status in ["paid", "processing", "shipped", "delivered"]:
+                pum_total_sales += amount
+            pum_total_orders += 1
+        for status in list(pum_by_status.keys()):
+            pum_by_status[status]["amount"] = round(pum_by_status[status]["amount"], 2)
+
+        pum_commission_query = {"commission_type": "pum", **tenant_scope}
         if date_query:
             pum_commission_query["created_at"] = date_query
-        pum_commission_pipeline = [
-            {"$match": {**pum_commission_query, "status": {"$in": ["confirmed", "paid_out"]}}},
-            {"$group": {"_id": None, "total": {"$sum": "$commission_amount"}}}
-        ]
-        pum_commission_result = await db.commission_records.aggregate(pum_commission_pipeline).to_list(1)
-        pum_commission_earned = pum_commission_result[0]["total"] if pum_commission_result else 0
-        pum_inventory_pipeline = [
-            {"$match": {"is_active": True}},
-            {"$group": {"_id": None, "total_stock_value": {"$sum": {"$multiply": ["$price", "$stock"]}}, "total_items": {"$sum": "$stock"}}}
-        ]
-        pum_inventory = await db.pum_products.aggregate(pum_inventory_pipeline).to_list(1)
-        pum_stock_value = pum_inventory[0]["total_stock_value"] if pum_inventory else 0
-        pum_stock_items = pum_inventory[0]["total_items"] if pum_inventory else 0
+        async for row in db.commission_records.find({**pum_commission_query, "status": {"$in": ["confirmed", "paid_out"]}}):
+            pum_commission_earned += _as_float(row.get("commission_amount"))
+
+        async for row in db.pum_products.find({"is_active": True, **tenant_scope}):
+            price = _as_float(row.get("price"))
+            stock = _as_int(row.get("stock"))
+            pum_stock_value += (price * stock)
+            pum_stock_items += stock
     
     # ============ GRAND TOTALS ============
     total_revenue = muafakat_total + koop_commission_earned + pum_commission_earned
@@ -1754,39 +2013,45 @@ async def get_monthly_trend(
 ):
     """Get monthly revenue trend for the past N months."""
     db = get_db()
+    tenant_scope = _tenant_scope_query(user)
     
     if user["role"] not in ALL_ACCOUNTING_ROLES:
         raise HTTPException(status_code=403, detail="Akses ditolak")
     
     start_date = datetime.now(timezone.utc) - timedelta(days=months * 30)
+    tenant_modules_doc = None
+    if tenant_scope:
+        tenant_modules_doc = await db.tenant_module_settings.find_one(tenant_scope)
     config = await db.settings.find_one({"type": "module_settings"})
-    modules_config = config.get("modules", {}) if config else {}
+    modules_config = tenant_modules_doc.get("modules", {}) if tenant_modules_doc else (config.get("modules", {}) if config else {})
     koperasi_enabled = modules_config.get("koperasi", {}).get("enabled", True)
     
-    pipeline = [
-        {"$match": {"created_at": {"$gte": start_date}, "status": {"$in": ["confirmed", "paid_out"]}}},
-        {"$group": {
-            "_id": {"year": {"$year": "$created_at"}, "month": {"$month": "$created_at"}, "type": "$commission_type"},
-            "amount": {"$sum": "$commission_amount"}
-        }},
-        {"$sort": {"_id.year": 1, "_id.month": 1}}
-    ]
-    
-    results = await db.commission_records.aggregate(pipeline).to_list(100)
-    
     monthly_data = {}
-    for r in results:
-        if not koperasi_enabled and r["_id"]["type"] in ("koperasi", "pum"):
+    async for row in db.commission_records.find({
+        "created_at": {"$gte": start_date},
+        "status": {"$in": ["confirmed", "paid_out"]},
+        **tenant_scope,
+    }):
+        commission_type = row.get("commission_type")
+        if not commission_type:
             continue
-        key = f"{r['_id']['year']}-{r['_id']['month']:02d}"
+        if not koperasi_enabled and commission_type in ("koperasi", "pum"):
+            continue
+        created_at = _as_datetime(row.get("created_at"))
+        if created_at is None:
+            continue
+        year = created_at.year
+        month = created_at.month
+        key = f"{year}-{month:02d}"
         if key not in monthly_data:
             monthly_data[key] = {
                 "period": key,
-                "month_name": f"{MALAY_MONTHS.get(r['_id']['month'], r['_id']['month'])} {r['_id']['year']}",
+                "month_name": f"{MALAY_MONTHS.get(month, month)} {year}",
                 "muafakat": 0, "koperasi": 0, "pum": 0, "total": 0
             }
-        monthly_data[key][r["_id"]["type"]] = round(r["amount"], 2)
-        monthly_data[key]["total"] += r["amount"]
+        amount = _as_float(row.get("commission_amount"))
+        monthly_data[key][commission_type] = round(monthly_data[key].get(commission_type, 0) + amount, 2)
+        monthly_data[key]["total"] += amount
     
     trend_data = sorted(monthly_data.values(), key=lambda x: x["period"])
     for item in trend_data:

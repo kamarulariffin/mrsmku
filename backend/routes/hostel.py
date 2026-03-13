@@ -6,8 +6,9 @@ import os
 import re
 import uuid
 from datetime import datetime, timezone, timedelta
-from typing import Optional, List, Callable, Tuple
+from typing import Any, Optional, List, Callable, Tuple
 from bson import ObjectId
+from services.id_normalizer import object_id_or_none
 
 from fastapi import APIRouter, HTTPException, Depends, Query, File, UploadFile
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -71,6 +72,21 @@ async def log_audit(user, action, module, details):
     """Wrapper for audit logging"""
     if _log_audit_func and user:
         await _log_audit_func(user, action, module, details)
+
+
+def _id_value(value: Any) -> Any:
+    """Normalize ID-like inputs while staying compatible with non-ObjectId IDs."""
+    if value is None:
+        return None
+    if isinstance(value, ObjectId):
+        return value
+    text = str(value)
+    try:
+        if ObjectId.is_valid(text):
+            return object_id_or_none(text)
+    except Exception:
+        pass
+    return text
 
 
 def require_warden_admin():
@@ -254,7 +270,7 @@ async def hostel_checkout(
         raise HTTPException(status_code=404, detail="Pelajar tidak dijumpai")
     
     record_doc = {
-        "student_id": ObjectId(record.student_id),
+        "student_id": _id_value(record.student_id),
         "student_name": student.get("full_name", student.get("fullName", "Unknown")),
         "check_type": "keluar",
         "tarikh_keluar": record.tarikh_keluar or datetime.now(timezone.utc).isoformat(),
@@ -271,7 +287,7 @@ async def hostel_checkout(
     student_name = student.get("full_name", student.get("fullName", "Unknown"))
     await append_movement_log(
         db,
-        ObjectId(record.student_id),
+        _id_value(record.student_id),
         student_name,
         MOVEMENT_TYPE_CHECKOUT,
         recorded_by=str(current_user["_id"]),
@@ -299,13 +315,13 @@ async def hostel_checkin(
 ):
     """Record student checkin"""
     db = get_db()
-    record = await db.hostel_records.find_one({"_id": ObjectId(record_id)})
+    record = await db.hostel_records.find_one({"_id": _id_value(record_id)})
     if not record:
         raise HTTPException(status_code=404, detail="Rekod tidak dijumpai")
     
     actual_return_iso = datetime.now(timezone.utc).isoformat()
     await db.hostel_records.update_one(
-        {"_id": ObjectId(record_id)},
+        {"_id": _id_value(record_id)},
         {"$set": {
             "check_type": "masuk",
             "actual_return": actual_return_iso,
@@ -354,7 +370,7 @@ async def get_hostel_records(
     db = get_db()
     query = {}
     if student_id:
-        query["student_id"] = ObjectId(student_id)
+        query["student_id"] = _id_value(student_id)
     if current_user["role"] == "warden":
         # Filter by block - check both users and students collections
         block = current_user.get("assigned_block", current_user.get("block_assigned", ""))
@@ -469,11 +485,10 @@ async def get_hostel_stats(current_user: dict = Depends(require_warden_admin()))
     total_students = await db.users.count_documents({**block_filter, "role": "pelajar", "status": "approved"})
     
     # Count students currently out
-    pipeline = [
-        {"$match": {"check_type": "keluar", "actual_return": {"$exists": False}}},
-        {"$group": {"_id": "$student_id"}}
-    ]
-    out_students = await db.hostel_records.aggregate(pipeline).to_list(1000)
+    out_students = await db.hostel_records.distinct(
+        "student_id",
+        {"check_type": "keluar", "actual_return": {"$exists": False}},
+    )
     
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     today_checkouts = await db.hostel_records.count_documents({
@@ -516,26 +531,24 @@ async def get_empty_rooms_by_block(current_user: dict = Depends(require_warden_a
             {"$or": [{"room_number": {"$exists": True, "$ne": ""}}, {"room": {"$exists": True, "$ne": ""}}]}
         ]
     }
-    pipeline = [
-        {"$match": students_match},
-        {"$project": {
-            "block": {"$ifNull": ["$block_name", {"$ifNull": ["$block", "$hostel_block"]}]},
-            "room": {"$ifNull": ["$room_number", "$room"]}
-        }},
-        {"$group": {"_id": {"block": "$block", "room": "$room"}, "occupants": {"$sum": 1}}}
-    ]
-    room_occupancy = await db.students.aggregate(pipeline).to_list(1000)
     from collections import defaultdict
     by_room = defaultdict(int)
-    for r in room_occupancy:
-        bid = r.get("_id") or {}
-        block = (bid.get("block") or "").strip()
-        room = (bid.get("room") or "").strip()
+    async for row in db.students.find(students_match):
+        block = row.get("block_name")
+        if block in (None, ""):
+            block = row.get("block")
+        if block in (None, ""):
+            block = row.get("hostel_block")
+        room = row.get("room_number")
+        if room in (None, ""):
+            room = row.get("room")
+        block = str(block or "").strip()
+        room = str(room or "").strip()
         if block or room:
-            by_room[(block, room)] += r.get("occupants", 0)
+            by_room[(block, room)] += 1
     block_beds_map = {}
     try:
-        for b in await db.hostel_blocks.find({}, {"code": 1, "beds_per_room": 1}).to_list(100):
+        for b in await db.hostel_blocks.find({}).to_list(100):
             code = (b.get("code") or "").strip()
             bp = b.get("beds_per_room")
             if code and bp is not None and int(bp) > 0:
@@ -600,7 +613,7 @@ async def get_movement_logs(
     db = get_db()
     query = {}
     if student_id:
-        query["student_id"] = ObjectId(student_id)
+        query["student_id"] = _id_value(student_id)
     if movement_type:
         query["movement_type"] = movement_type
     if current_user["role"] == "warden":
@@ -807,7 +820,7 @@ async def request_leave(
             raise HTTPException(status_code=403, detail="Akses ditolak")
     student_name = student.get("full_name", student.get("fullName", "Unknown"))
     existing = await db.hostel_records.find_one({
-        "student_id": ObjectId(student_id_str),
+        "student_id": _id_value(student_id_str),
         "kategori": request.kategori,
         "tarikh_keluar": request.tarikh_keluar,
         "status": {"$in": ["pending", "approved"]},
@@ -815,7 +828,7 @@ async def request_leave(
     if existing:
         raise HTTPException(status_code=400, detail="Sudah ada permohonan untuk tarikh dan kategori ini")
     record_doc = {
-        "student_id": ObjectId(student_id_str),
+        "student_id": _id_value(student_id_str),
         "student_name": student_name,
         "student_matric": student.get("matric_number", student.get("matric", "")),
         "student_form": student.get("form", 0),
@@ -974,13 +987,13 @@ async def serve_leave_file(
 async def approve_leave(request_id: str, current_user: dict = Depends(require_warden_admin())):
     """Lulus permohonan keluar (urusan lain)."""
     db = get_db()
-    record = await db.hostel_records.find_one({"_id": ObjectId(request_id), "kategori": {"$in": OTHER_LEAVE_CATEGORIES}})
+    record = await db.hostel_records.find_one({"_id": _id_value(request_id), "kategori": {"$in": OTHER_LEAVE_CATEGORIES}})
     if not record:
         raise HTTPException(status_code=404, detail="Permohonan tidak dijumpai")
     if record.get("status") != "pending":
         raise HTTPException(status_code=400, detail="Permohonan sudah diproses")
     await db.hostel_records.update_one(
-        {"_id": ObjectId(request_id)},
+        {"_id": _id_value(request_id)},
         {"$set": {
             "status": "approved",
             "approved_by": str(current_user["_id"]),
@@ -991,7 +1004,7 @@ async def approve_leave(request_id: str, current_user: dict = Depends(require_wa
     requester_id = record.get("requested_by")
     if requester_id:
         await db.notifications.insert_one({
-            "user_id": ObjectId(requester_id),
+            "user_id": _id_value(requester_id),
             "title": "Kelulusan Permohonan Keluar",
             "message": f"Permohonan keluar ({record.get('kategori', '')}) untuk {record.get('student_name', '')} telah DILULUSKAN.",
             "type": "success",
@@ -1010,13 +1023,13 @@ async def reject_leave(
 ):
     """Tolak permohonan keluar (urusan lain)."""
     db = get_db()
-    record = await db.hostel_records.find_one({"_id": ObjectId(request_id), "kategori": {"$in": OTHER_LEAVE_CATEGORIES}})
+    record = await db.hostel_records.find_one({"_id": _id_value(request_id), "kategori": {"$in": OTHER_LEAVE_CATEGORIES}})
     if not record:
         raise HTTPException(status_code=404, detail="Permohonan tidak dijumpai")
     if record.get("status") != "pending":
         raise HTTPException(status_code=400, detail="Permohonan sudah diproses")
     await db.hostel_records.update_one(
-        {"_id": ObjectId(request_id)},
+        {"_id": _id_value(request_id)},
         {"$set": {
             "status": "rejected",
             "rejected_by": str(current_user["_id"]),
@@ -1027,7 +1040,7 @@ async def reject_leave(
     requester_id = record.get("requested_by")
     if requester_id:
         await db.notifications.insert_one({
-            "user_id": ObjectId(requester_id),
+            "user_id": _id_value(requester_id),
             "title": "Permohonan Keluar Ditolak",
             "message": f"Permohonan keluar ({record.get('kategori', '')}) telah DITOLAK. {reason or ''}",
             "type": "warning",
@@ -1081,7 +1094,7 @@ async def request_klinik(
             raise HTTPException(status_code=403, detail="Anda hanya boleh memohon untuk pelajar dalam blok anda")
     student_name = student.get("full_name", student.get("fullName", "Unknown"))
     record_doc = {
-        "student_id": ObjectId(request.student_id),
+        "student_id": _id_value(request.student_id),
         "student_name": student_name,
         "student_matric": student.get("matric_number", student.get("matric", "")),
         "student_form": student.get("form", 0),
@@ -1162,7 +1175,7 @@ async def update_klinik_request(
 ):
     """Warden boleh mengemaskini permohonan klinik/hospital."""
     db = get_db()
-    record = await db.hostel_records.find_one({"_id": ObjectId(request_id), "kategori": KLINIK_KATEGORI})
+    record = await db.hostel_records.find_one({"_id": _id_value(request_id), "kategori": KLINIK_KATEGORI})
     if not record:
         raise HTTPException(status_code=404, detail="Permohonan tidak dijumpai")
     if not _warden_can_manage_klinik_record(current_user, record):
@@ -1182,7 +1195,7 @@ async def update_klinik_request(
         updates["pic_phone"] = body.pic_phone
     if not updates:
         return {"message": "Tiada perubahan"}
-    await db.hostel_records.update_one({"_id": ObjectId(request_id)}, {"$set": updates})
+    await db.hostel_records.update_one({"_id": _id_value(request_id)}, {"$set": updates})
     await log_audit(current_user, "KLINIK_UPDATE", "hostel", f"Kemaskini permohonan klinik: {record.get('student_name')}")
     return {"message": "Permohonan dikemaskini"}
 
@@ -1194,12 +1207,12 @@ async def delete_klinik_request(
 ):
     """Warden boleh padam permohonan klinik/hospital."""
     db = get_db()
-    record = await db.hostel_records.find_one({"_id": ObjectId(request_id), "kategori": KLINIK_KATEGORI})
+    record = await db.hostel_records.find_one({"_id": _id_value(request_id), "kategori": KLINIK_KATEGORI})
     if not record:
         raise HTTPException(status_code=404, detail="Permohonan tidak dijumpai")
     if not _warden_can_manage_klinik_record(current_user, record):
         raise HTTPException(status_code=403, detail="Akses ditolak")
-    await db.hostel_records.delete_one({"_id": ObjectId(request_id)})
+    await db.hostel_records.delete_one({"_id": _id_value(request_id)})
     await log_audit(current_user, "KLINIK_DELETE", "hostel", f"Padam permohonan klinik: {record.get('student_name')}")
     return {"message": "Permohonan telah dipadam"}
 
@@ -1241,14 +1254,14 @@ async def request_outing(
     if current_user["role"] == "parent":
         if str(student.get("parent_id", "")) != str(current_user["_id"]):
             raise HTTPException(status_code=403, detail="Akses ditolak")
-    student_id_obj = ObjectId(student_id_str) if student_id_str else ObjectId(student.get("_id"))
+    student_id_obj = _id_value(student_id_str) if student_id_str else _id_value(student.get("_id"))
     if current_user["role"] == "parent":
         blocked, reason, _ = await _olat_blocks_outing(db, student_id_obj)
         if blocked:
             raise HTTPException(status_code=403, detail=reason)
     student_name = student.get("full_name", student.get("fullName", "Unknown"))
     record_doc = {
-        "student_id": ObjectId(student_id_str),
+        "student_id": _id_value(student_id_str),
         "student_name": student_name,
         "student_matric": student.get("matric_number", student.get("matric", "")),
         "student_form": student.get("form", 0),
@@ -1303,12 +1316,12 @@ async def request_outing_by_warden(
     student_block = student.get("block_name", student.get("block", ""))
     if block and student_block and block != student_block:
         raise HTTPException(status_code=403, detail="Anda hanya boleh memohon bagi pelajar dalam blok anda")
-    blocked, reason, _ = await _olat_blocks_outing(db, ObjectId(student_id_str))
+    blocked, reason, _ = await _olat_blocks_outing(db, _id_value(student_id_str))
     if blocked:
         raise HTTPException(status_code=403, detail=reason)
     student_name = student.get("full_name", student.get("fullName", "Unknown"))
     record_doc = {
-        "student_id": ObjectId(student_id_str),
+        "student_id": _id_value(student_id_str),
         "student_name": student_name,
         "student_matric": student.get("matric_number", student.get("matric", "")),
         "student_form": student.get("form", 0),
@@ -1376,13 +1389,13 @@ async def get_outing_requests(
 async def approve_outing(request_id: str, current_user: dict = Depends(require_warden_admin())):
     """Lulus permohonan outing."""
     db = get_db()
-    record = await db.hostel_records.find_one({"_id": ObjectId(request_id), "kategori": "outing"})
+    record = await db.hostel_records.find_one({"_id": _id_value(request_id), "kategori": "outing"})
     if not record:
         raise HTTPException(status_code=404, detail="Permohonan tidak dijumpai")
     if record.get("status") != "pending":
         raise HTTPException(status_code=400, detail="Permohonan sudah diproses")
     await db.hostel_records.update_one(
-        {"_id": ObjectId(request_id)},
+        {"_id": _id_value(request_id)},
         {"$set": {
             "status": "approved",
             "approved_by": str(current_user["_id"]),
@@ -1403,7 +1416,7 @@ async def approve_outing(request_id: str, current_user: dict = Depends(require_w
     requester_id = record.get("requested_by")
     if requester_id:
         await db.notifications.insert_one({
-            "user_id": ObjectId(requester_id),
+            "user_id": _id_value(requester_id),
             "title": "Kelulusan Outing",
             "message": f"Permohonan outing untuk {record.get('student_name', '')} telah DILULUSKAN.",
             "type": "success",
@@ -1422,13 +1435,13 @@ async def reject_outing(
 ):
     """Tolak permohonan outing."""
     db = get_db()
-    record = await db.hostel_records.find_one({"_id": ObjectId(request_id), "kategori": "outing"})
+    record = await db.hostel_records.find_one({"_id": _id_value(request_id), "kategori": "outing"})
     if not record:
         raise HTTPException(status_code=404, detail="Permohonan tidak dijumpai")
     if record.get("status") != "pending":
         raise HTTPException(status_code=400, detail="Permohonan sudah diproses")
     await db.hostel_records.update_one(
-        {"_id": ObjectId(request_id)},
+        {"_id": _id_value(request_id)},
         {"$set": {
             "status": "rejected",
             "rejected_by": str(current_user["_id"]),
@@ -1439,7 +1452,7 @@ async def reject_outing(
     requester_id = record.get("requested_by")
     if requester_id:
         await db.notifications.insert_one({
-            "user_id": ObjectId(requester_id),
+            "user_id": _id_value(requester_id),
             "title": "Permohonan Outing Ditolak",
             "message": f"Permohonan outing telah DITOLAK. {reason or ''}",
             "type": "warning",
@@ -1462,18 +1475,18 @@ async def get_outing_calendar_counts(
     num_days = cal.monthrange(tahun, bulan)[1]
     start = f"{tahun}-{bulan:02d}-01"
     end = f"{tahun}-{bulan:02d}-{num_days:02d}"
-    pipeline = [
+    by_date = {}
+    async for row in db.hostel_records.find(
         {
-            "$match": {
-                "kategori": "outing",
-                "status": "approved",
-                "tarikh_keluar": {"$gte": start, "$lte": end},
-            }
-        },
-        {"$group": {"_id": "$tarikh_keluar", "count": {"$sum": 1}}},
-    ]
-    rows = await db.hostel_records.aggregate(pipeline).to_list(100)
-    by_date = {row["_id"]: row["count"] for row in rows}
+            "kategori": "outing",
+            "status": "approved",
+            "tarikh_keluar": {"$gte": start, "$lte": end},
+        }
+    ):
+        date_key = row.get("tarikh_keluar")
+        if not date_key:
+            continue
+        by_date[date_key] = by_date.get(date_key, 0) + 1
     return {"bulan": bulan, "tahun": tahun, "by_date": by_date}
 
 
@@ -1502,7 +1515,7 @@ async def qr_scan(
     is_late = False
     if body.direction == "in":
         open_record = await db.hostel_records.find_one({
-            "student_id": ObjectId(body.student_id),
+            "student_id": _id_value(body.student_id),
             "check_type": "keluar",
             "actual_return": {"$exists": False},
         }, sort=[("created_at", -1)])
@@ -1514,7 +1527,7 @@ async def qr_scan(
                 pass
     await append_movement_log(
         db,
-        ObjectId(body.student_id),
+        _id_value(body.student_id),
         student_name,
         movement_type,
         recorded_by=str(current_user["_id"]),
@@ -1637,12 +1650,12 @@ async def request_pulang_bermalam(
     if current_user["role"] == "parent":
         if str(student.get("parent_id", "")) != str(current_user["_id"]):
             raise HTTPException(status_code=403, detail="Akses ditolak")
-        blocked, reason, _ = await _olat_blocks_outing(db, ObjectId(student_id_str))
+        blocked, reason, _ = await _olat_blocks_outing(db, _id_value(student_id_str))
         if blocked:
             raise HTTPException(status_code=403, detail=reason)
     student_name = student.get("full_name", student.get("fullName", "Unknown"))
     existing = await db.hostel_records.find_one({
-        "student_id": ObjectId(student_id_str),
+        "student_id": _id_value(student_id_str),
         "kategori": "pulang_bermalam",
         "tarikh_keluar": request.tarikh_keluar,
         "status": {"$in": ["pending", "approved"]}
@@ -1650,7 +1663,7 @@ async def request_pulang_bermalam(
     if existing:
         raise HTTPException(status_code=400, detail="Sudah ada permohonan untuk tarikh ini")
     record_doc = {
-        "student_id": ObjectId(student_id_str),
+        "student_id": _id_value(student_id_str),
         "student_name": student_name,
         "student_matric": student.get("matric_number", student.get("matric", "")),
         "student_form": student.get("form", 0),
@@ -1843,7 +1856,7 @@ async def update_pbw_pbp_period(
 ):
     """Warden/Admin: kemaskini tempoh PBW/PBP."""
     try:
-        oid = ObjectId(period_id)
+        oid = _id_value(period_id)
     except Exception:
         raise HTTPException(status_code=400, detail="ID tidak sah")
     db = get_db()
@@ -1877,7 +1890,7 @@ async def delete_pbw_pbp_period(
 ):
     """Warden/Admin: padam tempoh PBW/PBP."""
     try:
-        oid = ObjectId(period_id)
+        oid = _id_value(period_id)
     except Exception:
         raise HTTPException(status_code=400, detail="ID tidak sah")
     db = get_db()
@@ -1904,7 +1917,7 @@ async def approve_pulang_bermalam(
 ):
     """Approve pulang bermalam request"""
     db = get_db()
-    record = await db.hostel_records.find_one({"_id": ObjectId(request_id)})
+    record = await db.hostel_records.find_one({"_id": _id_value(request_id)})
     if not record:
         raise HTTPException(status_code=404, detail="Permohonan tidak dijumpai")
     if not _warden_can_approve_record(current_user, record):
@@ -1913,7 +1926,7 @@ async def approve_pulang_bermalam(
         raise HTTPException(status_code=400, detail="Permohonan ini sudah diproses")
     
     await db.hostel_records.update_one(
-        {"_id": ObjectId(request_id)},
+        {"_id": _id_value(request_id)},
         {"$set": {
             "status": "approved",
             "approved_by": str(current_user["_id"]),
@@ -1925,7 +1938,7 @@ async def approve_pulang_bermalam(
     requester_id = record.get("requested_by")
     if requester_id:
         await db.notifications.insert_one({
-            "user_id": ObjectId(requester_id),
+            "user_id": _id_value(requester_id),
             "title": "Kelulusan Pulang Bermalam",
             "message": f"Permohonan pulang bermalam untuk {record.get('student_name', '')} dari {record.get('tarikh_keluar', '')} hingga {record.get('tarikh_pulang', '')} telah DILULUSKAN.",
             "type": "success",
@@ -1954,7 +1967,7 @@ async def bulk_approve_pulang_bermalam(
     approved = 0
     for rid in body.request_ids:
         try:
-            oid = ObjectId(rid)
+            oid = _id_value(rid)
         except Exception:
             continue
         record = await db.hostel_records.find_one({"_id": oid, "kategori": "pulang_bermalam"})
@@ -1974,7 +1987,7 @@ async def bulk_approve_pulang_bermalam(
         requester_id = record.get("requested_by")
         if requester_id:
             await db.notifications.insert_one({
-                "user_id": ObjectId(requester_id),
+                "user_id": _id_value(requester_id),
                 "title": "Kelulusan Pulang Bermalam",
                 "message": f"Permohonan pulang bermalam untuk {record.get('student_name', '')} dari {record.get('tarikh_keluar', '')} hingga {record.get('tarikh_pulang', '')} telah DILULUSKAN.",
                 "type": "success",
@@ -1994,7 +2007,7 @@ async def reject_pulang_bermalam(
 ):
     """Reject pulang bermalam request"""
     db = get_db()
-    record = await db.hostel_records.find_one({"_id": ObjectId(request_id)})
+    record = await db.hostel_records.find_one({"_id": _id_value(request_id)})
     if not record:
         raise HTTPException(status_code=404, detail="Permohonan tidak dijumpai")
     
@@ -2002,7 +2015,7 @@ async def reject_pulang_bermalam(
         raise HTTPException(status_code=400, detail="Permohonan ini sudah diproses")
     
     await db.hostel_records.update_one(
-        {"_id": ObjectId(request_id)},
+        {"_id": _id_value(request_id)},
         {"$set": {
             "status": "rejected",
             "rejected_by": str(current_user["_id"]),
@@ -2016,7 +2029,7 @@ async def reject_pulang_bermalam(
     requester_id = record.get("requested_by")
     if requester_id:
         await db.notifications.insert_one({
-            "user_id": ObjectId(requester_id),
+            "user_id": _id_value(requester_id),
             "title": "Permohonan Pulang Bermalam Ditolak",
             "message": f"Permohonan pulang bermalam untuk {record.get('student_name', '')} telah DITOLAK. Sebab: {reason or 'Tidak dinyatakan'}",
             "type": "warning",

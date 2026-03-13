@@ -353,22 +353,28 @@ async def get_students_stats():
     pending = await db.students.count_documents({"status": "pending"})
     rejected = await db.students.count_documents({"status": "rejected"})
     
-    # Get by form
-    pipeline = [
-        {"$match": {"status": "approved"}},
-        {"$group": {"_id": "$form", "count": {"$sum": 1}}},
-        {"$sort": {"_id": 1}}
-    ]
-    by_form = await db.students.aggregate(pipeline).to_list(10)
+    # Get by form and class
+    form_counts = {}
+    class_counts = {}
+    async for student in db.students.find({"status": "approved"}):
+        form_value = student.get("form")
+        if form_value is not None:
+            form_counts[form_value] = form_counts.get(form_value, 0) + 1
+        class_name = student.get("class_name")
+        if class_name:
+            class_counts[class_name] = class_counts.get(class_name, 0) + 1
+
+    by_form = sorted(
+        [{"_id": form_value, "count": count} for form_value, count in form_counts.items()],
+        key=lambda item: item["_id"],
+    )[:10]
     students_by_form = {str(item["_id"]): item["count"] for item in by_form}
-    
-    # Get by class
-    pipeline_class = [
-        {"$match": {"status": "approved"}},
-        {"$group": {"_id": "$class_name", "count": {"$sum": 1}}},
-        {"$sort": {"count": -1}}
-    ]
-    by_class = await db.students.aggregate(pipeline_class).to_list(20)
+
+    by_class = sorted(
+        [{"_id": class_name, "count": count} for class_name, count in class_counts.items()],
+        key=lambda item: item["count"],
+        reverse=True,
+    )[:20]
     students_by_class = {item["_id"]: item["count"] for item in by_class if item["_id"]}
     
     return {

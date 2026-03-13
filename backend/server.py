@@ -6,6 +6,7 @@ import os
 import uuid
 import asyncio
 import logging
+import contextvars
 from datetime import datetime, timezone, timedelta
 from typing import List, Optional, Dict, Any
 from contextlib import asynccontextmanager
@@ -13,7 +14,7 @@ from bson import ObjectId
 from io import BytesIO
 import base64
 
-from fastapi import FastAPI, HTTPException, Depends, status, Query, Body
+from fastapi import FastAPI, HTTPException, Depends, status, Query, Body, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, Field, EmailStr, validator
@@ -45,6 +46,7 @@ from routes import categories as categories_routes
 from routes import accounting as accounting_routes
 from routes import accounting_full as accounting_full_routes
 from routes import bank_accounts as bank_accounts_routes
+from routes import bank_reconciliation as bank_reconciliation_routes
 from routes import agm_reports as agm_reports_routes
 from routes import yuran as yuran_routes
 from routes import upload as upload_routes
@@ -68,12 +70,22 @@ from routes import discipline as discipline_routes
 from routes import risk as risk_routes
 from routes import email_templates as email_templates_routes
 from routes import pwa as pwa_routes
+from routes import tenant_onboarding as tenant_onboarding_routes
 from models.hostel import DEFAULT_HOSTEL_BLOCKS
 from db.config import DB_ENGINE, is_hybrid_mode, is_postgres_mode
 from db.postgres import init_postgres, close_postgres, get_session_factory
 from repositories.core_store import CoreStore
+from repositories.chatbox_relational_store import adapt_chatbox_read_db
+from repositories.notifications_relational_store import adapt_notifications_read_db
+from repositories.pwa_relational_store import adapt_pwa_read_db
 from repositories.tabung_relational_store import adapt_tabung_read_db
 from repositories.yuran_relational_store import adapt_yuran_read_db
+from services.id_normalizer import object_id_or_none
+from services.tenant_enforcement import (
+    require_user_tenant_context,
+    stamp_tenant_fields as apply_tenant_fields,
+    tenant_enforcement_snapshot,
+)
 
 load_dotenv()
 
@@ -97,12 +109,16 @@ core_db = None
 
 # Background Scheduler
 scheduler = AsyncIOScheduler()
+current_request_ctx: contextvars.ContextVar[Optional[Request]] = contextvars.ContextVar(
+    "current_request_ctx",
+    default=None,
+)
 
 
 async def run_monetization_expiration_job():
     """Background job to expire ads, boosts, and premium subscriptions"""
-    global db
-    if db is None:
+    runtime_db = _runtime_db()
+    if runtime_db is None:
         scheduler_logger.warning("Database not initialized, skipping expiration job")
         return
     
@@ -111,7 +127,7 @@ async def run_monetization_expiration_job():
         expired_counts = {"ads": 0, "boosts": 0, "subscriptions": 0}
         
         # 1. Expire banner ads
-        expired_ads = await db.marketplace_ads.update_many(
+        expired_ads = await runtime_db.marketplace_ads.update_many(
             {
                 "status": "active",
                 "end_date": {"$lt": now}
@@ -121,42 +137,42 @@ async def run_monetization_expiration_job():
         expired_counts["ads"] = expired_ads.modified_count
         
         # 2. Expire product boosts
-        expired_boosts = await db.product_boosts.find({
+        expired_boosts = await runtime_db.product_boosts.find({
             "status": "active",
             "end_date": {"$lt": now}
         }).to_list(500)
         
         for boost in expired_boosts:
-            await db.product_boosts.update_one(
+            await runtime_db.product_boosts.update_one(
                 {"_id": boost["_id"]},
                 {"$set": {"status": "expired"}}
             )
             # Reset product boost status
             if boost.get("boost_type") == "featured":
-                await db.marketplace_products.update_one(
+                await runtime_db.marketplace_products.update_one(
                     {"_id": ObjectId(boost["product_id"])},
                     {"$set": {"is_featured": False, "featured_until": None}}
                 )
             else:
-                await db.marketplace_products.update_one(
+                await runtime_db.marketplace_products.update_one(
                     {"_id": ObjectId(boost["product_id"])},
                     {"$set": {"is_boosted": False, "boost_expires_at": None}}
                 )
         expired_counts["boosts"] = len(expired_boosts)
         
         # 3. Expire premium subscriptions
-        expired_vendors = await db.marketplace_vendors.find({
+        expired_vendors = await runtime_db.marketplace_vendors.find({
             "tier": "premium",
             "premium_expires_at": {"$lt": now}
         }).to_list(500)
         
         for vendor in expired_vendors:
-            await db.marketplace_vendors.update_one(
+            await runtime_db.marketplace_vendors.update_one(
                 {"_id": vendor["_id"]},
                 {"$set": {"tier": "free", "updated_at": now}}
             )
             # Create notification
-            await db.notifications.insert_one({
+            await runtime_db.notifications.insert_one({
                 "user_id": ObjectId(vendor["user_id"]),
                 "title": "Langganan Premium Tamat",
                 "message": "Langganan premium anda telah tamat. Sila langgan semula untuk terus menikmati faedah premium.",
@@ -167,7 +183,7 @@ async def run_monetization_expiration_job():
         expired_counts["subscriptions"] = len(expired_vendors)
         
         # Log scheduler run
-        await db.scheduler_logs.insert_one({
+        await runtime_db.scheduler_logs.insert_one({
             "type": "expire_features",
             "expired_counts": expired_counts,
             "run_at": now,
@@ -183,14 +199,14 @@ async def run_monetization_expiration_job():
 
 async def run_auto_sync_job():
     """Background job to automatically synchronize students and users data"""
-    global db
-    if db is None:
+    runtime_db = _runtime_db()
+    if runtime_db is None:
         scheduler_logger.warning("Database not initialized, skipping auto-sync job")
         return
     
     try:
         # Check if auto-sync is enabled
-        settings = await db.settings.find_one({"type": "auto_sync"})
+        settings = await runtime_db.settings.find_one({"type": "auto_sync"})
         if not settings or not settings.get("enabled", False):
             scheduler_logger.info("Auto-sync is disabled, skipping job")
             return
@@ -204,8 +220,8 @@ async def run_auto_sync_job():
         }
         
         # Step 1: Cleanup orphan pelajar users
-        pelajar_users = await db.users.find({"role": "pelajar"}).to_list(1000)
-        students = await db.students.find({}).to_list(1000)
+        pelajar_users = await runtime_db.users.find({"role": "pelajar"}).to_list(1000)
+        students = await runtime_db.students.find({}).to_list(1000)
         student_matrics = set(s.get("matric_number") for s in students if s.get("matric_number"))
         student_ics = set(s.get("ic_number") for s in students if s.get("ic_number"))
         
@@ -220,20 +236,20 @@ async def run_auto_sync_job():
             
             if not has_matching_student:
                 try:
-                    await db.users.delete_one({"_id": user["_id"]})
+                    await runtime_db.users.delete_one({"_id": user["_id"]})
                     results["orphan_users_deleted"] += 1
                 except Exception as e:
                     results["errors"].append(f"Cleanup error: {str(e)}")
         
         # Step 2: Create user accounts for students without user_id
-        students_without_user = await db.students.find({"user_id": {"$exists": False}}).to_list(1000)
+        students_without_user = await runtime_db.students.find({"user_id": {"$exists": False}}).to_list(1000)
         
         for student in students_without_user:
             try:
-                existing_user = await db.users.find_one({"matric_number": student.get("matric_number")})
+                existing_user = await runtime_db.users.find_one({"matric_number": student.get("matric_number")})
                 
                 if existing_user:
-                    await db.students.update_one(
+                    await runtime_db.students.update_one(
                         {"_id": student["_id"]},
                         {"$set": {"user_id": existing_user["_id"]}}
                     )
@@ -254,8 +270,8 @@ async def run_auto_sync_job():
                         "created_at": datetime.now(timezone.utc).isoformat()
                     }
                     
-                    user_result = await db.users.insert_one(user_doc)
-                    await db.students.update_one(
+                    user_result = await runtime_db.users.insert_one(user_doc)
+                    await runtime_db.students.update_one(
                         {"_id": student["_id"]},
                         {"$set": {"user_id": user_result.inserted_id}}
                     )
@@ -265,24 +281,24 @@ async def run_auto_sync_job():
                 results["errors"].append(f"Sync error: {str(e)}")
         
         # Step 3: Update missing religion fields
-        students_without_religion = await db.students.find({"religion": {"$exists": False}}).to_list(1000)
+        students_without_religion = await runtime_db.students.find({"religion": {"$exists": False}}).to_list(1000)
         for student in students_without_religion:
-            await db.students.update_one(
+            await runtime_db.students.update_one(
                 {"_id": student["_id"]},
                 {"$set": {"religion": "Islam"}}
             )
             results["religion_updated"] += 1
         
-        pelajar_without_religion = await db.users.find({"role": "pelajar", "religion": {"$exists": False}}).to_list(1000)
+        pelajar_without_religion = await runtime_db.users.find({"role": "pelajar", "religion": {"$exists": False}}).to_list(1000)
         for user in pelajar_without_religion:
-            await db.users.update_one(
+            await runtime_db.users.update_one(
                 {"_id": user["_id"]},
                 {"$set": {"religion": "Islam"}}
             )
             results["religion_updated"] += 1
         
         # Log the auto-sync run
-        await db.scheduler_logs.insert_one({
+        await runtime_db.scheduler_logs.insert_one({
             "type": "auto_sync",
             "results": results,
             "run_at": now,
@@ -290,7 +306,7 @@ async def run_auto_sync_job():
         })
         
         # Update last sync time in settings
-        await db.settings.update_one(
+        await runtime_db.settings.update_one(
             {"type": "auto_sync"},
             {"$set": {"last_run": now.isoformat(), "last_results": results}}
         )
@@ -308,7 +324,7 @@ async def run_auto_sync_job():
 async def run_payment_reminder_job():
     """Background job to dispatch due payment reminders as in-app notifications."""
     global core_db, db
-    target_db = core_db or db
+    target_db = adapt_notifications_read_db(core_db or db)
     if target_db is None:
         scheduler_logger.warning("Database not initialized, skipping payment reminder job")
         return
@@ -1031,6 +1047,8 @@ class UserResponse(BaseModel):
     assigned_bus_id: Optional[str] = None  # untuk bus_driver: id bas yang ditugaskan
     staff_id: Optional[str] = None
     matric_number: Optional[str] = None
+    tenant_id: Optional[str] = None
+    tenant_code: Optional[str] = None
     state: Optional[str] = None
     status: Optional[str] = None  # active/inactive
     permissions: List[str] = []
@@ -1404,7 +1422,10 @@ async def load_rbac_from_db():
     """Load RBAC permissions from database into memory"""
     global ROLE_PERMISSIONS
     try:
-        rbac_configs = await db.rbac_config.find({}).to_list(100)
+        runtime_db = _runtime_db()
+        if runtime_db is None:
+            return
+        rbac_configs = await runtime_db.rbac_config.find({}).to_list(100)
         if rbac_configs:
             for config in rbac_configs:
                 role = config.get("role")
@@ -1444,34 +1465,35 @@ async def lifespan(app: FastAPI):
         scheduler_logger.info("Core modules database: MongoDB")
 
     if not strict_postgres_only:
+        mongo_bootstrap_db = db
         # Create indexes
-        await db.users.create_index("email", unique=True)
-        await db.students.create_index("matric_number", unique=True)
-        await db.students.create_index("parent_id")
-        await db.fees.create_index("student_id")
-        await db.payments.create_index("fee_id")
-        await db.audit_logs.create_index("created_at")
-        await db.audit_logs.create_index("module")  # Fasa 9: filter by module (hostel, discipline, escalation, etc.)
-        await db.notifications.create_index("user_id")
-        await db.notifications.create_index([("user_id", 1), ("created_at", -1)])
-        await db.hostel_records.create_index("student_id")
-        await db.movement_logs.create_index("student_id")
-        await db.movement_logs.create_index("created_at")
-        await db.movement_logs.create_index([("student_id", 1), ("created_at", -1)])
-        await db.offences.create_index("student_id")
-        await db.offences.create_index("created_at")
-        await db.offences.create_index("status")
-        await db.olat_cases.create_index("student_id")
-        await db.olat_cases.create_index("offence_id")
-        await db.olat_cases.create_index("created_at")
-        await db.olat_categories.create_index("order")
+        await mongo_bootstrap_db.users.create_index("email", unique=True)
+        await mongo_bootstrap_db.students.create_index("matric_number", unique=True)
+        await mongo_bootstrap_db.students.create_index("parent_id")
+        await mongo_bootstrap_db.fees.create_index("student_id")
+        await mongo_bootstrap_db.payments.create_index("fee_id")
+        await mongo_bootstrap_db.audit_logs.create_index("created_at")
+        await mongo_bootstrap_db.audit_logs.create_index("module")  # Fasa 9: filter by module (hostel, discipline, escalation, etc.)
+        await mongo_bootstrap_db.notifications.create_index("user_id")
+        await mongo_bootstrap_db.notifications.create_index([("user_id", 1), ("created_at", -1)])
+        await mongo_bootstrap_db.hostel_records.create_index("student_id")
+        await mongo_bootstrap_db.movement_logs.create_index("student_id")
+        await mongo_bootstrap_db.movement_logs.create_index("created_at")
+        await mongo_bootstrap_db.movement_logs.create_index([("student_id", 1), ("created_at", -1)])
+        await mongo_bootstrap_db.offences.create_index("student_id")
+        await mongo_bootstrap_db.offences.create_index("created_at")
+        await mongo_bootstrap_db.offences.create_index("status")
+        await mongo_bootstrap_db.olat_cases.create_index("student_id")
+        await mongo_bootstrap_db.olat_cases.create_index("offence_id")
+        await mongo_bootstrap_db.olat_cases.create_index("created_at")
+        await mongo_bootstrap_db.olat_categories.create_index("order")
         # offence_sections: remove duplicates then create unique index (must not crash startup)
         try:
-            await db.offence_sections.drop_index("code_1")
+            await mongo_bootstrap_db.offence_sections.drop_index("code_1")
         except Exception:
             pass
         try:
-            sections = await db.offence_sections.find({}).sort("_id", 1).to_list(500)
+            sections = await mongo_bootstrap_db.offence_sections.find({}).sort("_id", 1).to_list(500)
             seen_codes = set()
             ids_to_delete = []
             for doc in sections:
@@ -1483,41 +1505,41 @@ async def lifespan(app: FastAPI):
                 else:
                     seen_codes.add(code)
             if ids_to_delete:
-                await db.offence_sections.delete_many({"_id": {"$in": ids_to_delete}})
+                await mongo_bootstrap_db.offence_sections.delete_many({"_id": {"$in": ids_to_delete}})
                 scheduler_logger.info("Removed %d duplicate offence_sections", len(ids_to_delete))
         except Exception as e:
             scheduler_logger.warning("offence_sections dedup skip: %s", e)
         try:
-            await db.offence_sections.create_index("code", unique=True)
-            await db.offence_sections.create_index("order")
+            await mongo_bootstrap_db.offence_sections.create_index("code", unique=True)
+            await mongo_bootstrap_db.offence_sections.create_index("order")
         except Exception as e:
             scheduler_logger.warning("offence_sections index skipped (server will run without unique code index): %s", e)
-        await db.sickbay_records.create_index("student_id")
-        await db.vehicles.create_index("plate_number", unique=True)
-        await db.rbac_config.create_index("role", unique=True)
+        await mongo_bootstrap_db.sickbay_records.create_index("student_id")
+        await mongo_bootstrap_db.vehicles.create_index("plate_number", unique=True)
+        await mongo_bootstrap_db.rbac_config.create_index("role", unique=True)
         
         # Create marketplace indexes
-        await db.marketplace_ads.create_index("status")
-        await db.marketplace_ads.create_index("end_date")
-        await db.product_boosts.create_index([("status", 1), ("end_date", 1)])
-        await db.marketplace_vendors.create_index([("tier", 1), ("premium_expires_at", 1)])
-        await db.scheduler_logs.create_index("run_at")
-        await db.payment_reminders.create_index([("user_id", 1), ("status", 1), ("remind_at", 1)])
-        await db.payment_reminders.create_index("remind_at")
-        await db.payment_reminder_preferences.create_index("user_id", unique=True)
+        await mongo_bootstrap_db.marketplace_ads.create_index("status")
+        await mongo_bootstrap_db.marketplace_ads.create_index("end_date")
+        await mongo_bootstrap_db.product_boosts.create_index([("status", 1), ("end_date", 1)])
+        await mongo_bootstrap_db.marketplace_vendors.create_index([("tier", 1), ("premium_expires_at", 1)])
+        await mongo_bootstrap_db.scheduler_logs.create_index("run_at")
+        await mongo_bootstrap_db.payment_reminders.create_index([("user_id", 1), ("status", 1), ("remind_at", 1)])
+        await mongo_bootstrap_db.payment_reminders.create_index("remind_at")
+        await mongo_bootstrap_db.payment_reminder_preferences.create_index("user_id", unique=True)
         # Yuran list performance indexes (supports admin list at 100K+ scale)
-        await db.student_yuran.create_index([("tahun", -1), ("tingkatan", 1), ("student_name", 1)])
-        await db.student_yuran.create_index([("tahun", -1), ("status", 1), ("tingkatan", 1)])
-        await db.student_yuran.create_index("status")
-        await db.student_yuran.create_index("tingkatan")
-        await db.student_yuran.create_index("student_id")
-        await db.student_yuran.create_index("parent_id")
-        await db.student_yuran.create_index("matric_number")
-        await db.student_yuran.create_index("billing_mode")
-        await db.hostel_blocks.create_index("code", unique=True)
-        await db.email_templates.create_index("template_key", unique=True)
-        await db.password_reset_tokens.create_index("token", unique=True)
-        await db.password_reset_tokens.create_index("expires_at")
+        await mongo_bootstrap_db.student_yuran.create_index([("tahun", -1), ("tingkatan", 1), ("student_name", 1)])
+        await mongo_bootstrap_db.student_yuran.create_index([("tahun", -1), ("status", 1), ("tingkatan", 1)])
+        await mongo_bootstrap_db.student_yuran.create_index("status")
+        await mongo_bootstrap_db.student_yuran.create_index("tingkatan")
+        await mongo_bootstrap_db.student_yuran.create_index("student_id")
+        await mongo_bootstrap_db.student_yuran.create_index("parent_id")
+        await mongo_bootstrap_db.student_yuran.create_index("matric_number")
+        await mongo_bootstrap_db.student_yuran.create_index("billing_mode")
+        await mongo_bootstrap_db.hostel_blocks.create_index("code", unique=True)
+        await mongo_bootstrap_db.email_templates.create_index("template_key", unique=True)
+        await mongo_bootstrap_db.password_reset_tokens.create_index("token", unique=True)
+        await mongo_bootstrap_db.password_reset_tokens.create_index("expires_at")
     else:
         scheduler_logger.info("MongoDB bootstrap/index setup skipped (PostgreSQL-only mode)")
     
@@ -1551,11 +1573,14 @@ async def lifespan(app: FastAPI):
     scheduler_logger.info(
         "Background scheduler started - monetization expiration (hourly), auto-sync (daily), payment reminders (5 min)"
     )
+    runtime_db = _runtime_db()
+    if runtime_db is None:
+        raise RuntimeError("Runtime database is not initialized")
     
     # Initialize auto-sync settings if not exists
-    auto_sync_settings = await db.settings.find_one({"type": "auto_sync"})
+    auto_sync_settings = await runtime_db.settings.find_one({"type": "auto_sync"})
     if not auto_sync_settings:
-        await db.settings.insert_one({
+        await runtime_db.settings.insert_one({
             "type": "auto_sync",
             "enabled": True,
             "interval_hours": 24,
@@ -1565,10 +1590,10 @@ async def lifespan(app: FastAPI):
         })
     
     # Seed RBAC default config if not exists
-    rbac_count = await db.rbac_config.count_documents({})
+    rbac_count = await runtime_db.rbac_config.count_documents({})
     if rbac_count == 0:
         for role, permissions in DEFAULT_ROLE_PERMISSIONS.items():
-            await db.rbac_config.insert_one({
+            await runtime_db.rbac_config.insert_one({
                 "role": role,
                 "permissions": permissions,
                 "created_at": datetime.now(timezone.utc).isoformat(),
@@ -1581,10 +1606,10 @@ async def lifespan(app: FastAPI):
     auth_routes.init_db(core_db, ROLES, ROLE_PERMISSIONS)
     
     # Seed default hostel blocks if empty (sync dengan tetapan Asrama)
-    if await db.hostel_blocks.count_documents({}) == 0:
+    if await runtime_db.hostel_blocks.count_documents({}) == 0:
         now = datetime.now(timezone.utc).isoformat()
         for b in DEFAULT_HOSTEL_BLOCKS:
-            await db.hostel_blocks.insert_one({
+            await runtime_db.hostel_blocks.insert_one({
                 "code": b["code"],
                 "name": b["name"],
                 "gender": b["gender"],
@@ -1685,10 +1710,10 @@ async def lifespan(app: FastAPI):
         {"template_key": "test_email", "name": "E-mel Ujian", "description": "E-mel ujian konfigurasi", "subject": "Email Ujian - Portal MRSMKU", "body_html": "<p>Konfigurasi e-mel berfungsi. Masa: {{timestamp}}.</p><p>Portal MRSMKU</p>", "variables": ["timestamp"], "is_active": True},
     ]
     for t in _default_email_templates:
-        existing = await db.email_templates.find_one({"template_key": t["template_key"]})
+        existing = await runtime_db.email_templates.find_one({"template_key": t["template_key"]})
         if not existing:
             now_et = datetime.now(timezone.utc).isoformat()
-            await db.email_templates.insert_one({**t, "created_at": now_et, "updated_at": now_et})
+            await runtime_db.email_templates.insert_one({**t, "created_at": now_et, "updated_at": now_et})
             continue
         if t["template_key"] == "fee_reminder":
             now_et = datetime.now(timezone.utc).isoformat()
@@ -1709,7 +1734,7 @@ async def lifespan(app: FastAPI):
                 })
             if update_doc:
                 update_doc["updated_at"] = now_et
-                await db.email_templates.update_one({"_id": existing["_id"]}, {"$set": update_doc})
+                await runtime_db.email_templates.update_one({"_id": existing["_id"]}, {"$set": update_doc})
     scheduler_logger.info("Email templates ready")
 
     # Seed chatbox FAQ, responses & suggestions (sekali sahaja; elak data duplicate & panggilan berulang)
@@ -1725,7 +1750,7 @@ async def lifespan(app: FastAPI):
         "is_active": True,
         "created_at": datetime.now(timezone.utc).isoformat()
     }
-    result = await db.users.update_one(
+    result = await runtime_db.users.update_one(
         {"email": "superadmin@muafakat.link"},
         {"$set": {
             "password": superadmin_doc["password"],
@@ -1736,12 +1761,12 @@ async def lifespan(app: FastAPI):
         }}
     )
     if result.matched_count == 0:
-        await db.users.insert_one(superadmin_doc)
+        await runtime_db.users.insert_one(superadmin_doc)
 
     # Seed Admin
-    admin = await db.users.find_one({"email": "admin@muafakat.link"})
+    admin = await runtime_db.users.find_one({"email": "admin@muafakat.link"})
     if not admin:
-        await db.users.insert_one({
+        await runtime_db.users.insert_one({
             "email": "admin@muafakat.link",
             "password": pwd_context.hash("admin123"),
             "full_name": "Admin MRSMKU",
@@ -1752,9 +1777,9 @@ async def lifespan(app: FastAPI):
         })
 
     # Seed Admin Bas (urus modul bas sepenuhnya)
-    bus_admin_user = await db.users.find_one({"email": "busadmin@muafakat.link"})
+    bus_admin_user = await runtime_db.users.find_one({"email": "busadmin@muafakat.link"})
     if not bus_admin_user:
-        await db.users.insert_one({
+        await runtime_db.users.insert_one({
             "email": "busadmin@muafakat.link",
             "password": pwd_context.hash("busadmin123"),
             "full_name": "Pentadbir Bas MRSMKU",
@@ -1765,9 +1790,9 @@ async def lifespan(app: FastAPI):
         })
 
     # Seed Driver Bas (assigned_bus_id boleh diset oleh admin kemudian)
-    driver_user = await db.users.find_one({"email": "driver@muafakat.link"})
+    driver_user = await runtime_db.users.find_one({"email": "driver@muafakat.link"})
     if not driver_user:
-        await db.users.insert_one({
+        await runtime_db.users.insert_one({
             "email": "driver@muafakat.link",
             "password": pwd_context.hash("driver123"),
             "full_name": "Driver Bas Demo",
@@ -1779,18 +1804,18 @@ async def lifespan(app: FastAPI):
 
     # Seed data demo modul bas jika tiada syarikat demo (supaya /bus-admin/company ada data)
     try:
-        demo_count = await db.bus_companies.count_documents({"created_by": "seed_bus_data"})
+        demo_count = await runtime_db.bus_companies.count_documents({"created_by": "seed_bus_data"})
         if demo_count == 0:
             from seed_bus_data import seed_bus_data_into
-            await seed_bus_data_into(db, silent=True)
+            await seed_bus_data_into(runtime_db, silent=True)
     except Exception as e:
         import logging
         logging.getLogger("uvicorn.error").warning("Bus seed on startup skipped: %s", e)
 
     # Seed Bendahari
-    bendahari = await db.users.find_one({"email": "bendahari@muafakat.link"})
+    bendahari = await runtime_db.users.find_one({"email": "bendahari@muafakat.link"})
     if not bendahari:
-        await db.users.insert_one({
+        await runtime_db.users.insert_one({
             "email": "bendahari@muafakat.link",
             "password": pwd_context.hash("bendahari123"),
             "full_name": "Bendahari MRSMKU",
@@ -1813,17 +1838,17 @@ async def lifespan(app: FastAPI):
     ]
     
     for staff in sample_staff:
-        existing = await db.users.find_one({"email": staff["email"]})
+        existing = await runtime_db.users.find_one({"email": staff["email"]})
         if not existing:
             staff["password"] = pwd_context.hash(staff["password"])
             staff["is_active"] = True
             staff["created_at"] = datetime.now(timezone.utc).isoformat()
-            await db.users.insert_one(staff)
+            await runtime_db.users.insert_one(staff)
     
     # Seed Demo Student (Pelajar) — pastikan sentiasa ada dalam database sebenar (upsert)
-    demo_student_user = await db.users.find_one({"matric_number": "M2024001"})
+    demo_student_user = await runtime_db.users.find_one({"matric_number": "M2024001"})
     if not demo_student_user:
-        demo_student_user = await db.users.insert_one({
+        demo_student_user = await runtime_db.users.insert_one({
             "email": "pelajar@muafakat.link",
             "password": pwd_context.hash("pelajar123"),
             "full_name": "Ahmad bin Abu",
@@ -1837,7 +1862,7 @@ async def lifespan(app: FastAPI):
         user_id = demo_student_user.inserted_id
     else:
         user_id = demo_student_user["_id"]
-    demo_parent = await db.users.find_one({"role": "parent"})
+    demo_parent = await runtime_db.users.find_one({"role": "parent"})
     parent_id = demo_parent["_id"] if demo_parent else user_id
     demo_student_doc = {
         "full_name": "Ahmad bin Abu",
@@ -1855,11 +1880,11 @@ async def lifespan(app: FastAPI):
         "user_id": user_id,
         "created_at": datetime.now(timezone.utc).isoformat()
     }
-    existing_demo_record = await db.students.find_one({"matric_number": "M2024001"})
+    existing_demo_record = await runtime_db.students.find_one({"matric_number": "M2024001"})
     if not existing_demo_record:
-        await db.students.insert_one(demo_student_doc)
+        await runtime_db.students.insert_one(demo_student_doc)
     else:
-        await db.students.update_one(
+        await runtime_db.students.update_one(
             {"matric_number": "M2024001"},
             {"$set": {"block_name": "JA", "gender": "lelaki", "room_number": "101", "status": "approved", "full_name": "Ahmad bin Abu"}}
         )
@@ -1879,9 +1904,9 @@ async def lifespan(app: FastAPI):
     ]
     
     for student in sample_students:
-        existing_user = await db.users.find_one({"matric_number": student["matric"]})
+        existing_user = await runtime_db.users.find_one({"matric_number": student["matric"]})
         if not existing_user:
-            await db.users.insert_one({
+            await runtime_db.users.insert_one({
                 "email": f"{student['matric'].lower()}@pelajar.mrsm.edu.my",
                 "password": pwd_context.hash("student123"),
                 "full_name": student["name"],
@@ -1892,13 +1917,13 @@ async def lifespan(app: FastAPI):
                 "is_active": True,
                 "created_at": datetime.now(timezone.utc).isoformat()
             })
-        usr = await db.users.find_one({"matric_number": student["matric"]})
+        usr = await runtime_db.users.find_one({"matric_number": student["matric"]})
         user_id = usr["_id"]
-        demo_parent = await db.users.find_one({"role": "parent"})
+        demo_parent = await runtime_db.users.find_one({"role": "parent"})
         parent_id = demo_parent["_id"] if demo_parent else user_id
-        existing_record = await db.students.find_one({"matric_number": student["matric"]})
+        existing_record = await runtime_db.students.find_one({"matric_number": student["matric"]})
         if not existing_record:
-            await db.students.insert_one({
+            await runtime_db.students.insert_one({
                 "full_name": student["name"],
                 "matric_number": student["matric"],
                 "ic_number": student["ic"],
@@ -1915,7 +1940,7 @@ async def lifespan(app: FastAPI):
                 "created_at": datetime.now(timezone.utc).isoformat()
             })
         else:
-            await db.students.update_one(
+            await runtime_db.students.update_one(
                 {"matric_number": student["matric"]},
                 {"$set": {
                     "block_name": student["block"],
@@ -1927,30 +1952,30 @@ async def lifespan(app: FastAPI):
             )
     
     # Seed: setiap ibu bapa 2 anak + sample student_yuran (data sebenar)
-    parent1 = await db.users.find_one({"email": "parent@muafakat.link", "role": "parent"})
-    parent2 = await db.users.find_one({"email": "parent2@muafakat.link", "role": "parent"})
+    parent1 = await runtime_db.users.find_one({"email": "parent@muafakat.link", "role": "parent"})
+    parent2 = await runtime_db.users.find_one({"email": "parent2@muafakat.link", "role": "parent"})
     if parent1 and parent2:
         # Parent 1: 2 anak (M2024001 Ahmad, S2026001 Aiman)
         for matric, name in [("M2024001", "Ahmad bin Abu"), ("S2026001", "Aiman bin Razali")]:
-            await db.students.update_one(
+            await runtime_db.students.update_one(
                 {"matric_number": matric},
                 {"$set": {"parent_id": parent1["_id"], "status": "approved", "full_name": name}}
             )
         # Parent 2: 2 anak (S2026002, S2026003)
         for matric, name in [("S2026002", "Nurul Aisyah bt Ahmad"), ("S2026003", "Muhammad Arif bin Ismail")]:
-            await db.students.update_one(
+            await runtime_db.students.update_one(
                 {"matric_number": matric},
                 {"$set": {"parent_id": parent2["_id"], "status": "approved", "full_name": name}}
             )
         # Sample student_yuran untuk setiap anak (supaya ada tertunggak)
         for parent_id, matrics in [(parent1["_id"], ["M2024001", "S2026001"]), (parent2["_id"], ["S2026002", "S2026003"])]:
             for matric in matrics:
-                child = await db.students.find_one({"matric_number": matric, "parent_id": parent_id})
+                child = await runtime_db.students.find_one({"matric_number": matric, "parent_id": parent_id})
                 if not child:
                     continue
-                existing = await db.student_yuran.find_one({"student_id": child["_id"]})
+                existing = await runtime_db.student_yuran.find_one({"student_id": child["_id"]})
                 if not existing:
-                    await db.student_yuran.insert_one({
+                    await runtime_db.student_yuran.insert_one({
                         "student_id": child["_id"],
                         "parent_id": parent_id,
                         "student_name": child.get("full_name", ""),
@@ -1965,7 +1990,7 @@ async def lifespan(app: FastAPI):
                     })
     
     # Seed Donation Campaigns
-    campaigns_count = await db.donation_campaigns.count_documents({})
+    campaigns_count = await runtime_db.donation_campaigns.count_documents({})
     if campaigns_count == 0:
         sample_campaigns = [
             {
@@ -2021,7 +2046,7 @@ async def lifespan(app: FastAPI):
                 "created_at": datetime.now(timezone.utc).isoformat()
             }
         ]
-        await db.donation_campaigns.insert_many(sample_campaigns)
+        await runtime_db.donation_campaigns.insert_many(sample_campaigns)
     
     yield
     
@@ -2056,6 +2081,17 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+@app.middleware("http")
+async def bind_request_context(request: Request, call_next):
+    """Expose current request to legacy auth wrappers via context var."""
+    token = current_request_ctx.set(request)
+    try:
+        return await call_next(request)
+    finally:
+        current_request_ctx.reset(token)
+
+
 # ============ HELPERS ============
 
 def create_access_token(data: dict):
@@ -2064,17 +2100,77 @@ def create_access_token(data: dict):
     to_encode.update({"exp": expire})
     return jwt.encode(to_encode, JWT_SECRET, algorithm=JWT_ALGORITHM)
 
-async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
+
+def _id_value(value: Any) -> Any:
+    """Normalize ID-like inputs while supporting non-ObjectId IDs."""
+    if value is None:
+        return None
+    if isinstance(value, ObjectId):
+        return value
+    text = str(value).strip()
+    if not text:
+        return text
+    try:
+        if ObjectId.is_valid(text):
+            return object_id_or_none(text)
+    except Exception:
+        pass
+    return text
+
+
+async def _attach_user_tenant_context(user: Optional[dict]) -> Optional[dict]:
+    if not user:
+        return user
+    if user.get("tenant_id"):
+        if user.get("tenant_code"):
+            return user
+        tenant = await _runtime_db().tenants.find_one({"_id": _id_value(user.get("tenant_id"))})
+        if tenant:
+            user["tenant_code"] = tenant.get("tenant_code", user.get("tenant_code"))
+        return user
+
+    user_id_text = str(user.get("_id", "")).strip()
+    if not user_id_text:
+        return user
+
+    memberships = await (
+        _runtime_db()
+        .tenant_user_memberships.find(
+            {"user_id": user_id_text, "status": {"$in": ["active", "invited"]}}
+        )
+        .sort([("is_primary", -1), ("updated_at", -1), ("created_at", -1)])
+        .limit(1)
+        .to_list(1)
+    )
+    membership = memberships[0] if memberships else None
+    if membership:
+        user["tenant_id"] = membership.get("tenant_id")
+        user["tenant_code"] = membership.get("tenant_code")
+    return user
+
+
+async def get_current_user(
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+    request: Request = None,
+):
+    request = request or current_request_ctx.get()
     try:
         payload = jwt.decode(credentials.credentials, JWT_SECRET, algorithms=[JWT_ALGORITHM])
         user_id = payload.get("sub")
         if not user_id:
             raise HTTPException(status_code=401, detail="Token tidak sah")
-        user = await db.users.find_one({"_id": ObjectId(user_id)})
+        user = await _runtime_db().users.find_one({"_id": _id_value(user_id)})
         if not user:
             raise HTTPException(status_code=401, detail="Pengguna tidak dijumpai")
         if not user.get("is_active", True):
             raise HTTPException(status_code=403, detail="Akaun tidak aktif")
+        user = await _attach_user_tenant_context(user)
+        require_user_tenant_context(
+            user,
+            detail="Tenant context pengguna tidak lengkap. Sila hubungi superadmin institusi.",
+        )
+        if request is not None:
+            await _enforce_module_access_for_request(request, user)
         return user
     except JWTError:
         raise HTTPException(status_code=401, detail="Token tidak sah")
@@ -2089,8 +2185,13 @@ async def get_current_user_optional(credentials: Optional[HTTPAuthorizationCrede
         user_id = payload.get("sub")
         if not user_id:
             return None
-        user = await db.users.find_one({"_id": ObjectId(user_id)})
+        user = await _runtime_db().users.find_one({"_id": _id_value(user_id)})
         if not user or not user.get("is_active", True):
+            return None
+        user = await _attach_user_tenant_context(user)
+        try:
+            require_user_tenant_context(user)
+        except HTTPException:
             return None
         return user
     except Exception:
@@ -2122,15 +2223,17 @@ def require_roles(*roles):
 # Audit logs: semua tindakan disimpan dengan timestamp (created_at), immutable (tiada update/delete),
 # dan boleh ditelusur untuk rollback. GET /api/audit-logs untuk superadmin/admin (filter by module).
 async def log_audit(user: dict, action: str, module: str, details: str):
-    await db.audit_logs.insert_one({
+    doc = {
         "user_id": user["_id"],
         "user_name": user.get("full_name", "Unknown"),
         "user_role": user.get("role", "unknown"),
         "action": action,
         "module": module,
         "details": details,
-        "created_at": datetime.now(timezone.utc).isoformat()
-    })
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    apply_tenant_fields(doc, user)
+    await _runtime_db().audit_logs.insert_one(doc)
 
 def serialize_user(user: dict) -> UserResponse:
     role = user.get("role", "parent")
@@ -2152,6 +2255,8 @@ def serialize_user(user: dict) -> UserResponse:
         assigned_bus_id=str(v) if (v := user.get("assigned_bus_id")) is not None else None,
         staff_id=user.get("staff_id"),
         matric_number=user.get("matric_number", user.get("matric", "")),
+        tenant_id=(str(v) if (v := user.get("tenant_id")) is not None else None),
+        tenant_code=user.get("tenant_code"),
         state=user.get("state"),
         status=user.get("status", "active"),
         permissions=permissions if "*" not in permissions else ["*"]
@@ -2261,9 +2366,20 @@ def serialize_fee_package(package: dict) -> FeePackageResponse:
         categories=categories,
         total_amount=total_amount,
         is_active=package.get("is_active", True),
-        created_at=package.get("created_at", ""),
+        created_at=_as_iso_str(package.get("created_at")),
         created_by=package.get("created_by")
     )
+
+def _as_optional_iso_str(value):
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.isoformat()
+    return str(value)
+
+def _as_iso_str(value) -> str:
+    normalized = _as_optional_iso_str(value)
+    return normalized if normalized is not None else ""
 
 def serialize_payment(payment: dict) -> PaymentResponse:
     return PaymentResponse(
@@ -2273,7 +2389,7 @@ def serialize_payment(payment: dict) -> PaymentResponse:
         payment_method=payment["payment_method"],
         status=payment["status"],
         receipt_number=payment["receipt_number"],
-        created_at=payment["created_at"]
+        created_at=_as_iso_str(payment.get("created_at"))
     )
 
 def serialize_notification(notification: dict) -> NotificationResponse:
@@ -2284,7 +2400,7 @@ def serialize_notification(notification: dict) -> NotificationResponse:
         message=notification["message"],
         type=notification["type"],
         is_read=notification["is_read"],
-        created_at=notification["created_at"]
+        created_at=_as_iso_str(notification.get("created_at"))
     )
 
 def serialize_audit(audit: dict) -> AuditLogResponse:
@@ -2297,7 +2413,7 @@ def serialize_audit(audit: dict) -> AuditLogResponse:
         module=audit["module"],
         details=audit["details"],
         ip_address=audit.get("ip_address"),
-        created_at=audit["created_at"]
+        created_at=_as_iso_str(audit.get("created_at"))
     )
 
 # ============ AUTH ROUTES (disatukan dalam routes/auth.py) ============
@@ -2339,7 +2455,8 @@ async def get_rbac_modules(current_user: dict = Depends(require_roles("superadmi
 @app.get("/api/rbac/config")
 async def get_rbac_config(current_user: dict = Depends(require_roles("superadmin"))):
     """Get current RBAC configuration for all roles"""
-    rbac_configs = await db.rbac_config.find({}).to_list(100)
+    runtime_db = _runtime_db()
+    rbac_configs = await runtime_db.rbac_config.find({}).to_list(100)
     
     result = {}
     for config in rbac_configs:
@@ -2371,7 +2488,7 @@ async def get_role_rbac_config(role: str, current_user: dict = Depends(require_r
     if role not in ROLES:
         raise HTTPException(status_code=404, detail="Role tidak dijumpai")
     
-    config = await db.rbac_config.find_one({"role": role})
+    config = await _runtime_db().rbac_config.find_one({"role": role})
     if not config:
         permissions = DEFAULT_ROLE_PERMISSIONS.get(role, [])
     else:
@@ -2410,7 +2527,7 @@ async def update_role_rbac_config(
     valid_permissions = [p for p in request.permissions if p in all_valid_permissions]
     
     # Update database
-    await db.rbac_config.update_one(
+    await _runtime_db().rbac_config.update_one(
         {"role": role},
         {
             "$set": {
@@ -2457,7 +2574,7 @@ async def reset_role_rbac_config(
     default_permissions = DEFAULT_ROLE_PERMISSIONS.get(role, [])
     
     # Update database
-    await db.rbac_config.update_one(
+    await _runtime_db().rbac_config.update_one(
         {"role": role},
         {
             "$set": {
@@ -2500,13 +2617,14 @@ async def reset_role_rbac_config(
 @app.post("/api/students", response_model=StudentResponse)
 async def create_student(student_data: StudentCreate, current_user: dict = Depends(get_current_user)):
     """Register new student (by parent). Kelas mesti dari Senarai Kelas dalam Tetapan."""
+    runtime_db = _runtime_db()
     valid_kelas = await _get_valid_kelas_list()
     if student_data.class_name not in valid_kelas:
         raise HTTPException(
             status_code=400,
             detail=f"Kelas mesti salah satu dari Senarai Kelas: {', '.join(valid_kelas)}. Sila pilih dari dropdown atau kemaskini Senarai Kelas di Tetapan > Data Pelajar."
         )
-    existing = await db.students.find_one({"matric_number": student_data.matric_number})
+    existing = await runtime_db.students.find_one({"matric_number": student_data.matric_number})
     if existing:
         raise HTTPException(status_code=400, detail="Nombor matrik sudah didaftarkan")
     
@@ -2532,13 +2650,13 @@ async def create_student(student_data: StudentCreate, current_user: dict = Depen
         "parent_id": current_user["_id"],
         "created_at": datetime.now(timezone.utc).isoformat()
     }
-    result = await db.students.insert_one(student_doc)
+    result = await runtime_db.students.insert_one(student_doc)
     student_doc["_id"] = result.inserted_id
     
     # Notify admins
-    admins = await db.users.find({"role": {"$in": ["admin", "superadmin"]}}).to_list(100)
+    admins = await runtime_db.users.find({"role": {"$in": ["admin", "superadmin"]}}).to_list(100)
     for admin in admins:
-        await db.notifications.insert_one({
+        await runtime_db.notifications.insert_one({
             "user_id": admin["_id"],
             "title": "Pendaftaran Pelajar Baru",
             "message": f"Pelajar {student_data.full_name} ({student_data.matric_number}) menunggu pengesahan.",
@@ -2562,6 +2680,7 @@ async def get_students(
     current_user: dict = Depends(get_current_user)
 ):
     """Get students based on role with optional pagination"""
+    runtime_db = _runtime_db()
     query = {}
     
     if current_user["role"] == "parent":
@@ -2586,11 +2705,11 @@ async def get_students(
     
     # If pagination is requested, return paginated response
     if page is not None and limit is not None:
-        total = await db.students.count_documents(query)
+        total = await runtime_db.students.count_documents(query)
         skip = (page - 1) * limit
         total_pages = (total + limit - 1) // limit if total > 0 else 1
         
-        students = await db.students.find(query).sort("full_name", 1).skip(skip).limit(limit).to_list(limit)
+        students = await runtime_db.students.find(query).sort("full_name", 1).skip(skip).limit(limit).to_list(limit)
         
         return {
             "students": [serialize_student(s) for s in students],
@@ -2605,7 +2724,7 @@ async def get_students(
         }
     
     # For backward compatibility, return list (limited to 200 for safety)
-    students = await db.students.find(query).sort("full_name", 1).to_list(200)
+    students = await runtime_db.students.find(query).sort("full_name", 1).to_list(200)
     return [serialize_student(s) for s in students]
 
 @app.get("/api/admin/students")
@@ -2620,6 +2739,7 @@ async def get_admin_students(
     current_user: dict = Depends(require_roles("superadmin", "admin", "bendahari", "sub_bendahari"))
 ):
     """Get all students with search and pagination for admin"""
+    runtime_db = _runtime_db()
     query = {}
     
     # Apply search filter
@@ -2644,14 +2764,14 @@ async def get_admin_students(
         query["block_name"] = block_name
     
     # Get total count
-    total = await db.students.count_documents(query)
+    total = await runtime_db.students.count_documents(query)
     
     # Calculate pagination
     skip = (page - 1) * limit
     total_pages = (total + limit - 1) // limit if total > 0 else 1
     
     # Get paginated students
-    students = await db.students.find(query).sort("created_at", -1).skip(skip).limit(limit).to_list(limit)
+    students = await runtime_db.students.find(query).sort("created_at", -1).skip(skip).limit(limit).to_list(limit)
     
     return {
         "students": [serialize_student(s) for s in students],
@@ -2668,7 +2788,7 @@ async def get_admin_students(
 @app.get("/api/students/{student_id}", response_model=StudentResponse)
 async def get_student(student_id: str, current_user: dict = Depends(get_current_user)):
     """Get single student"""
-    student = await db.students.find_one({"_id": ObjectId(student_id)})
+    student = await _runtime_db().students.find_one({"_id": ObjectId(student_id)})
     if not student:
         raise HTTPException(status_code=404, detail="Pelajar tidak dijumpai")
     
@@ -2684,11 +2804,12 @@ async def approve_student(
     current_user: dict = Depends(require_roles("superadmin", "admin"))
 ):
     """Approve student registration"""
-    student = await db.students.find_one({"_id": ObjectId(student_id)})
+    runtime_db = _runtime_db()
+    student = await runtime_db.students.find_one({"_id": ObjectId(student_id)})
     if not student:
         raise HTTPException(status_code=404, detail="Pelajar tidak dijumpai")
     
-    await db.students.update_one(
+    await runtime_db.students.update_one(
         {"_id": ObjectId(student_id)},
         {"$set": {"status": "approved", "approved_by": str(current_user["_id"]), "approved_at": datetime.now(timezone.utc).isoformat()}}
     )
@@ -2719,7 +2840,7 @@ async def approve_student(
         "form": student["form"],
         "created_at": datetime.now(timezone.utc).isoformat()
     }
-    await db.fees.insert_one(muafakat_doc)
+    await runtime_db.fees.insert_one(muafakat_doc)
     
     # 2. Koperasi - RM110.00 (Dobi RM10 x 11 bulan)
     koperasi_items = [
@@ -2740,10 +2861,10 @@ async def approve_student(
         "form": student["form"],
         "created_at": datetime.now(timezone.utc).isoformat()
     }
-    await db.fees.insert_one(koperasi_doc)
+    await runtime_db.fees.insert_one(koperasi_doc)
     
     # Notify parent
-    await db.notifications.insert_one({
+    await runtime_db.notifications.insert_one({
         "user_id": student["parent_id"],
         "title": "Pelajar Disahkan",
         "message": f"Pendaftaran {student['full_name']} telah disahkan. Yuran telah dijana.",
@@ -2762,16 +2883,17 @@ async def reject_student(
     current_user: dict = Depends(require_roles("superadmin", "admin"))
 ):
     """Reject student registration"""
-    student = await db.students.find_one({"_id": ObjectId(student_id)})
+    runtime_db = _runtime_db()
+    student = await runtime_db.students.find_one({"_id": ObjectId(student_id)})
     if not student:
         raise HTTPException(status_code=404, detail="Pelajar tidak dijumpai")
     
-    await db.students.update_one(
+    await runtime_db.students.update_one(
         {"_id": ObjectId(student_id)},
         {"$set": {"status": "rejected", "rejected_by": str(current_user["_id"]), "rejected_at": datetime.now(timezone.utc).isoformat()}}
     )
     
-    await db.notifications.insert_one({
+    await runtime_db.notifications.insert_one({
         "user_id": student["parent_id"],
         "title": "Pendaftaran Ditolak",
         "message": f"Pendaftaran {student['full_name']} telah ditolak. Sila hubungi pejabat MRSMKU.",
@@ -2791,7 +2913,8 @@ async def update_student(
     current_user: dict = Depends(get_current_user)
 ):
     """Update student information"""
-    student = await db.students.find_one({"_id": ObjectId(student_id)})
+    runtime_db = _runtime_db()
+    student = await runtime_db.students.find_one({"_id": ObjectId(student_id)})
     if not student:
         raise HTTPException(status_code=404, detail="Pelajar tidak dijumpai")
     
@@ -2847,7 +2970,7 @@ async def update_student(
     if student_data.city is not None:
         update_data["city"] = student_data.city
     
-    await db.students.update_one({"_id": ObjectId(student_id)}, {"$set": update_data})
+    await runtime_db.students.update_one({"_id": ObjectId(student_id)}, {"$set": update_data})
     
     # Also update user record if exists
     if student.get("user_id"):
@@ -2861,25 +2984,26 @@ async def update_student(
         if student_data.phone is not None:
             user_update["phone"] = student_data.phone
         if user_update:
-            await db.users.update_one({"_id": student["user_id"]}, {"$set": user_update})
+            await runtime_db.users.update_one({"_id": student["user_id"]}, {"$set": user_update})
     
     await log_audit(current_user, "UPDATE_STUDENT", "students", f"Kemaskini pelajar: {student.get('full_name', 'Unknown')}")
     
-    updated = await db.students.find_one({"_id": ObjectId(student_id)})
+    updated = await runtime_db.students.find_one({"_id": ObjectId(student_id)})
     return serialize_student(updated)
 
 @app.delete("/api/students/{student_id}")
 async def delete_student(student_id: str, current_user: dict = Depends(get_current_user)):
     """Delete student"""
-    student = await db.students.find_one({"_id": ObjectId(student_id)})
+    runtime_db = _runtime_db()
+    student = await runtime_db.students.find_one({"_id": ObjectId(student_id)})
     if not student:
         raise HTTPException(status_code=404, detail="Pelajar tidak dijumpai")
     
     if current_user["role"] == "parent" and str(student["parent_id"]) != str(current_user["_id"]):
         raise HTTPException(status_code=403, detail="Akses ditolak")
     
-    await db.fees.delete_many({"student_id": ObjectId(student_id)})
-    await db.students.delete_one({"_id": ObjectId(student_id)})
+    await runtime_db.fees.delete_many({"student_id": ObjectId(student_id)})
+    await runtime_db.students.delete_one({"_id": ObjectId(student_id)})
     
     await log_audit(current_user, "DELETE_STUDENT", "students", f"Padam pelajar: {student['full_name']}")
     
@@ -2892,17 +3016,18 @@ async def get_sync_status(
     current_user: dict = Depends(require_roles("superadmin", "admin"))
 ):
     """Get data synchronization status between users and students"""
+    runtime_db = _runtime_db()
     # Get counts
-    total_users = await db.users.count_documents({})
-    pelajar_users = await db.users.count_documents({"role": "pelajar"})
-    parent_users = await db.users.count_documents({"role": "parent"})
-    total_students = await db.students.count_documents({})
+    total_users = await runtime_db.users.count_documents({})
+    pelajar_users = await runtime_db.users.count_documents({"role": "pelajar"})
+    parent_users = await runtime_db.users.count_documents({"role": "parent"})
+    total_students = await runtime_db.students.count_documents({})
     
     # Find issues
-    students_without_user = await db.students.count_documents({"user_id": {"$exists": False}})
-    students_without_religion = await db.students.count_documents({"religion": {"$exists": False}})
-    pelajar_without_religion = await db.users.count_documents({"role": "pelajar", "religion": {"$exists": False}})
-    orphan_students = await db.students.count_documents({"parent_id": {"$exists": False}})
+    students_without_user = await runtime_db.students.count_documents({"user_id": {"$exists": False}})
+    students_without_religion = await runtime_db.students.count_documents({"religion": {"$exists": False}})
+    pelajar_without_religion = await runtime_db.users.count_documents({"role": "pelajar", "religion": {"$exists": False}})
+    orphan_students = await runtime_db.students.count_documents({"parent_id": {"$exists": False}})
     
     # Get students by form
     pipeline = [
@@ -2910,7 +3035,7 @@ async def get_sync_status(
         {"$group": {"_id": "$form", "count": {"$sum": 1}}},
         {"$sort": {"_id": 1}}
     ]
-    by_form = await db.students.aggregate(pipeline).to_list(10)
+    by_form = await runtime_db.students.aggregate(pipeline).to_list(10)
     students_by_form = {str(item["_id"]): item["count"] for item in by_form}
     
     return {
@@ -2935,6 +3060,7 @@ async def cleanup_orphan_pelajar_users(
     current_user: dict = Depends(require_roles("superadmin"))
 ):
     """Remove pelajar users that don't have a matching student record"""
+    runtime_db = _runtime_db()
     results = {
         "deleted_count": 0,
         "deleted_users": [],
@@ -2942,10 +3068,10 @@ async def cleanup_orphan_pelajar_users(
     }
     
     # Get all pelajar users
-    pelajar_users = await db.users.find({"role": "pelajar"}).to_list(1000)
+    pelajar_users = await runtime_db.users.find({"role": "pelajar"}).to_list(1000)
     
     # Get all student matric numbers
-    students = await db.students.find({}).to_list(1000)
+    students = await runtime_db.students.find({}).to_list(1000)
     student_matrics = set(s.get("matric_number") for s in students if s.get("matric_number"))
     student_ics = set(s.get("ic_number") for s in students if s.get("ic_number"))
     
@@ -2961,7 +3087,7 @@ async def cleanup_orphan_pelajar_users(
         
         if not has_matching_student:
             try:
-                await db.users.delete_one({"_id": user["_id"]})
+                await runtime_db.users.delete_one({"_id": user["_id"]})
                 results["deleted_count"] += 1
                 results["deleted_users"].append({
                     "name": user.get("full_name"),
@@ -2986,6 +3112,7 @@ async def sync_students_data(
     current_user: dict = Depends(require_roles("superadmin", "admin"))
 ):
     """Synchronize students data - create user accounts and set religion"""
+    runtime_db = _runtime_db()
     results = {
         "users_created": 0,
         "religion_updated": 0,
@@ -2993,16 +3120,16 @@ async def sync_students_data(
     }
     
     # Get all students without user_id
-    students_without_user = await db.students.find({"user_id": {"$exists": False}}).to_list(1000)
+    students_without_user = await runtime_db.students.find({"user_id": {"$exists": False}}).to_list(1000)
     
     for student in students_without_user:
         try:
             # Check if user with matric already exists
-            existing_user = await db.users.find_one({"matric_number": student.get("matric_number")})
+            existing_user = await runtime_db.users.find_one({"matric_number": student.get("matric_number")})
             
             if existing_user:
                 # Link existing user to student
-                await db.students.update_one(
+                await runtime_db.students.update_one(
                     {"_id": student["_id"]},
                     {"$set": {"user_id": existing_user["_id"]}}
                 )
@@ -3024,10 +3151,10 @@ async def sync_students_data(
                     "created_at": datetime.now(timezone.utc).isoformat()
                 }
                 
-                user_result = await db.users.insert_one(user_doc)
+                user_result = await runtime_db.users.insert_one(user_doc)
                 
                 # Update student with user_id
-                await db.students.update_one(
+                await runtime_db.students.update_one(
                     {"_id": student["_id"]},
                     {"$set": {"user_id": user_result.inserted_id}}
                 )
@@ -3037,18 +3164,18 @@ async def sync_students_data(
             results["errors"].append(f"Error for {student.get('matric_number')}: {str(e)}")
     
     # Update religion for students without religion
-    students_without_religion = await db.students.find({"religion": {"$exists": False}}).to_list(1000)
+    students_without_religion = await runtime_db.students.find({"religion": {"$exists": False}}).to_list(1000)
     for student in students_without_religion:
-        await db.students.update_one(
+        await runtime_db.students.update_one(
             {"_id": student["_id"]},
             {"$set": {"religion": "Islam"}}  # Default to Islam
         )
         results["religion_updated"] += 1
     
     # Update religion for pelajar users without religion
-    pelajar_without_religion = await db.users.find({"role": "pelajar", "religion": {"$exists": False}}).to_list(1000)
+    pelajar_without_religion = await runtime_db.users.find({"role": "pelajar", "religion": {"$exists": False}}).to_list(1000)
     for user in pelajar_without_religion:
-        await db.users.update_one(
+        await runtime_db.users.update_one(
             {"_id": user["_id"]},
             {"$set": {"religion": "Islam"}}  # Default to Islam
         )
@@ -3074,6 +3201,7 @@ async def full_sync_data(
     2. Creates user accounts for students without user_id
     3. Updates missing religion fields
     """
+    runtime_db = _runtime_db()
     results = {
         "cleanup": {
             "orphan_users_deleted": 0,
@@ -3090,14 +3218,14 @@ async def full_sync_data(
     
     # Get counts before sync
     results["before"] = {
-        "total_users": await db.users.count_documents({}),
-        "pelajar_users": await db.users.count_documents({"role": "pelajar"}),
-        "total_students": await db.students.count_documents({})
+        "total_users": await runtime_db.users.count_documents({}),
+        "pelajar_users": await runtime_db.users.count_documents({"role": "pelajar"}),
+        "total_students": await runtime_db.students.count_documents({})
     }
     
     # Step 1: Cleanup orphan pelajar users
-    pelajar_users = await db.users.find({"role": "pelajar"}).to_list(1000)
-    students = await db.students.find({}).to_list(1000)
+    pelajar_users = await runtime_db.users.find({"role": "pelajar"}).to_list(1000)
+    students = await runtime_db.students.find({}).to_list(1000)
     student_matrics = set(s.get("matric_number") for s in students if s.get("matric_number"))
     student_ics = set(s.get("ic_number") for s in students if s.get("ic_number"))
     
@@ -3112,21 +3240,21 @@ async def full_sync_data(
         
         if not has_matching_student:
             try:
-                await db.users.delete_one({"_id": user["_id"]})
+                await runtime_db.users.delete_one({"_id": user["_id"]})
                 results["cleanup"]["orphan_users_deleted"] += 1
                 results["cleanup"]["deleted_details"].append(user.get("full_name", "Unknown"))
             except Exception as e:
                 results["errors"].append(f"Cleanup error: {str(e)}")
     
     # Step 2: Create user accounts for students without user_id
-    students_without_user = await db.students.find({"user_id": {"$exists": False}}).to_list(1000)
+    students_without_user = await runtime_db.students.find({"user_id": {"$exists": False}}).to_list(1000)
     
     for student in students_without_user:
         try:
-            existing_user = await db.users.find_one({"matric_number": student.get("matric_number")})
+            existing_user = await runtime_db.users.find_one({"matric_number": student.get("matric_number")})
             
             if existing_user:
-                await db.students.update_one(
+                await runtime_db.students.update_one(
                     {"_id": student["_id"]},
                     {"$set": {"user_id": existing_user["_id"]}}
                 )
@@ -3147,8 +3275,8 @@ async def full_sync_data(
                     "created_at": datetime.now(timezone.utc).isoformat()
                 }
                 
-                user_result = await db.users.insert_one(user_doc)
-                await db.students.update_one(
+                user_result = await runtime_db.users.insert_one(user_doc)
+                await runtime_db.students.update_one(
                     {"_id": student["_id"]},
                     {"$set": {"user_id": user_result.inserted_id}}
                 )
@@ -3158,17 +3286,17 @@ async def full_sync_data(
             results["errors"].append(f"Sync error for {student.get('matric_number')}: {str(e)}")
     
     # Step 3: Update missing religion fields
-    students_without_religion = await db.students.find({"religion": {"$exists": False}}).to_list(1000)
+    students_without_religion = await runtime_db.students.find({"religion": {"$exists": False}}).to_list(1000)
     for student in students_without_religion:
-        await db.students.update_one(
+        await runtime_db.students.update_one(
             {"_id": student["_id"]},
             {"$set": {"religion": "Islam"}}
         )
         results["sync"]["religion_updated"] += 1
     
-    pelajar_without_religion = await db.users.find({"role": "pelajar", "religion": {"$exists": False}}).to_list(1000)
+    pelajar_without_religion = await runtime_db.users.find({"role": "pelajar", "religion": {"$exists": False}}).to_list(1000)
     for user in pelajar_without_religion:
-        await db.users.update_one(
+        await runtime_db.users.update_one(
             {"_id": user["_id"]},
             {"$set": {"religion": "Islam"}}
         )
@@ -3176,9 +3304,9 @@ async def full_sync_data(
     
     # Get counts after sync
     results["after"] = {
-        "total_users": await db.users.count_documents({}),
-        "pelajar_users": await db.users.count_documents({"role": "pelajar"}),
-        "total_students": await db.students.count_documents({})
+        "total_users": await runtime_db.users.count_documents({}),
+        "pelajar_users": await runtime_db.users.count_documents({"role": "pelajar"}),
+        "total_students": await runtime_db.students.count_documents({})
     }
     
     await log_audit(
@@ -3206,8 +3334,9 @@ async def standardize_student_classes(
     
     Juga akan membuang field nama_kelas lama dan menggunakan field 'class' sahaja.
     """
+    runtime_db = _runtime_db()
     # Get system config for valid classes
-    system_config = await db.settings.find_one({"type": "system_config"})
+    system_config = await runtime_db.settings.find_one({"type": "system_config"})
     valid_classes = system_config.get("kelas", ["A", "B", "C", "D", "E", "F"]) if system_config else ["A", "B", "C", "D", "E", "F"]
     
     # Mapping non-standard classes to standard
@@ -3238,7 +3367,7 @@ async def standardize_student_classes(
     }
     
     # ========== UPDATE STUDENTS ==========
-    all_students = await db.students.find({}).to_list(5000)
+    all_students = await runtime_db.students.find({}).to_list(5000)
     
     for student in all_students:
         current_class = student.get("class_name") or student.get("nama_kelas") or student.get("class") or ""
@@ -3258,7 +3387,7 @@ async def standardize_student_classes(
         # Remove old nama_kelas field
         unset_data = {"nama_kelas": ""}
         
-        await db.students.update_one(
+        await runtime_db.students.update_one(
             {"_id": student["_id"]},
             {
                 "$set": update_data,
@@ -3277,7 +3406,7 @@ async def standardize_student_classes(
         results["students_updated"] += 1
     
     # ========== UPDATE CLAIM CODES ==========
-    all_claim_codes = await db.claim_codes.find({}).to_list(5000)
+    all_claim_codes = await runtime_db.claim_codes.find({}).to_list(5000)
     
     for cc in all_claim_codes:
         current_class = cc.get("nama_kelas") or cc.get("kelas") or ""
@@ -3296,7 +3425,7 @@ async def standardize_student_classes(
         # Remove old nama_kelas field
         unset_data = {"nama_kelas": ""}
         
-        await db.claim_codes.update_one(
+        await runtime_db.claim_codes.update_one(
             {"_id": cc["_id"]},
             {
                 "$set": update_data,
@@ -3335,15 +3464,16 @@ async def get_class_summary(
     Mendapatkan ringkasan kelas dan guru yang ditugaskan mengikut tingkatan
     Struktur: 5 tingkatan × 6 kelas = 30 kelas
     """
+    runtime_db = _runtime_db()
     current_year = tahun or datetime.now().year
     
     # Get system config for valid classes and tingkatan
-    system_config = await db.settings.find_one({"type": "system_config"})
+    system_config = await runtime_db.settings.find_one({"type": "system_config"})
     valid_classes = system_config.get("kelas", ["A", "B", "C", "D", "E", "F"]) if system_config else ["A", "B", "C", "D", "E", "F"]
     valid_tingkatan = system_config.get("tingkatan", [1, 2, 3, 4, 5]) if system_config else [1, 2, 3, 4, 5]
     
     # Get all guru_kelas users
-    guru_kelas_list = await db.users.find({"role": "guru_kelas"}).to_list(200)
+    guru_kelas_list = await runtime_db.users.find({"role": "guru_kelas"}).to_list(200)
     
     # Build class matrix (tingkatan × kelas)
     class_matrix = []
@@ -3358,7 +3488,7 @@ async def get_class_summary(
         
         for kelas in valid_classes:
             # Count students in this tingkatan + kelas combination
-            student_count = await db.students.count_documents({
+            student_count = await runtime_db.students.count_documents({
                 "form": tingkatan,
                 "class_name": kelas,
                 "status": "approved"
@@ -3395,7 +3525,7 @@ async def get_class_summary(
         {"$match": {"form": {"$nin": valid_tingkatan}}},
         {"$group": {"_id": "$form", "count": {"$sum": 1}}}
     ]
-    non_standard_forms = await db.students.aggregate(pipeline).to_list(20)
+    non_standard_forms = await runtime_db.students.aggregate(pipeline).to_list(20)
     
     # Get list of unassigned classes
     unassigned = []
@@ -3446,13 +3576,14 @@ async def assign_guru_to_class(
     """
     Tugaskan guru kelas ke tingkatan dan kelas tertentu
     """
+    runtime_db = _runtime_db()
     # Validate guru exists
-    guru = await db.users.find_one({"_id": ObjectId(guru_id), "role": "guru_kelas"})
+    guru = await runtime_db.users.find_one({"_id": ObjectId(guru_id), "role": "guru_kelas"})
     if not guru:
         raise HTTPException(status_code=404, detail="Guru tidak dijumpai")
     
     # Check if class is already assigned to another guru
-    existing = await db.users.find_one({
+    existing = await runtime_db.users.find_one({
         "role": "guru_kelas",
         "assigned_form": tingkatan,
         "assigned_class": kelas,
@@ -3465,7 +3596,7 @@ async def assign_guru_to_class(
         )
     
     # Update guru assignment
-    await db.users.update_one(
+    await runtime_db.users.update_one(
         {"_id": ObjectId(guru_id)},
         {"$set": {
             "assigned_form": tingkatan,
@@ -3497,10 +3628,11 @@ async def update_guru_class_assignment(
     """
     Guru kemas kini tugasan tingkatan dan kelas sendiri
     """
+    runtime_db = _runtime_db()
     guru_id = current_user.get("_id")
     
     # Get system config
-    system_config = await db.settings.find_one({"type": "system_config"})
+    system_config = await runtime_db.settings.find_one({"type": "system_config"})
     valid_classes = system_config.get("kelas", ["A", "B", "C", "D", "E", "F"]) if system_config else ["A", "B", "C", "D", "E", "F"]
     valid_tingkatan = system_config.get("tingkatan", [1, 2, 3, 4, 5]) if system_config else [1, 2, 3, 4, 5]
     
@@ -3511,7 +3643,7 @@ async def update_guru_class_assignment(
         raise HTTPException(status_code=400, detail=f"Kelas tidak sah. Pilih dari: {valid_classes}")
     
     # Check if class is already assigned to another guru
-    existing = await db.users.find_one({
+    existing = await runtime_db.users.find_one({
         "role": "guru_kelas",
         "assigned_form": tingkatan,
         "assigned_class": kelas,
@@ -3524,7 +3656,7 @@ async def update_guru_class_assignment(
         )
     
     # Update assignment
-    await db.users.update_one(
+    await runtime_db.users.update_one(
         {"_id": guru_id},
         {"$set": {
             "assigned_form": tingkatan,
@@ -3539,7 +3671,7 @@ async def update_guru_class_assignment(
         "tingkatan": tingkatan,
         "kelas": kelas
     }
-    non_standard = await db.students.aggregate(pipeline).to_list(20)
+    non_standard = await runtime_db.students.aggregate(pipeline).to_list(20)
     
     return {
         "valid_classes": valid_classes,
@@ -3555,10 +3687,11 @@ async def get_auto_sync_settings(
     current_user: dict = Depends(require_roles("superadmin", "admin"))
 ):
     """Get auto-sync settings and status"""
-    settings = await db.settings.find_one({"type": "auto_sync"})
+    runtime_db = _runtime_db()
+    settings = await runtime_db.settings.find_one({"type": "auto_sync"})
     
     # Get recent sync logs
-    recent_logs = await db.scheduler_logs.find(
+    recent_logs = await runtime_db.scheduler_logs.find(
         {"type": "auto_sync"}
     ).sort("run_at", -1).limit(5).to_list(5)
     
@@ -3582,10 +3715,11 @@ async def update_auto_sync_settings(
 ):
     """Update auto-sync settings"""
     global scheduler
+    runtime_db = _runtime_db()
     
     now = datetime.now(timezone.utc)
     
-    await db.settings.update_one(
+    await runtime_db.settings.update_one(
         {"type": "auto_sync"},
         {
             "$set": {
@@ -3636,7 +3770,7 @@ async def trigger_auto_sync_now(
         await run_auto_sync_job()
         
         # Get updated settings with results
-        settings = await db.settings.find_one({"type": "auto_sync"})
+        settings = await _runtime_db().settings.find_one({"type": "auto_sync"})
         
         await log_audit(
             current_user, "TRIGGER_AUTO_SYNC", "admin",
@@ -3690,12 +3824,13 @@ async def get_students_report(
     current_user: dict = Depends(require_roles("superadmin", "admin", "bendahari", "juruaudit"))
 ):
     """Get comprehensive student report by religion and bangsa"""
+    runtime_db = _runtime_db()
     
     # Total students
-    total = await db.students.count_documents({"status": "approved"})
+    total = await runtime_db.students.count_documents({"status": "approved"})
     
     # By religion
-    muslim = await db.students.count_documents({"status": "approved", "religion": "Islam"})
+    muslim = await runtime_db.students.count_documents({"status": "approved", "religion": "Islam"})
     non_muslim = total - muslim
     
     # By specific religion
@@ -3704,7 +3839,7 @@ async def get_students_report(
         {"$group": {"_id": "$religion", "count": {"$sum": 1}}},
         {"$sort": {"count": -1}}
     ]
-    by_religion = await db.students.aggregate(religion_pipeline).to_list(20)
+    by_religion = await runtime_db.students.aggregate(religion_pipeline).to_list(20)
     religion_breakdown = {item["_id"]: item["count"] for item in by_religion}
     
     # By bangsa
@@ -3713,7 +3848,7 @@ async def get_students_report(
         {"$group": {"_id": "$bangsa", "count": {"$sum": 1}}},
         {"$sort": {"count": -1}}
     ]
-    by_bangsa = await db.students.aggregate(bangsa_pipeline).to_list(20)
+    by_bangsa = await runtime_db.students.aggregate(bangsa_pipeline).to_list(20)
     bangsa_breakdown = {item["_id"] or "Tidak Dinyatakan": item["count"] for item in by_bangsa}
     
     # By form (tingkatan)
@@ -3722,7 +3857,7 @@ async def get_students_report(
         {"$group": {"_id": "$form", "count": {"$sum": 1}}},
         {"$sort": {"_id": 1}}
     ]
-    by_form = await db.students.aggregate(form_pipeline).to_list(10)
+    by_form = await runtime_db.students.aggregate(form_pipeline).to_list(10)
     form_breakdown = {f"Tingkatan {item['_id']}": item["count"] for item in by_form}
     
     # Cross-tabulation: Bangsa x Religion
@@ -3734,7 +3869,7 @@ async def get_students_report(
         }},
         {"$sort": {"count": -1}}
     ]
-    cross_data = await db.students.aggregate(cross_pipeline).to_list(50)
+    cross_data = await runtime_db.students.aggregate(cross_pipeline).to_list(50)
     cross_breakdown = []
     for item in cross_data:
         cross_breakdown.append({
@@ -3764,6 +3899,7 @@ async def get_students_with_parents(
     limit: int = Query(50, ge=1, le=100)
 ):
     """Get students list with their parent information"""
+    runtime_db = _runtime_db()
     skip = (page - 1) * limit
     
     pipeline = [
@@ -3794,8 +3930,8 @@ async def get_students_with_parents(
         }}
     ]
     
-    students = await db.students.aggregate(pipeline).to_list(limit)
-    total = await db.students.count_documents({"status": "approved"})
+    students = await runtime_db.students.aggregate(pipeline).to_list(limit)
+    total = await runtime_db.students.count_documents({"status": "approved"})
     
     return {
         "students": students,
@@ -3874,13 +4010,14 @@ async def assign_package_to_student(
 
 async def _get_parent_children_fee_summary(parent_id) -> List[Dict[str, Any]]:
     """Return list of {student_name, total_fees, paid_amount, outstanding} for AI chat / internal use."""
-    children = await db.students.find({
+    runtime_db = _runtime_db()
+    children = await runtime_db.students.find({
         "parent_id": ObjectId(parent_id) if isinstance(parent_id, str) else parent_id,
         "status": "approved"
     }).to_list(100)
     result = []
     for child in children:
-        yuran_records = await db.student_yuran.find({"student_id": child["_id"]}).to_list(100)
+        yuran_records = await runtime_db.student_yuran.find({"student_id": child["_id"]}).to_list(100)
         total_fees = sum(r.get("total_amount", 0) for r in yuran_records)
         paid_amount = sum(r.get("paid_amount", 0) for r in yuran_records)
         result.append({
@@ -3895,8 +4032,9 @@ async def _get_parent_children_fee_summary(parent_id) -> List[Dict[str, Any]]:
 @app.get("/api/parent/children-fees")
 async def get_parent_children_fees(current_user: dict = Depends(require_roles("parent"))):
     """Get fee summary for all parent's children - uses new student_yuran system"""
+    runtime_db = _runtime_db()
     # Get all children
-    children = await db.students.find({
+    children = await runtime_db.students.find({
         "parent_id": ObjectId(current_user["_id"]),
         "status": "approved"
     }).to_list(100)
@@ -3905,7 +4043,7 @@ async def get_parent_children_fees(current_user: dict = Depends(require_roles("p
     
     for child in children:
         # Get all yuran from new student_yuran collection
-        yuran_records = await db.student_yuran.find({"student_id": child["_id"]}).to_list(100)
+        yuran_records = await runtime_db.student_yuran.find({"student_id": child["_id"]}).to_list(100)
         
         total_fees = sum(r.get("total_amount", 0) for r in yuran_records)
         paid_amount = sum(r.get("paid_amount", 0) for r in yuran_records)
@@ -3955,6 +4093,7 @@ async def send_fee_reminders(
     
     try:
         from services.email_service import send_fee_reminder, RESEND_ENABLED
+        runtime_db = _runtime_db()
         
         # Find all parents with outstanding fees from student_yuran
         pipeline = [
@@ -3976,7 +4115,7 @@ async def send_fee_reminders(
             {"$match": {"total_outstanding": {"$gt": 0}}}
         ]
         
-        parents_outstanding = await db.student_yuran.aggregate(pipeline).to_list(1000)
+        parents_outstanding = await runtime_db.student_yuran.aggregate(pipeline).to_list(1000)
         
         notifications_sent = 0
         emails_sent = 0
@@ -3987,7 +4126,7 @@ async def send_fee_reminders(
                 continue
             
             # Get parent info
-            parent = await db.users.find_one({"_id": parent_id})
+            parent = await runtime_db.users.find_one({"_id": parent_id})
             if not parent:
                 continue
             
@@ -4016,7 +4155,7 @@ async def send_fee_reminders(
             # Get student details
             for student_id, data in records_by_student.items():
                 try:
-                    student = await db.students.find_one({"_id": ObjectId(student_id)})
+                    student = await runtime_db.students.find_one({"_id": ObjectId(student_id)})
                     if student:
                         data["form"] = student.get("form")
                         data["class_name"] = student.get("class_name", "")
@@ -4026,7 +4165,7 @@ async def send_fee_reminders(
             
             # Create in-app notification
             student_list = ", ".join([f"{d['name']} (RM{d['outstanding']:,.2f})" for d in children_outstanding])
-            await db.notifications.insert_one({
+            await runtime_db.notifications.insert_one({
                 "user_id": parent_id,
                 "title": "Peringatan Tunggakan Yuran",
                 "message": f"Anda mempunyai tunggakan yuran berjumlah RM {parent_data['total_outstanding']:,.2f}. Pelajar: {student_list}. Sila jelaskan secepat mungkin.",
@@ -4084,13 +4223,14 @@ async def get_audit_logs(
     current_user: dict = Depends(require_roles("superadmin", "admin"))
 ):
     """Get audit logs"""
+    runtime_db = _runtime_db()
     query = {}
     if module:
         query["module"] = module
     if user_id:
         query["user_id"] = ObjectId(user_id)
     
-    logs = await db.audit_logs.find(query).sort("created_at", -1).limit(limit).to_list(limit)
+    logs = await runtime_db.audit_logs.find(query).sort("created_at", -1).limit(limit).to_list(limit)
     return [serialize_audit(log) for log in logs]
 # ============ GURU DASHBOARD FASA 3 ============
 
@@ -4103,6 +4243,7 @@ async def get_guru_dashboard_overview(
     Dashboard overview untuk Guru Kelas - Statistik yuran pelajar dalam kelas
     Menggunakan assigned_form dan assigned_class
     """
+    runtime_db = _runtime_db()
     assigned_form = current_user.get("assigned_form")
     assigned_class = current_user.get("assigned_class", "")
     user_role = current_user.get("role", "")
@@ -4120,7 +4261,7 @@ async def get_guru_dashboard_overview(
         student_query["class_name"] = assigned_class
     
     # Get all students in class
-    students = await db.students.find(student_query).to_list(500)
+    students = await runtime_db.students.find(student_query).to_list(500)
     student_ids = [s["_id"] for s in students]
     
     # Build class display name
@@ -4161,7 +4302,7 @@ async def get_guru_dashboard_overview(
     if tahun:
         yuran_query["tahun"] = tahun
     
-    yuran_records = await db.student_yuran.find(yuran_query).to_list(2000)
+    yuran_records = await runtime_db.student_yuran.find(yuran_query).to_list(2000)
     
     # Build yuran by student_id map
     yuran_by_student = {}
@@ -4274,6 +4415,7 @@ async def get_guru_students_with_fees(
     Senarai pelajar dalam kelas dengan status yuran dan filters
     Menggunakan assigned_form dan assigned_class
     """
+    runtime_db = _runtime_db()
     assigned_form = current_user.get("assigned_form")
     assigned_class = current_user.get("assigned_class", "")
     user_role = current_user.get("role", "")
@@ -4315,7 +4457,7 @@ async def get_guru_students_with_fees(
         ]
     
     # Get all students (we'll filter by fee_status in memory)
-    all_students = await db.students.find(student_query).sort("full_name", 1).to_list(500)
+    all_students = await runtime_db.students.find(student_query).sort("full_name", 1).to_list(500)
     student_ids = [s["_id"] for s in all_students]
     
     # Get yuran records
@@ -4323,7 +4465,7 @@ async def get_guru_students_with_fees(
     if tahun:
         yuran_query["tahun"] = tahun
     
-    yuran_records = await db.student_yuran.find(yuran_query).to_list(2000)
+    yuran_records = await runtime_db.student_yuran.find(yuran_query).to_list(2000)
     
     # Build yuran by student_id map
     yuran_by_student = {}
@@ -4417,12 +4559,13 @@ async def get_student_detail_for_guru(
     """
     Detail pelajar dengan sejarah yuran - untuk Guru Kelas
     """
+    runtime_db = _runtime_db()
     assigned_form = current_user.get("assigned_form")
     assigned_class = current_user.get("assigned_class", "")
     user_role = current_user.get("role", "")
     
     # Get student
-    student = await db.students.find_one({"_id": ObjectId(student_id)})
+    student = await runtime_db.students.find_one({"_id": ObjectId(student_id)})
     if not student:
         raise HTTPException(status_code=404, detail="Pelajar tidak dijumpai")
     
@@ -4436,7 +4579,7 @@ async def get_student_detail_for_guru(
             raise HTTPException(status_code=403, detail="Pelajar bukan dalam kelas anda")
     
     # Get all yuran records
-    yuran_records = await db.student_yuran.find({
+    yuran_records = await runtime_db.student_yuran.find({
         "student_id": ObjectId(student_id)
     }).sort([("tahun", -1), ("tingkatan", -1)]).to_list(20)
     
@@ -4448,7 +4591,7 @@ async def get_student_detail_for_guru(
     # Get parent info
     parent = None
     if student.get("parent_id"):
-        parent_doc = await db.users.find_one({"_id": student.get("parent_id")})
+        parent_doc = await runtime_db.users.find_one({"_id": student.get("parent_id")})
         if parent_doc:
             parent = {
                 "id": str(parent_doc["_id"]),
@@ -4507,6 +4650,7 @@ async def get_guru_filter_options(
     """
     Dapatkan pilihan untuk filters - gender, religion, bangsa, state
     """
+    runtime_db = _runtime_db()
     assigned_form = current_user.get("assigned_form")
     assigned_class = current_user.get("assigned_class", "")
     user_role = current_user.get("role", "")
@@ -4520,7 +4664,7 @@ async def get_guru_filter_options(
             student_query["class_name"] = assigned_class
     
     # Get distinct values
-    students = await db.students.find(student_query).to_list(500)
+    students = await runtime_db.students.find(student_query).to_list(500)
     
     religions = set()
     bangsa_list = set()
@@ -4535,7 +4679,7 @@ async def get_guru_filter_options(
             states.add(s["state"])
     
     # Get system config for default options
-    system_config = await db.settings.find_one({"type": "system_config"})
+    system_config = await runtime_db.settings.find_one({"type": "system_config"})
     
     return {
         "gender": [
@@ -4567,6 +4711,7 @@ async def send_fee_reminder_from_guru(
     - student_ids: Senarai ID pelajar tertentu
     - send_to_all: Hantar kepada semua pelajar dengan tunggakan dalam kelas
     """
+    runtime_db = _runtime_db()
     class_name = current_user.get("assigned_class", "")
     user_role = current_user.get("role", "")
     current_tahun = tahun or datetime.now().year
@@ -4583,11 +4728,11 @@ async def send_fee_reminder_from_guru(
         if class_name:
             student_query["class_name"] = class_name
         
-        all_students = await db.students.find(student_query).to_list(500)
+        all_students = await runtime_db.students.find(student_query).to_list(500)
         
         for student in all_students:
             # Get yuran records
-            yuran_records = await db.student_yuran.find({
+            yuran_records = await runtime_db.student_yuran.find({
                 "student_id": student["_id"],
                 "tahun": current_tahun
             }).to_list(10)
@@ -4608,7 +4753,7 @@ async def send_fee_reminder_from_guru(
         # Get specific students
         for sid in student_ids:
             try:
-                student = await db.students.find_one({"_id": ObjectId(sid)})
+                student = await runtime_db.students.find_one({"_id": ObjectId(sid)})
                 if not student:
                     continue
                 
@@ -4618,7 +4763,7 @@ async def send_fee_reminder_from_guru(
                         continue
                 
                 # Get yuran records
-                yuran_records = await db.student_yuran.find({
+                yuran_records = await runtime_db.student_yuran.find({
                     "student_id": student["_id"],
                     "tahun": current_tahun
                 }).to_list(10)
@@ -4661,7 +4806,7 @@ async def send_fee_reminder_from_guru(
             continue
         
         # Get parent info
-        parent = await db.users.find_one({"_id": parent_id})
+        parent = await runtime_db.users.find_one({"_id": parent_id})
         if not parent:
             continue
         
@@ -4679,7 +4824,7 @@ async def send_fee_reminder_from_guru(
             "student_name": student.get("full_name", ""),
             "created_at": datetime.now(timezone.utc).isoformat()
         }
-        await db.notifications.insert_one(notification_doc)
+        await runtime_db.notifications.insert_one(notification_doc)
         notifications_sent += 1
         
         # Try to send email if Resend is enabled
@@ -4821,6 +4966,7 @@ async def get_user_notifications(
     current_user: dict = Depends(require_roles())
 ):
     """Get user's notifications with pagination"""
+    runtime_db = _runtime_db()
     user_id = current_user["_id"]
     
     query = {"user_id": user_id}
@@ -4829,10 +4975,10 @@ async def get_user_notifications(
     if unread_only:
         query["is_read"] = False
     
-    total = await db.notifications.count_documents(query)
+    total = await runtime_db.notifications.count_documents(query)
     skip = (page - 1) * limit
-    notifications = await db.notifications.find(query).sort("created_at", -1).skip(skip).limit(limit).to_list(limit)
-    unread_count = await db.notifications.count_documents({"user_id": user_id, "is_read": False})
+    notifications = await runtime_db.notifications.find(query).sort("created_at", -1).skip(skip).limit(limit).to_list(limit)
+    unread_count = await runtime_db.notifications.count_documents({"user_id": user_id, "is_read": False})
     
     return {
         "notifications": [serialize_notification(n) for n in notifications],
@@ -4844,15 +4990,16 @@ async def get_user_notifications(
 @app.get("/api/notifications/unread-count")
 async def get_unread_notification_count(current_user: dict = Depends(require_roles())):
     """Get count of unread notifications"""
-    count = await db.notifications.count_documents({"user_id": current_user["_id"], "is_read": False})
+    count = await _runtime_db().notifications.count_documents({"user_id": current_user["_id"], "is_read": False})
     return {"unread_count": count}
 
 
 @app.put("/api/notifications/mark-read")
 async def mark_notifications_as_read(data: NotificationMarkRead, current_user: dict = Depends(require_roles())):
     """Mark specific notifications as read"""
+    runtime_db = _runtime_db()
     notif_ids = [ObjectId(nid) for nid in data.notification_ids]
-    result = await db.notifications.update_many(
+    result = await runtime_db.notifications.update_many(
         {"_id": {"$in": notif_ids}, "user_id": current_user["_id"]},
         {"$set": {"is_read": True, "read_at": datetime.now(timezone.utc)}}
     )
@@ -4862,7 +5009,7 @@ async def mark_notifications_as_read(data: NotificationMarkRead, current_user: d
 @app.put("/api/notifications/mark-all-read")
 async def mark_all_notifications_read(current_user: dict = Depends(require_roles())):
     """Mark all notifications as read"""
-    result = await db.notifications.update_many(
+    result = await _runtime_db().notifications.update_many(
         {"user_id": current_user["_id"], "is_read": False},
         {"$set": {"is_read": True, "read_at": datetime.now(timezone.utc)}}
     )
@@ -4872,7 +5019,7 @@ async def mark_all_notifications_read(current_user: dict = Depends(require_roles
 @app.delete("/api/notifications/{notification_id}")
 async def delete_notification(notification_id: str, current_user: dict = Depends(require_roles())):
     """Delete a notification"""
-    result = await db.notifications.delete_one({"_id": ObjectId(notification_id), "user_id": current_user["_id"]})
+    result = await _runtime_db().notifications.delete_one({"_id": ObjectId(notification_id), "user_id": current_user["_id"]})
     if result.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Notifikasi tidak dijumpai")
     return {"status": "deleted"}
@@ -4881,6 +5028,7 @@ async def delete_notification(notification_id: str, current_user: dict = Depends
 @app.get("/api/notifications/guru/dashboard")
 async def get_guru_notification_dashboard(current_user: dict = Depends(require_roles("guru_kelas", "guru_homeroom", "superadmin", "admin"))):
     """Dashboard notifikasi untuk Guru Kelas"""
+    runtime_db = _runtime_db()
     teacher_id = current_user["_id"]
     tingkatan = current_user.get("assigned_form")
     kelas = current_user.get("assigned_class")
@@ -4891,14 +5039,14 @@ async def get_guru_notification_dashboard(current_user: dict = Depends(require_r
     if kelas:
         student_query["class_name"] = kelas
     
-    students = await db.students.find(student_query).to_list(100)
+    students = await runtime_db.students.find(student_query).to_list(100)
     parent_ids = list(set([s.get("parent_id") for s in students if s.get("parent_id")]))
-    parents = await db.users.find({"_id": {"$in": parent_ids}, "role": "parent"}).to_list(100)
+    parents = await runtime_db.users.find({"_id": {"$in": parent_ids}, "role": "parent"}).to_list(100)
     
-    push_count = await db.push_subscriptions.count_documents({"user_id": {"$in": [p["_id"] for p in parents]}, "is_active": True})
-    recent_announcements = await db.announcements.find({"created_by": teacher_id}).sort("created_at", -1).limit(5).to_list(5)
-    total_ann = await db.announcements.count_documents({"created_by": teacher_id})
-    published_ann = await db.announcements.count_documents({"created_by": teacher_id, "status": "published"})
+    push_count = await runtime_db.push_subscriptions.count_documents({"user_id": {"$in": [p["_id"] for p in parents]}, "is_active": True})
+    recent_announcements = await runtime_db.announcements.find({"created_by": teacher_id}).sort("created_at", -1).limit(5).to_list(5)
+    total_ann = await runtime_db.announcements.count_documents({"created_by": teacher_id})
+    published_ann = await runtime_db.announcements.count_documents({"created_by": teacher_id, "status": "published"})
     
     return {
         "class_info": {
@@ -4927,6 +5075,7 @@ async def get_guru_class_parents(
     current_user: dict = Depends(require_roles("guru_kelas", "guru_homeroom", "superadmin", "admin"))
 ):
     """Senarai ibu bapa dalam kelas guru"""
+    runtime_db = _runtime_db()
     tingkatan = current_user.get("assigned_form")
     kelas = current_user.get("assigned_class")
     
@@ -4936,7 +5085,7 @@ async def get_guru_class_parents(
     if kelas:
         student_query["class_name"] = kelas
     
-    students = await db.students.find(student_query).to_list(500)
+    students = await runtime_db.students.find(student_query).to_list(500)
     
     parent_students = {}
     for s in students:
@@ -4954,11 +5103,11 @@ async def get_guru_class_parents(
             {"phone": {"$regex": search, "$options": "i"}}
         ]
     
-    total = await db.users.count_documents(parent_query)
+    total = await runtime_db.users.count_documents(parent_query)
     skip = (page - 1) * limit
-    parents = await db.users.find(parent_query).skip(skip).limit(limit).to_list(limit)
+    parents = await runtime_db.users.find(parent_query).skip(skip).limit(limit).to_list(limit)
     
-    subscriptions = await db.push_subscriptions.find({"user_id": {"$in": [p["_id"] for p in parents]}, "is_active": True}).to_list(500)
+    subscriptions = await runtime_db.push_subscriptions.find({"user_id": {"$in": [p["_id"] for p in parents]}, "is_active": True}).to_list(500)
     sub_by_parent = {}
     for sub in subscriptions:
         uid = sub["user_id"]
@@ -4987,15 +5136,16 @@ async def get_announcements_list(
     current_user: dict = Depends(require_roles("guru_kelas", "guru_homeroom", "superadmin", "admin"))
 ):
     """Senarai pengumuman oleh guru"""
+    runtime_db = _runtime_db()
     query = {}
     if current_user.get("role") in ["guru_kelas", "guru_homeroom"]:
         query["created_by"] = current_user["_id"]
     if status:
         query["status"] = status
     
-    total = await db.announcements.count_documents(query)
+    total = await runtime_db.announcements.count_documents(query)
     skip = (page - 1) * limit
-    announcements = await db.announcements.find(query).sort("created_at", -1).skip(skip).limit(limit).to_list(limit)
+    announcements = await runtime_db.announcements.find(query).sort("created_at", -1).skip(skip).limit(limit).to_list(limit)
     
     return {"announcements": [serialize_announcement(a) for a in announcements], "pagination": {"page": page, "limit": limit, "total": total, "total_pages": max(1, (total + limit - 1) // limit)}}
 
@@ -5003,6 +5153,7 @@ async def get_announcements_list(
 @app.post("/api/notifications/announcements")
 async def create_new_announcement(data: AnnouncementCreate, current_user: dict = Depends(require_roles("guru_kelas", "guru_homeroom", "superadmin", "admin"))):
     """Cipta dan terbitkan pengumuman baru"""
+    runtime_db = _runtime_db()
     tingkatan = current_user.get("assigned_form")
     kelas = current_user.get("assigned_class")
     
@@ -5022,7 +5173,7 @@ async def create_new_announcement(data: AnnouncementCreate, current_user: dict =
         "published_at": datetime.now(timezone.utc)
     }
     
-    result = await db.announcements.insert_one(announcement)
+    result = await runtime_db.announcements.insert_one(announcement)
     announcement["_id"] = result.inserted_id
     
     # Send to parents in class
@@ -5032,14 +5183,14 @@ async def create_new_announcement(data: AnnouncementCreate, current_user: dict =
     if kelas:
         student_query["class_name"] = kelas
     
-    students = await db.students.find(student_query).to_list(500)
+    students = await runtime_db.students.find(student_query).to_list(500)
     parent_ids = list(set([s.get("parent_id") for s in students if s.get("parent_id")]))
-    parents = await db.users.find({"_id": {"$in": parent_ids}, "role": "parent"}).to_list(500)
+    parents = await runtime_db.users.find({"_id": {"$in": parent_ids}, "role": "parent"}).to_list(500)
     
     sent_count = 0
     for parent in parents:
         # Create in-app notification with FULL message content
-        await db.notifications.insert_one({
+        await runtime_db.notifications.insert_one({
             "user_id": parent["_id"],
             "type": "announcement",
             "category": "announcement",
@@ -5059,7 +5210,7 @@ async def create_new_announcement(data: AnnouncementCreate, current_user: dict =
         
         # Log push notification (would be sent by service worker)
         if data.send_push:
-            await db.push_logs.insert_one({
+            await runtime_db.push_logs.insert_one({
                 "user_id": parent["_id"],
                 "title": f"Pengumuman: {announcement['title']}",
                 "body": announcement["content"][:100],
@@ -5070,7 +5221,7 @@ async def create_new_announcement(data: AnnouncementCreate, current_user: dict =
         
         # Log email (would be sent by background job)
         if data.send_email and parent.get("email"):
-            await db.email_logs.insert_one({
+            await runtime_db.email_logs.insert_one({
                 "user_id": parent["_id"],
                 "email": parent["email"],
                 "subject": f"Pengumuman: {announcement['title']}",
@@ -5080,7 +5231,7 @@ async def create_new_announcement(data: AnnouncementCreate, current_user: dict =
                 "created_at": datetime.now(timezone.utc)
             })
     
-    await db.announcements.update_one({"_id": result.inserted_id}, {"$set": {"sent_count": sent_count}})
+    await runtime_db.announcements.update_one({"_id": result.inserted_id}, {"$set": {"sent_count": sent_count}})
     announcement["sent_count"] = sent_count
     
     return {"status": "success", "message": f"Pengumuman berjaya diterbitkan kepada {sent_count} ibu bapa", "announcement": serialize_announcement(announcement)}
@@ -5089,21 +5240,22 @@ async def create_new_announcement(data: AnnouncementCreate, current_user: dict =
 @app.delete("/api/notifications/announcements/{announcement_id}")
 async def delete_announcement_by_id(announcement_id: str, current_user: dict = Depends(require_roles("guru_kelas", "guru_homeroom", "superadmin", "admin"))):
     """Padam pengumuman"""
-    announcement = await db.announcements.find_one({"_id": ObjectId(announcement_id)})
+    runtime_db = _runtime_db()
+    announcement = await runtime_db.announcements.find_one({"_id": ObjectId(announcement_id)})
     if not announcement:
         raise HTTPException(status_code=404, detail="Pengumuman tidak dijumpai")
     
     if current_user.get("role") in ["guru_kelas", "guru_homeroom"] and announcement["created_by"] != current_user["_id"]:
         raise HTTPException(status_code=403, detail="Akses ditolak")
     
-    await db.announcements.delete_one({"_id": ObjectId(announcement_id)})
+    await runtime_db.announcements.delete_one({"_id": ObjectId(announcement_id)})
     return {"status": "deleted"}
 
 
 @app.get("/api/notifications/announcements/{announcement_id}")
 async def get_single_announcement(announcement_id: str, current_user: dict = Depends(require_roles())):
     """Get single announcement by ID"""
-    announcement = await db.announcements.find_one({"_id": ObjectId(announcement_id)})
+    announcement = await _runtime_db().announcements.find_one({"_id": ObjectId(announcement_id)})
     if not announcement:
         raise HTTPException(status_code=404, detail="Pengumuman tidak dijumpai")
     return {"announcement": serialize_announcement(announcement)}
@@ -5121,6 +5273,7 @@ async def send_quick_class_notification(
     current_user: dict = Depends(require_roles("guru_kelas", "guru_homeroom", "superadmin", "admin"))
 ):
     """Hantar notifikasi ringkas kepada ibu bapa dalam kelas"""
+    runtime_db = _runtime_db()
     tingkatan = current_user.get("assigned_form")
     kelas = current_user.get("assigned_class")
     
@@ -5130,7 +5283,7 @@ async def send_quick_class_notification(
             student_query["form"] = tingkatan
         if kelas:
             student_query["class_name"] = kelas
-        students = await db.students.find(student_query).to_list(500)
+        students = await runtime_db.students.find(student_query).to_list(500)
         parent_ids = list(set([s.get("parent_id") for s in students if s.get("parent_id")]))
     else:
         parent_ids = [ObjectId(pid) for pid in (target_parents or [])]
@@ -5138,11 +5291,11 @@ async def send_quick_class_notification(
     if not parent_ids:
         raise HTTPException(status_code=400, detail="Tiada ibu bapa untuk dihantar notifikasi")
     
-    parents = await db.users.find({"_id": {"$in": parent_ids}, "role": "parent"}).to_list(500)
+    parents = await runtime_db.users.find({"_id": {"$in": parent_ids}, "role": "parent"}).to_list(500)
     
     sent_count = 0
     for parent in parents:
-        await db.notifications.insert_one({
+        await runtime_db.notifications.insert_one({
             "user_id": parent["_id"],
             "type": "message",
             "category": "class_message",
@@ -5159,7 +5312,7 @@ async def send_quick_class_notification(
         sent_count += 1
         
         if send_push:
-            await db.push_logs.insert_one({
+            await runtime_db.push_logs.insert_one({
                 "user_id": parent["_id"],
                 "title": title,
                 "body": message[:100],
@@ -5169,7 +5322,7 @@ async def send_quick_class_notification(
             })
         
         if send_email and parent.get("email"):
-            await db.email_logs.insert_one({
+            await runtime_db.email_logs.insert_one({
                 "user_id": parent["_id"],
                 "email": parent["email"],
                 "subject": title,
@@ -5192,16 +5345,17 @@ async def get_push_public_key(current_user: dict = Depends(require_roles())):
 @app.post("/api/notifications/push/subscribe")
 async def subscribe_to_push(subscription: PushSubscriptionModel, current_user: dict = Depends(require_roles())):
     """Langgan push notification"""
-    existing = await db.push_subscriptions.find_one({"endpoint": subscription.endpoint, "user_id": current_user["_id"]})
+    runtime_db = _runtime_db()
+    existing = await runtime_db.push_subscriptions.find_one({"endpoint": subscription.endpoint, "user_id": current_user["_id"]})
     
     if existing:
-        await db.push_subscriptions.update_one(
+        await runtime_db.push_subscriptions.update_one(
             {"_id": existing["_id"]},
             {"$set": {"keys": subscription.keys, "device_info": subscription.device_info, "is_active": True, "updated_at": datetime.now(timezone.utc)}}
         )
         return {"status": "updated", "message": "Langganan dikemas kini"}
     
-    await db.push_subscriptions.insert_one({
+    await runtime_db.push_subscriptions.insert_one({
         "user_id": current_user["_id"],
         "endpoint": subscription.endpoint,
         "keys": subscription.keys,
@@ -5216,7 +5370,7 @@ async def subscribe_to_push(subscription: PushSubscriptionModel, current_user: d
 @app.get("/api/notifications/push/status")
 async def get_push_subscription_status(current_user: dict = Depends(require_roles())):
     """Dapatkan status langganan push notification"""
-    subscriptions = await db.push_subscriptions.find({"user_id": current_user["_id"], "is_active": True}).to_list(10)
+    subscriptions = await _runtime_db().push_subscriptions.find({"user_id": current_user["_id"], "is_active": True}).to_list(10)
     
     return {
         "is_subscribed": len(subscriptions) > 0,
@@ -5232,15 +5386,16 @@ async def register_vehicle(
     current_user: dict = Depends(require_roles("guard", "admin", "superadmin"))
 ):
     """Register vehicle"""
-    existing = await db.vehicles.find_one({"plate_number": vehicle.plate_number.upper()})
+    runtime_db = _runtime_db()
+    existing = await runtime_db.vehicles.find_one({"plate_number": vehicle.plate_number.upper()})
     if existing:
         raise HTTPException(status_code=400, detail="Kenderaan sudah didaftarkan")
     
     # Try users collection first (pelajar role)
-    student = await db.users.find_one({"_id": ObjectId(vehicle.student_id), "role": "pelajar"})
+    student = await runtime_db.users.find_one({"_id": ObjectId(vehicle.student_id), "role": "pelajar"})
     if not student:
         # Fallback to students collection
-        student = await db.students.find_one({"_id": ObjectId(vehicle.student_id)})
+        student = await runtime_db.students.find_one({"_id": ObjectId(vehicle.student_id)})
     if not student:
         raise HTTPException(status_code=404, detail="Pelajar tidak dijumpai")
     
@@ -5258,7 +5413,7 @@ async def register_vehicle(
         "registered_by": str(current_user["_id"]),
         "created_at": datetime.now(timezone.utc).isoformat()
     }
-    result = await db.vehicles.insert_one(vehicle_doc)
+    result = await runtime_db.vehicles.insert_one(vehicle_doc)
     
     await log_audit(current_user, "REGISTER_VEHICLE", "vehicles", f"Daftar kenderaan: {vehicle.plate_number}")
     
@@ -5270,7 +5425,8 @@ async def scan_vehicle(
     current_user: dict = Depends(require_roles("guard", "admin", "superadmin"))
 ):
     """Scan vehicle QR"""
-    vehicle = await db.vehicles.find_one({"plate_number": plate_number.upper()})
+    runtime_db = _runtime_db()
+    vehicle = await runtime_db.vehicles.find_one({"plate_number": plate_number.upper()})
     if not vehicle:
         raise HTTPException(status_code=404, detail="Kenderaan tidak didaftarkan")
     
@@ -5280,7 +5436,7 @@ async def scan_vehicle(
         "scan_time": datetime.now(timezone.utc).isoformat(),
         "scanned_by": str(current_user["_id"])
     }
-    await db.vehicle_scans.insert_one(scan_doc)
+    await runtime_db.vehicle_scans.insert_one(scan_doc)
     
     return {
         "message": "Scan berjaya",
@@ -5295,21 +5451,22 @@ async def scan_vehicle(
 @app.get("/api/vehicles")
 async def get_vehicles(current_user: dict = Depends(require_roles("guard", "admin", "superadmin"))):
     """Get all registered vehicles"""
-    vehicles = await db.vehicles.find().to_list(1000)
+    vehicles = await _runtime_db().vehicles.find().to_list(1000)
     return [{"id": str(v["_id"]), **{k: val for k, val in v.items() if k not in ["_id", "student_id"]}, "student_id": str(v["student_id"])} for v in vehicles]
 
 @app.get("/api/vehicles/stats")
 async def get_vehicle_stats(current_user: dict = Depends(require_roles("guard", "admin", "superadmin"))):
     """Get vehicle statistics"""
+    runtime_db = _runtime_db()
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     
-    total_vehicles = await db.vehicles.count_documents({})
-    today_scans = await db.vehicle_scans.count_documents({
+    total_vehicles = await runtime_db.vehicles.count_documents({})
+    today_scans = await runtime_db.vehicle_scans.count_documents({
         "scan_time": {"$regex": f"^{today}"}
     })
     
     # Recent scans
-    recent_scans = await db.vehicle_scans.find().sort("scan_time", -1).limit(10).to_list(10)
+    recent_scans = await runtime_db.vehicle_scans.find().sort("scan_time", -1).limit(10).to_list(10)
     
     return {
         "total_vehicles": total_vehicles,
@@ -5327,7 +5484,7 @@ async def search_vehicle(
     current_user: dict = Depends(require_roles("guard", "admin", "superadmin"))
 ):
     """Search vehicle by plate number"""
-    vehicle = await db.vehicles.find_one({"plate_number": {"$regex": plate_number.upper(), "$options": "i"}})
+    vehicle = await _runtime_db().vehicles.find_one({"plate_number": {"$regex": plate_number.upper(), "$options": "i"}})
     if not vehicle:
         return {"found": False, "message": "Kenderaan tidak dijumpai"}
     
@@ -5350,7 +5507,7 @@ async def delete_vehicle(
     current_user: dict = Depends(require_roles("guard", "admin", "superadmin"))
 ):
     """Delete a vehicle"""
-    result = await db.vehicles.delete_one({"_id": ObjectId(vehicle_id)})
+    result = await _runtime_db().vehicles.delete_one({"_id": ObjectId(vehicle_id)})
     if result.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Kenderaan tidak dijumpai")
     
@@ -5363,7 +5520,7 @@ async def get_vehicle_scans(
     current_user: dict = Depends(require_roles("guard", "admin", "superadmin"))
 ):
     """Get vehicle scan history"""
-    scans = await db.vehicle_scans.find().sort("scan_time", -1).limit(limit).to_list(limit)
+    scans = await _runtime_db().vehicle_scans.find().sort("scan_time", -1).limit(limit).to_list(limit)
     return [{
         "id": str(s["_id"]),
         "plate_number": s["plate_number"],
@@ -5383,7 +5540,7 @@ async def get_students_for_vehicle(
             {"matric": {"$regex": search, "$options": "i"}}
         ]
     
-    students = await db.users.find(query).limit(20).to_list(20)
+    students = await _runtime_db().users.find(query).limit(20).to_list(20)
     return [{
         "id": str(s["_id"]),
         "matric": s.get("matric", ""),
@@ -5688,7 +5845,7 @@ async def ai_chat(
     if response_text is None:
         # Ambil jawapan dari MongoDB (chatbox_responses), fallback ke AI_CHAT_DATASET jika kosong
         try:
-            cursor = db.chatbox_responses.find({}).sort("order", 1)
+            cursor = _runtime_db().chatbox_responses.find({}).sort("order", 1)
             db_responses = await cursor.to_list(length=500)
         except Exception:
             db_responses = []
@@ -5710,7 +5867,7 @@ async def ai_chat(
         )
 
     try:
-        await db.ai_chat_history.insert_many([
+        await _runtime_db().ai_chat_history.insert_many([
             {
                 "session_id": session_id,
                 "role": "user",
@@ -5751,7 +5908,7 @@ AI_CHAT_SUGGESTIONS = [
 async def get_ai_suggestions():
     """Get suggested questions from MongoDB (chatbox_suggestions)."""
     try:
-        cursor = db.chatbox_suggestions.find({}).sort("order", 1)
+        cursor = _runtime_db().chatbox_suggestions.find({}).sort("order", 1)
         docs = await cursor.to_list(length=100)
         suggestions = [x.get("text", "") for x in docs if x.get("text")]
     except Exception:
@@ -5795,38 +5952,41 @@ async def _seed_chatbox_collections():
     """Seed chatbox_faq, chatbox_responses & chatbox_suggestions sekali sahaja (dipanggil dari lifespan).
     Kosong: isi penuh. Sedia ada: pastikan SOP FAQ wujud sahaja. Elak panggilan berulang & data duplicate."""
     try:
-        faq_count = await db.chatbox_faq.count_documents({})
+        runtime_db = _runtime_db()
+        if runtime_db is None:
+            return
+        faq_count = await runtime_db.chatbox_faq.count_documents({})
         if faq_count == 0:
             for i, item in enumerate(AI_FAQ_LIST):
-                await db.chatbox_faq.insert_one({
+                await runtime_db.chatbox_faq.insert_one({
                     "question": item["q"],
                     "answer": item["a"],
                     "order": i,
                 })
         else:
             # Pastikan FAQ SOP Urusan Pelajar Harian wujud (untuk DB sedia ada)
-            existing_sop = await db.chatbox_faq.find_one({"question": SOP_FAQ_QUESTION})
+            existing_sop = await runtime_db.chatbox_faq.find_one({"question": SOP_FAQ_QUESTION})
             if not existing_sop:
-                max_order = await db.chatbox_faq.find_one(sort=[("order", -1)])
+                max_order = await runtime_db.chatbox_faq.find_one(sort=[("order", -1)])
                 next_order = (max_order["order"] + 1) if max_order and "order" in max_order else 999
-                await db.chatbox_faq.insert_one({
+                await runtime_db.chatbox_faq.insert_one({
                     "question": SOP_FAQ_QUESTION,
                     "answer": SOP_FAQ_ANSWER,
                     "order": next_order,
                 })
-        resp_count = await db.chatbox_responses.count_documents({})
+        resp_count = await runtime_db.chatbox_responses.count_documents({})
         if resp_count == 0:
             for i, (keyword, response) in enumerate(AI_CHAT_DATASET):
-                await db.chatbox_responses.insert_one({
+                await runtime_db.chatbox_responses.insert_one({
                     "keyword": keyword,
                     "response": response,
                     "order": i,
                 })
         # Soalan cadangan (untuk API jika digunakan)
-        sug_count = await db.chatbox_suggestions.count_documents({})
+        sug_count = await runtime_db.chatbox_suggestions.count_documents({})
         if sug_count == 0 and AI_CHAT_SUGGESTIONS:
             for i, s in enumerate(AI_CHAT_SUGGESTIONS):
-                await db.chatbox_suggestions.insert_one({"text": s, "order": i})
+                await runtime_db.chatbox_suggestions.insert_one({"text": s, "order": i})
     except Exception:
         pass
 
@@ -5834,7 +5994,7 @@ async def _seed_chatbox_collections():
 @app.get("/api/ai/faq")
 async def get_ai_faq():
     """Get FAQ list for chatbox tab from MongoDB (chatbox_faq). Termasuk lampiran jika ada."""
-    cursor = db.chatbox_faq.find({}).sort("order", 1)
+    cursor = _runtime_db().chatbox_faq.find({}).sort("order", 1)
     items = await cursor.to_list(length=200)
     faq = []
     base_url = os.environ.get("REACT_APP_BACKEND_URL", "").rstrip("/") or ""
@@ -5857,7 +6017,7 @@ class MyDigitalIDSettings(BaseModel):
 @app.get("/api/settings/mydigitalid")
 async def get_mydigitalid_settings():
     """Get MyDigital ID settings (public endpoint for login page)"""
-    settings = await db.settings.find_one({"key": "mydigitalid"})
+    settings = await _runtime_db().settings.find_one({"key": "mydigitalid"})
     if settings:
         return {
             "enabled": True,
@@ -5873,7 +6033,7 @@ async def save_mydigitalid_settings(
     current_user: dict = Depends(require_roles("superadmin"))
 ):
     """Save MyDigital ID settings (SuperAdmin only)"""
-    await db.settings.update_one(
+    await _runtime_db().settings.update_one(
         {"key": "mydigitalid"},
         {"$set": {
             "key": "mydigitalid",
@@ -5893,7 +6053,7 @@ async def delete_mydigitalid_settings(
     current_user: dict = Depends(require_roles("superadmin"))
 ):
     """Delete MyDigital ID settings (SuperAdmin only)"""
-    await db.settings.delete_one({"key": "mydigitalid"})
+    await _runtime_db().settings.delete_one({"key": "mydigitalid"})
     await log_audit(current_user, "DELETE_SETTINGS", "settings", "Padam tetapan MyDigital ID")
     return {"message": "Tetapan MyDigital ID dipadam", "success": True}
 
@@ -5901,7 +6061,8 @@ async def delete_mydigitalid_settings(
 async def mydigitalid_mock_login():
     """Mock MyDigital ID login - returns a demo parent token"""
     # Find or create a demo parent user
-    demo_user = await db.users.find_one({"email": "demo.mydigitalid@muafakat.link"})
+    runtime_db = _runtime_db()
+    demo_user = await runtime_db.users.find_one({"email": "demo.mydigitalid@muafakat.link"})
     
     if not demo_user:
         # Create demo user for MyDigital ID
@@ -5916,7 +6077,7 @@ async def mydigitalid_mock_login():
             "auth_method": "mydigitalid",
             "created_at": datetime.now(timezone.utc).isoformat()
         }
-        result = await db.users.insert_one(demo_doc)
+        result = await runtime_db.users.insert_one(demo_doc)
         demo_doc["_id"] = result.inserted_id
         demo_user = demo_doc
     
@@ -5933,7 +6094,7 @@ async def get_email_settings(current_user: dict = Depends(get_current_user)):
     if current_user.get("role") != "superadmin":
         raise HTTPException(status_code=403, detail="Akses ditolak")
     
-    settings = await db.settings.find_one({"type": "email"}, {"_id": 0})
+    settings = await _runtime_db().settings.find_one({"type": "email"}, {"_id": 0})
     if settings:
         if settings.get("api_key"):
             key = settings["api_key"]
@@ -5955,7 +6116,7 @@ async def save_email_settings(settings: dict, current_user: dict = Depends(get_c
     if not api_key.startswith("re_"):
         raise HTTPException(status_code=400, detail="API Key tidak sah. Mesti bermula dengan 're_'")
     
-    await db.settings.update_one(
+    await _runtime_db().settings.update_one(
         {"type": "email"},
         {"$set": {
             "type": "email",
@@ -5977,7 +6138,7 @@ async def delete_email_settings(current_user: dict = Depends(get_current_user)):
     if current_user.get("role") != "superadmin":
         raise HTTPException(status_code=403, detail="Akses ditolak")
     
-    await db.settings.delete_one({"type": "email"})
+    await _runtime_db().settings.delete_one({"type": "email"})
     await log_audit(current_user, "EMAIL_SETTINGS_DELETED", "settings", "Email settings deleted")
     return {"message": "Tetapan email dipadam"}
 
@@ -6003,16 +6164,17 @@ async def get_email_status(current_user: dict = Depends(get_current_user)):
         from services.ses_service import SES_ENABLED
     except ImportError:
         SES_ENABLED = False
+    runtime_db = _runtime_db()
     smtp_from_db = False
     ses_from_db = False
     if get_smtp_config_from_db:
         try:
-            smtp_from_db = await get_smtp_config_from_db(db) is not None
+            smtp_from_db = await get_smtp_config_from_db(runtime_db) is not None
         except Exception:
             pass
     if get_ses_config_from_db:
         try:
-            ses_from_db = await get_ses_config_from_db(db) is not None
+            ses_from_db = await get_ses_config_from_db(runtime_db) is not None
         except Exception:
             pass
     smtp_enabled = SMTP_ENABLED or smtp_from_db
@@ -6042,7 +6204,7 @@ async def get_ses_settings(current_user: dict = Depends(get_current_user)):
     """Dapatkan tetapan AWS SES (rahsia disamarkan). Superadmin/admin sahaja."""
     if current_user.get("role") not in ("superadmin", "admin"):
         raise HTTPException(status_code=403, detail="Akses ditolak")
-    doc = await db.settings.find_one({"type": "ses"}, {"_id": 0})
+    doc = await _runtime_db().settings.find_one({"type": "ses"}, {"_id": 0})
     if not doc:
         return {"enabled": False}
     out = {
@@ -6068,7 +6230,7 @@ async def save_ses_settings(body: dict, current_user: dict = Depends(get_current
     if not access_key_id:
         raise HTTPException(status_code=400, detail="Access Key ID wajib")
     if not secret_access_key:
-        existing = await db.settings.find_one({"type": "ses"})
+        existing = await _runtime_db().settings.find_one({"type": "ses"})
         if existing and existing.get("secret_access_key"):
             secret_access_key = existing["secret_access_key"]
         else:
@@ -6082,7 +6244,7 @@ async def save_ses_settings(body: dict, current_user: dict = Depends(get_current
         "updated_at": datetime.now(timezone.utc).isoformat(),
         "updated_by": str(current_user.get("id", current_user.get("_id", ""))),
     }
-    await db.settings.update_one({"type": "ses"}, {"$set": update}, upsert=True)
+    await _runtime_db().settings.update_one({"type": "ses"}, {"$set": update}, upsert=True)
     await log_audit(current_user, "SES_SETTINGS_UPDATED", "settings", "SES settings updated")
     return {"message": "Tetapan AWS SES disimpan"}
 
@@ -6092,7 +6254,7 @@ async def delete_ses_settings(current_user: dict = Depends(get_current_user)):
     """Padam tetapan AWS SES. Superadmin/admin sahaja."""
     if current_user.get("role") not in ("superadmin", "admin"):
         raise HTTPException(status_code=403, detail="Akses ditolak")
-    await db.settings.delete_one({"type": "ses"})
+    await _runtime_db().settings.delete_one({"type": "ses"})
     await log_audit(current_user, "SES_SETTINGS_DELETED", "settings", "SES settings deleted")
     return {"message": "Tetapan AWS SES dipadam"}
 
@@ -6102,7 +6264,7 @@ async def get_smtp_settings(current_user: dict = Depends(get_current_user)):
     """Dapatkan tetapan SMTP (kata laluan disamarkan). Superadmin/admin sahaja."""
     if current_user.get("role") not in ("superadmin", "admin"):
         raise HTTPException(status_code=403, detail="Akses ditolak")
-    doc = await db.settings.find_one({"type": "smtp"}, {"_id": 0})
+    doc = await _runtime_db().settings.find_one({"type": "smtp"}, {"_id": 0})
     if not doc:
         return {"enabled": False}
     out = {
@@ -6132,7 +6294,7 @@ async def save_smtp_settings(body: dict, current_user: dict = Depends(get_curren
     if not host or not user:
         raise HTTPException(status_code=400, detail="Host dan User SMTP wajib")
     if not password:
-        existing = await db.settings.find_one({"type": "smtp"})
+        existing = await _runtime_db().settings.find_one({"type": "smtp"})
         if existing and existing.get("password"):
             password = existing["password"]
         else:
@@ -6148,7 +6310,7 @@ async def save_smtp_settings(body: dict, current_user: dict = Depends(get_curren
         "updated_at": datetime.now(timezone.utc).isoformat(),
         "updated_by": str(current_user.get("id", current_user.get("_id", ""))),
     }
-    await db.settings.update_one({"type": "smtp"}, {"$set": update}, upsert=True)
+    await _runtime_db().settings.update_one({"type": "smtp"}, {"$set": update}, upsert=True)
     await log_audit(current_user, "SMTP_SETTINGS_UPDATED", "settings", "SMTP settings updated")
     return {"message": "Tetapan SMTP disimpan"}
 
@@ -6158,7 +6320,7 @@ async def delete_smtp_settings(current_user: dict = Depends(get_current_user)):
     """Padam tetapan SMTP. Superadmin/admin sahaja."""
     if current_user.get("role") not in ("superadmin", "admin"):
         raise HTTPException(status_code=403, detail="Akses ditolak")
-    await db.settings.delete_one({"type": "smtp"})
+    await _runtime_db().settings.delete_one({"type": "smtp"})
     await log_audit(current_user, "SMTP_SETTINGS_DELETED", "settings", "SMTP settings deleted")
     return {"message": "Tetapan SMTP dipadam"}
 
@@ -6176,7 +6338,8 @@ async def test_email(request: dict, current_user: dict = Depends(get_current_use
     if not recipient_email:
         raise HTTPException(status_code=400, detail="Email penerima diperlukan")
     
-    settings = await db.settings.find_one({"type": "email"}, {"_id": 0})
+    runtime_db = _runtime_db()
+    settings = await runtime_db.settings.find_one({"type": "email"}, {"_id": 0})
     if not settings or not settings.get("api_key"):
         raise HTTPException(status_code=400, detail="Tetapan email belum dikonfigurasi")
     
@@ -6219,7 +6382,7 @@ async def test_email(request: dict, current_user: dict = Depends(get_current_use
     try:
         email = await asyncio.to_thread(resend.Emails.send, params)
         
-        await db.email_logs.insert_one({
+        await runtime_db.email_logs.insert_one({
             "type": "test",
             "recipient": recipient_email,
             "status": "sent",
@@ -6244,6 +6407,11 @@ async def test_email(request: dict, current_user: dict = Depends(get_current_use
         raise HTTPException(status_code=500, detail=f"Gagal menghantar email: {error_msg}")
 
 # ============ BUS TICKET MANAGEMENT SYSTEM ============
+
+
+def _runtime_db():
+    """Resolve active runtime DB (CoreStore in postgres mode)."""
+    return adapt_notifications_read_db(core_db or db)
 
 # Import bus routes and models
 from models.bus import (
@@ -6272,7 +6440,7 @@ async def get_bus_companies(
     current_user: dict = Depends(require_roles("superadmin", "admin", "bus_admin"))
 ):
     """Get all bus companies (filter by application_status: pending, approved, rejected, need_documents)"""
-    return await bus_routes.get_bus_companies(db, is_active, is_verified, application_status)
+    return await bus_routes.get_bus_companies(_runtime_db(), is_active, is_verified, application_status)
 
 @app.post("/api/bus/companies", response_model=BusCompanyResponse)
 async def create_bus_company(
@@ -6280,14 +6448,14 @@ async def create_bus_company(
     current_user: dict = Depends(require_roles("superadmin", "admin", "bus_admin"))
 ):
     """Create new bus company"""
-    result = await bus_routes.create_bus_company(db, data, str(current_user["_id"]))
+    result = await bus_routes.create_bus_company(_runtime_db(), data, str(current_user["_id"]))
     await log_audit(current_user, "CREATE_BUS_COMPANY", "bus", f"Cipta syarikat bas: {data.name}")
     return result
 
 @app.post("/api/bus/companies/register", response_model=BusCompanyResponse)
 async def register_bus_company_public(data: BusCompanyCreate):
     """Pendaftaran syarikat bas oleh syarikat sendiri (awam, tanpa login). Status = Pending; Admin Bas akan lulus kemudian."""
-    return await bus_routes.create_bus_company_public(db, data)
+    return await bus_routes.create_bus_company_public(_runtime_db(), data)
 
 @app.get("/api/bus/companies/{company_id}", response_model=BusCompanyResponse)
 async def get_bus_company(
@@ -6295,7 +6463,7 @@ async def get_bus_company(
     current_user: dict = Depends(require_roles("superadmin", "admin", "bus_admin"))
 ):
     """Get single bus company"""
-    return await bus_routes.get_bus_company(db, company_id)
+    return await bus_routes.get_bus_company(_runtime_db(), company_id)
 
 @app.put("/api/bus/companies/{company_id}", response_model=BusCompanyResponse)
 async def update_bus_company(
@@ -6304,7 +6472,7 @@ async def update_bus_company(
     current_user: dict = Depends(require_roles("superadmin", "admin", "bus_admin"))
 ):
     """Update bus company"""
-    result = await bus_routes.update_bus_company(db, company_id, data)
+    result = await bus_routes.update_bus_company(_runtime_db(), company_id, data)
     await log_audit(current_user, "UPDATE_BUS_COMPANY", "bus", f"Kemaskini syarikat bas: {company_id}")
     return result
 
@@ -6316,7 +6484,7 @@ async def approve_bus_company(
 ):
     """Admin Bas: Lulus / Ditolak / Perlu Dokumen Tambahan permohonan syarikat"""
     result = await bus_routes.approve_bus_company(
-        db, company_id, data.application_status, data.officer_notes, str(current_user["_id"])
+        _runtime_db(), company_id, data.application_status, data.officer_notes, str(current_user["_id"])
     )
     await log_audit(current_user, "APPROVE_BUS_COMPANY", "bus", f"Status {data.application_status}: {company_id}")
     return result
@@ -6327,7 +6495,7 @@ async def delete_bus_company(
     current_user: dict = Depends(require_roles("superadmin", "admin", "bus_admin"))
 ):
     """Delete bus company"""
-    result = await bus_routes.delete_bus_company(db, company_id)
+    result = await bus_routes.delete_bus_company(_runtime_db(), company_id)
     await log_audit(current_user, "DELETE_BUS_COMPANY", "bus", f"Padam syarikat bas: {company_id}")
     return result
 
@@ -6340,7 +6508,7 @@ async def get_buses(
     current_user: dict = Depends(require_roles("superadmin", "admin", "bus_admin"))
 ):
     """Get all buses"""
-    return await bus_routes.get_buses(db, company_id, is_active)
+    return await bus_routes.get_buses(_runtime_db(), company_id, is_active)
 
 @app.post("/api/bus/buses", response_model=BusResponse)
 async def create_bus(
@@ -6348,7 +6516,7 @@ async def create_bus(
     current_user: dict = Depends(require_roles("superadmin", "admin", "bus_admin"))
 ):
     """Create new bus"""
-    result = await bus_routes.create_bus(db, data, str(current_user["_id"]))
+    result = await bus_routes.create_bus(_runtime_db(), data, str(current_user["_id"]))
     await log_audit(current_user, "CREATE_BUS", "bus", f"Daftar bas: {data.plate_number}")
     return result
 
@@ -6358,7 +6526,7 @@ async def get_bus(
     current_user: dict = Depends(require_roles("superadmin", "admin", "bus_admin"))
 ):
     """Get single bus"""
-    return await bus_routes.get_bus(db, bus_id)
+    return await bus_routes.get_bus(_runtime_db(), bus_id)
 
 @app.put("/api/bus/buses/{bus_id}", response_model=BusResponse)
 async def update_bus(
@@ -6367,7 +6535,7 @@ async def update_bus(
     current_user: dict = Depends(require_roles("superadmin", "admin", "bus_admin"))
 ):
     """Update bus"""
-    result = await bus_routes.update_bus(db, bus_id, data)
+    result = await bus_routes.update_bus(_runtime_db(), bus_id, data)
     await log_audit(current_user, "UPDATE_BUS", "bus", f"Kemaskini bas: {bus_id}")
     return result
 
@@ -6377,7 +6545,7 @@ async def delete_bus(
     current_user: dict = Depends(require_roles("superadmin", "admin", "bus_admin"))
 ):
     """Delete bus"""
-    result = await bus_routes.delete_bus(db, bus_id)
+    result = await bus_routes.delete_bus(_runtime_db(), bus_id)
     await log_audit(current_user, "DELETE_BUS", "bus", f"Padam bas: {bus_id}")
     return result
 
@@ -6390,7 +6558,7 @@ async def get_bus_routes(
     current_user: dict = Depends(require_roles("superadmin", "admin", "bus_admin"))
 ):
     """Get all bus routes"""
-    return await bus_routes.get_routes(db, company_id, is_active)
+    return await bus_routes.get_routes(_runtime_db(), company_id, is_active)
 
 @app.post("/api/bus/routes", response_model=RouteResponse)
 async def create_bus_route(
@@ -6398,7 +6566,7 @@ async def create_bus_route(
     current_user: dict = Depends(require_roles("superadmin", "admin", "bus_admin"))
 ):
     """Create new bus route"""
-    result = await bus_routes.create_route(db, data, str(current_user["_id"]))
+    result = await bus_routes.create_route(_runtime_db(), data, str(current_user["_id"]))
     await log_audit(current_user, "CREATE_ROUTE", "bus", f"Cipta route: {data.name}")
     return result
 
@@ -6408,7 +6576,7 @@ async def get_bus_route(
     current_user: dict = Depends(require_roles("superadmin", "admin", "bus_admin"))
 ):
     """Get single bus route"""
-    return await bus_routes.get_route(db, route_id)
+    return await bus_routes.get_route(_runtime_db(), route_id)
 
 @app.put("/api/bus/routes/{route_id}", response_model=RouteResponse)
 async def update_bus_route(
@@ -6417,7 +6585,7 @@ async def update_bus_route(
     current_user: dict = Depends(require_roles("superadmin", "admin", "bus_admin"))
 ):
     """Update bus route"""
-    result = await bus_routes.update_route(db, route_id, data)
+    result = await bus_routes.update_route(_runtime_db(), route_id, data)
     await log_audit(current_user, "UPDATE_ROUTE", "bus", f"Kemaskini route: {route_id}")
     return result
 
@@ -6427,7 +6595,7 @@ async def delete_bus_route(
     current_user: dict = Depends(require_roles("superadmin", "admin", "bus_admin"))
 ):
     """Delete bus route"""
-    result = await bus_routes.delete_route(db, route_id)
+    result = await bus_routes.delete_route(_runtime_db(), route_id)
     await log_audit(current_user, "DELETE_ROUTE", "bus", f"Padam route: {route_id}")
     return result
 
@@ -6444,7 +6612,7 @@ async def get_bus_trips(
     current_user: dict = Depends(require_roles("superadmin", "admin", "bus_admin"))
 ):
     """Get all bus trips"""
-    return await bus_routes.get_trips(db, route_id, bus_id, company_id, status, date_from, date_to)
+    return await bus_routes.get_trips(_runtime_db(), route_id, bus_id, company_id, status, date_from, date_to)
 
 @app.post("/api/bus/trips", response_model=TripResponse)
 async def create_bus_trip(
@@ -6452,7 +6620,7 @@ async def create_bus_trip(
     current_user: dict = Depends(require_roles("superadmin", "admin", "bus_admin"))
 ):
     """Create new bus trip"""
-    result = await bus_routes.create_trip(db, data, str(current_user["_id"]))
+    result = await bus_routes.create_trip(_runtime_db(), data, str(current_user["_id"]))
     await log_audit(current_user, "CREATE_TRIP", "bus", f"Cipta trip: {data.departure_date}")
     return result
 
@@ -6462,7 +6630,7 @@ async def get_bus_trip(
     current_user: dict = Depends(get_current_user)
 ):
     """Get single bus trip"""
-    return await bus_routes.get_trip(db, trip_id)
+    return await bus_routes.get_trip(_runtime_db(), trip_id)
 
 @app.put("/api/bus/trips/{trip_id}", response_model=TripResponse)
 async def update_bus_trip(
@@ -6471,7 +6639,7 @@ async def update_bus_trip(
     current_user: dict = Depends(require_roles("superadmin", "admin", "bus_admin"))
 ):
     """Update bus trip"""
-    result = await bus_routes.update_trip(db, trip_id, data)
+    result = await bus_routes.update_trip(_runtime_db(), trip_id, data)
     await log_audit(current_user, "UPDATE_TRIP", "bus", f"Kemaskini trip: {trip_id}")
     return result
 
@@ -6482,7 +6650,7 @@ async def cancel_bus_trip(
     current_user: dict = Depends(require_roles("superadmin", "admin", "bus_admin"))
 ):
     """Cancel bus trip"""
-    result = await bus_routes.cancel_trip(db, trip_id, reason)
+    result = await bus_routes.cancel_trip(_runtime_db(), trip_id, reason)
     await log_audit(current_user, "CANCEL_TRIP", "bus", f"Batal trip: {trip_id}")
     return result
 
@@ -6492,7 +6660,7 @@ async def get_trip_seat_map(
     current_user: dict = Depends(get_current_user)
 ):
     """Get seat map for a trip"""
-    return await bus_routes.get_trip_seat_map(db, trip_id)
+    return await bus_routes.get_trip_seat_map(_runtime_db(), trip_id)
 
 # --- DRIVER BAS ENDPOINTS ---
 
@@ -6501,7 +6669,7 @@ async def driver_get_my_trips(
     current_user: dict = Depends(require_roles("bus_driver"))
 ):
     """Driver Bas: senarai trip untuk bas yang ditugaskan (hari ini & akan datang)"""
-    return await bus_routes.get_driver_trips(db, current_user)
+    return await bus_routes.get_driver_trips(_runtime_db(), current_user)
 
 @app.get("/api/bus/driver/trips/{trip_id}/students")
 async def driver_get_trip_students(
@@ -6509,7 +6677,7 @@ async def driver_get_trip_students(
     current_user: dict = Depends(require_roles("bus_driver"))
 ):
     """Driver Bas: senarai pelajar menaiki bas + checkpoint drop-off"""
-    return await bus_routes.get_trip_students_for_driver(db, trip_id, current_user)
+    return await bus_routes.get_trip_students_for_driver(_runtime_db(), trip_id, current_user)
 
 @app.post("/api/bus/driver/location")
 async def driver_update_location(
@@ -6519,20 +6687,20 @@ async def driver_update_location(
     current_user: dict = Depends(require_roles("bus_driver"))
 ):
     """Driver Bas: hantar lokasi semasa (untuk peta live ibu bapa)"""
-    return await bus_routes.update_bus_live_location(db, trip_id, lat, lng, current_user)
+    return await bus_routes.update_bus_live_location(_runtime_db(), trip_id, lat, lng, current_user)
 
 # --- LIVE LOCATION (untuk ibu bapa / peta) ---
 
 @app.get("/api/bus/live-location/{trip_id}")
 async def get_bus_live_location(trip_id: str):
     """Dapat lokasi bas semasa untuk trip (peta live). Ibu bapa guna trip_id dari tempahan."""
-    loc = await bus_routes.get_bus_live_location(db, trip_id)
+    loc = await bus_routes.get_bus_live_location(_runtime_db(), trip_id)
     return loc if loc else {}
 
 @app.get("/api/bus/trips/{trip_id}/map-info")
 async def get_trip_map_info(trip_id: str):
     """Maklumat trip untuk peta (route, drop-off, plat bas). Awam dengan trip_id."""
-    info = await bus_routes.get_trip_for_live_map(db, trip_id)
+    info = await bus_routes.get_trip_for_live_map(_runtime_db(), trip_id)
     if not info:
         raise HTTPException(status_code=404, detail="Trip tidak dijumpai")
     return info
@@ -6548,9 +6716,9 @@ async def get_bus_bookings(
 ):
     """Get bookings based on role"""
     if current_user["role"] == "parent":
-        return await bus_routes.get_bookings(db, trip_id, student_id, str(current_user["_id"]), status)
+        return await bus_routes.get_bookings(_runtime_db(), trip_id, student_id, str(current_user["_id"]), status)
     elif current_user["role"] in ["superadmin", "admin", "bus_admin"]:
-        return await bus_routes.get_bookings(db, trip_id, student_id, None, status)
+        return await bus_routes.get_bookings(_runtime_db(), trip_id, student_id, None, status)
     else:
         raise HTTPException(status_code=403, detail="Akses ditolak")
 
@@ -6560,29 +6728,30 @@ async def create_bus_booking(
     current_user: dict = Depends(require_roles("parent", "pelajar"))
 ):
     """Create new booking (Parent or Student)"""
+    runtime_db = _runtime_db()
     # Check if hostel leave approval is required
-    bus_settings = await db.settings.find_one({"type": "bus_booking"})
+    bus_settings = await runtime_db.settings.find_one({"type": "bus_booking"})
     require_leave_approval = bus_settings.get("require_leave_approval", False) if bus_settings else False
     
     if require_leave_approval:
         # Get student info
-        student = await db.students.find_one({"_id": ObjectId(data.student_id)})
+        student = await runtime_db.students.find_one({"_id": ObjectId(data.student_id)})
         if not student:
             # Check if pelajar user
-            student = await db.users.find_one({"_id": ObjectId(data.student_id), "role": "pelajar"})
+            student = await runtime_db.users.find_one({"_id": ObjectId(data.student_id), "role": "pelajar"})
         
         if not student:
             raise HTTPException(status_code=404, detail="Pelajar tidak dijumpai")
         
         # Check for approved pulang bermalam
-        trip = await db.bus_trips.find_one({"_id": ObjectId(data.trip_id)})
+        trip = await runtime_db.bus_trips.find_one({"_id": ObjectId(data.trip_id)})
         if not trip:
             raise HTTPException(status_code=404, detail="Trip tidak dijumpai")
         
         departure_date = trip.get("departure_date", "")
         
         # Find approved pulang bermalam that covers this trip date
-        approved_leave = await db.hostel_records.find_one({
+        approved_leave = await runtime_db.hostel_records.find_one({
             "student_id": ObjectId(data.student_id),
             "kategori": "pulang_bermalam",
             "status": "approved",
@@ -6601,7 +6770,7 @@ async def create_bus_booking(
         # Add pulang bermalam id to booking
         data.pulang_bermalam_id = str(approved_leave["_id"])
     
-    result = await bus_routes.create_booking(db, data, str(current_user["_id"]))
+    result = await bus_routes.create_booking(_runtime_db(), data, str(current_user["_id"]))
     await log_audit(current_user, "CREATE_BOOKING", "bus", f"Tempah tiket: {result.booking_number}")
     return result
 
@@ -6611,7 +6780,7 @@ async def get_bus_booking(
     current_user: dict = Depends(get_current_user)
 ):
     """Get single booking"""
-    booking = await bus_routes.get_booking(db, booking_id)
+    booking = await bus_routes.get_booking(_runtime_db(), booking_id)
     
     # Check access
     if current_user["role"] == "parent" and booking.parent_id != str(current_user["_id"]):
@@ -6626,7 +6795,7 @@ async def update_bus_booking(
     current_user: dict = Depends(require_roles("superadmin", "admin", "bus_admin"))
 ):
     """Update booking (Admin/Bus Admin only)"""
-    result = await bus_routes.update_booking(db, booking_id, data)
+    result = await bus_routes.update_booking(_runtime_db(), booking_id, data)
     await log_audit(current_user, "UPDATE_BOOKING", "bus", f"Kemaskini tempahan: {booking_id}")
     return result
 
@@ -6637,7 +6806,7 @@ async def assign_booking_seat(
     current_user: dict = Depends(require_roles("superadmin", "admin", "bus_admin"))
 ):
     """Assign seat to booking"""
-    result = await bus_routes.assign_seat(db, booking_id, seat_number)
+    result = await bus_routes.assign_seat(_runtime_db(), booking_id, seat_number)
     await log_audit(current_user, "ASSIGN_SEAT", "bus", f"Berikan tempat duduk {seat_number} untuk tempahan {booking_id}")
     return result
 
@@ -6650,11 +6819,11 @@ async def cancel_bus_booking(
     """Cancel booking"""
     # Parents can only cancel their own bookings
     if current_user["role"] == "parent":
-        booking = await bus_routes.get_booking(db, booking_id)
+        booking = await bus_routes.get_booking(_runtime_db(), booking_id)
         if booking.parent_id != str(current_user["_id"]):
             raise HTTPException(status_code=403, detail="Akses ditolak")
     
-    result = await bus_routes.cancel_booking(db, booking_id, reason)
+    result = await bus_routes.cancel_booking(_runtime_db(), booking_id, reason)
     await log_audit(current_user, "CANCEL_BOOKING", "bus", f"Batal tempahan: {booking_id}")
     return result
 
@@ -6666,12 +6835,12 @@ async def get_available_trips_public(
     destination: Optional[str] = None
 ):
     """Get available trips for booking (Public)"""
-    return await bus_routes.get_available_trips(db, date_from, destination)
+    return await bus_routes.get_available_trips(_runtime_db(), date_from, destination)
 
 @app.get("/api/public/bus/trips/{trip_id}/seats")
 async def get_trip_seat_map_public(trip_id: str):
     """Get seat map for a trip (Public)"""
-    return await bus_routes.get_trip_seat_map(db, trip_id)
+    return await bus_routes.get_trip_seat_map(_runtime_db(), trip_id)
 
 # --- BUS STATISTICS ---
 
@@ -6680,11 +6849,12 @@ async def get_bus_stats(
     current_user: dict = Depends(require_roles("superadmin", "admin", "bus_admin"))
 ):
     """Get bus system statistics"""
-    total_companies = await db.bus_companies.count_documents({"is_active": True})
-    total_buses = await db.buses.count_documents({"is_active": True})
-    total_routes = await db.bus_routes.count_documents({"is_active": True})
-    total_trips = await db.bus_trips.count_documents({"status": "scheduled"})
-    total_bookings = await db.bus_bookings.count_documents({"status": {"$nin": ["cancelled"]}})
+    runtime_db = _runtime_db()
+    total_companies = await runtime_db.bus_companies.count_documents({"is_active": True})
+    total_buses = await runtime_db.buses.count_documents({"is_active": True})
+    total_routes = await runtime_db.bus_routes.count_documents({"is_active": True})
+    total_trips = await runtime_db.bus_trips.count_documents({"status": "scheduled"})
+    total_bookings = await runtime_db.bus_bookings.count_documents({"status": {"$nin": ["cancelled"]}})
     
     return {
         "total_companies": total_companies,
@@ -6728,7 +6898,7 @@ async def get_pwa_settings(current_user: dict = Depends(get_current_user)):
     """Get PWA/Smart360 settings (untuk modul ketetapan)"""
     if current_user.get("role") not in ("superadmin", "admin"):
         raise HTTPException(status_code=403, detail="Akses ditolak")
-    doc = await db.settings.find_one({"type": "pwa"}, {"_id": 0})
+    doc = await _runtime_db().settings.find_one({"type": "pwa"}, {"_id": 0})
     if doc:
         return {
             "name": doc.get("name", "Smart 360 AI Edition"),
@@ -6771,7 +6941,7 @@ async def save_pwa_settings(
     current_user: dict = Depends(require_roles("superadmin", "admin")),
 ):
     """Save PWA + Splash settings ke database (Superadmin/Admin)"""
-    await db.settings.update_one(
+    await _runtime_db().settings.update_one(
         {"type": "pwa"},
         {"$set": {
             "type": "pwa",
@@ -6800,7 +6970,7 @@ async def save_pwa_settings(
 @app.get("/api/public/settings/pwa")
 async def get_pwa_settings_public():
     """Tetapan PWA untuk awam (meta tag, manifest) - tiada auth"""
-    doc = await db.settings.find_one({"type": "pwa"}, {"_id": 0})
+    doc = await _runtime_db().settings.find_one({"type": "pwa"}, {"_id": 0})
     if doc:
         return {
             "name": doc.get("name", "Smart 360 AI Edition"),
@@ -6840,7 +7010,7 @@ async def get_landing_settings(current_user: dict = Depends(get_current_user)):
     """Get landing page settings (hero image). Superadmin/Admin sahaja."""
     if current_user.get("role") not in ("superadmin", "admin"):
         raise HTTPException(status_code=403, detail="Akses ditolak")
-    doc = await db.settings.find_one({"type": "landing"}, {"_id": 0})
+    doc = await _runtime_db().settings.find_one({"type": "landing"}, {"_id": 0})
     if doc:
         return {"hero_image_url": doc.get("hero_image_url") or ""}
     return {"hero_image_url": ""}
@@ -6849,7 +7019,7 @@ async def get_landing_settings(current_user: dict = Depends(get_current_user)):
 @app.get("/api/settings/landing/public")
 async def get_landing_settings_public():
     """Get landing hero image URL (awam - untuk paparan landing page)."""
-    doc = await db.settings.find_one({"type": "landing"}, {"_id": 0})
+    doc = await _runtime_db().settings.find_one({"type": "landing"}, {"_id": 0})
     if doc and doc.get("hero_image_url"):
         return {"hero_image_url": doc["hero_image_url"]}
     return {"hero_image_url": ""}
@@ -6861,7 +7031,7 @@ async def save_landing_settings(
     current_user: dict = Depends(require_roles("superadmin", "admin")),
 ):
     """Save landing page settings (gambar hero)."""
-    await db.settings.update_one(
+    await _runtime_db().settings.update_one(
         {"type": "landing"},
         {"$set": {
             "type": "landing",
@@ -6899,7 +7069,7 @@ async def get_onboarding_settings(current_user: dict = Depends(get_current_user)
     """Get onboarding slides (untuk modul tetapan - Superadmin/Admin)."""
     if current_user.get("role") not in ("superadmin", "admin"):
         raise HTTPException(status_code=403, detail="Akses ditolak")
-    doc = await db.settings.find_one({"type": "onboarding"}, {"_id": 0})
+    doc = await _runtime_db().settings.find_one({"type": "onboarding"}, {"_id": 0})
     if doc and doc.get("slides"):
         slides = sorted(doc["slides"], key=lambda s: s.get("order", 0))
         return {"slides": slides, "updated_at": doc.get("updated_at")}
@@ -6922,7 +7092,7 @@ async def save_onboarding_settings(
             "image_url": (getattr(s, "image_url", None) or "").strip() or None,
         })
     slides.sort(key=lambda x: x["order"])
-    await db.settings.update_one(
+    await _runtime_db().settings.update_one(
         {"type": "onboarding"},
         {"$set": {
             "type": "onboarding",
@@ -6938,7 +7108,7 @@ async def save_onboarding_settings(
 @app.get("/api/public/settings/onboarding")
 async def get_onboarding_settings_public():
     """Tetapan onboarding untuk awam (paparan slider pertama kali - tiada auth)."""
-    doc = await db.settings.find_one({"type": "onboarding"}, {"_id": 0})
+    doc = await _runtime_db().settings.find_one({"type": "onboarding"}, {"_id": 0})
     if doc and doc.get("slides"):
         slides = sorted(doc["slides"], key=lambda s: s.get("order", 0))
         return {"slides": slides}
@@ -6958,7 +7128,7 @@ DEFAULT_INSTITUTION_NAME = "MRSMKU"
 @app.get("/api/public/settings/portal")
 async def get_portal_settings_public():
     """Tetapan portal untuk awam (tajuk portal & nama institusi - tiada auth). Untuk sesuaikan dengan MRSM lain."""
-    doc = await db.settings.find_one({"type": "portal"}, {"_id": 0})
+    doc = await _runtime_db().settings.find_one({"type": "portal"}, {"_id": 0})
     if doc:
         return {
             "portal_title": (doc.get("portal_title") or "").strip() or DEFAULT_PORTAL_TITLE,
@@ -6972,7 +7142,7 @@ async def get_portal_settings(current_user: dict = Depends(get_current_user)):
     """Get portal settings. Superadmin/Admin sahaja."""
     if current_user.get("role") not in ("superadmin", "admin"):
         raise HTTPException(status_code=403, detail="Akses ditolak")
-    doc = await db.settings.find_one({"type": "portal"}, {"_id": 0})
+    doc = await _runtime_db().settings.find_one({"type": "portal"}, {"_id": 0})
     if doc:
         return {
             "portal_title": doc.get("portal_title") or DEFAULT_PORTAL_TITLE,
@@ -6997,7 +7167,7 @@ async def save_portal_settings(
     updates["type"] = "portal"
     updates["updated_at"] = datetime.now(timezone.utc).isoformat()
     updates["updated_by"] = str(current_user.get("_id", ""))
-    await db.settings.update_one({"type": "portal"}, {"$set": updates}, upsert=True)
+    await _runtime_db().settings.update_one({"type": "portal"}, {"$set": updates}, upsert=True)
     return {"message": "Tetapan portal berjaya disimpan"}
 
 
@@ -7017,7 +7187,7 @@ def _abs_url(base: str, path: str) -> str:
 @app.get("/api/manifest")
 async def get_manifest():
     """Manifest PWA dinamik dari DB (untuk Add to Home Screen). Jika app_base_url diset, start_url/scope/ikon guna URL penuh supaya betul bila API lain origin."""
-    doc = await db.settings.find_one({"type": "pwa"}, {"_id": 0})
+    doc = await _runtime_db().settings.find_one({"type": "pwa"}, {"_id": 0})
     name = doc.get("name", "Smart360") if doc else "Smart360"
     short_name = doc.get("short_name", "Smart360") if doc else "Smart360"
     theme_color = doc.get("theme_color", "#0f766e") if doc else "#0f766e"
@@ -7056,7 +7226,7 @@ async def get_manifest():
 @app.get("/api/public/settings/bus-booking")
 async def get_bus_booking_settings_public():
     """Get bus booking settings - public endpoint for checking requirement"""
-    settings = await db.settings.find_one({"type": "bus_booking"}, {"_id": 0})
+    settings = await _runtime_db().settings.find_one({"type": "bus_booking"}, {"_id": 0})
     if settings:
         return {
             "require_leave_approval": settings.get("require_leave_approval", False)
@@ -7066,7 +7236,7 @@ async def get_bus_booking_settings_public():
 @app.get("/api/settings/bus-booking")
 async def get_bus_booking_settings(current_user: dict = Depends(get_current_user)):
     """Get bus booking settings - for authenticated users"""
-    settings = await db.settings.find_one({"type": "bus_booking"}, {"_id": 0})
+    settings = await _runtime_db().settings.find_one({"type": "bus_booking"}, {"_id": 0})
     if settings:
         return {
             "require_leave_approval": settings.get("require_leave_approval", False),
@@ -7081,7 +7251,7 @@ async def save_bus_booking_settings(
     current_user: dict = Depends(require_roles("superadmin", "admin", "bus_admin"))
 ):
     """Save bus booking settings (SuperAdmin only)"""
-    await db.settings.update_one(
+    await _runtime_db().settings.update_one(
         {"type": "bus_booking"},
         {"$set": {
             "type": "bus_booking",
@@ -7110,9 +7280,10 @@ async def get_student_approved_leaves(
     current_user: dict = Depends(require_roles("parent", "pelajar", "admin", "superadmin"))
 ):
     """Get approved pulang bermalam for a student"""
+    runtime_db = _runtime_db()
     # Verify parent owns this student or is admin
     if current_user["role"] == "parent":
-        student = await db.students.find_one({
+        student = await runtime_db.students.find_one({
             "_id": ObjectId(student_id),
             "parent_id": current_user["_id"]
         })
@@ -7123,7 +7294,7 @@ async def get_student_approved_leaves(
             raise HTTPException(status_code=403, detail="Akses ditolak")
     
     # Get approved leaves
-    leaves = await db.hostel_records.find({
+    leaves = await runtime_db.hostel_records.find({
         "student_id": ObjectId(student_id),
         "kategori": "pulang_bermalam",
         "status": "approved"
@@ -7145,8 +7316,9 @@ async def check_leave_requirement_for_booking(
     current_user: dict = Depends(require_roles("parent", "pelajar"))
 ):
     """Check if student has approved leave for a trip date"""
+    runtime_db = _runtime_db()
     # Get settings
-    bus_settings = await db.settings.find_one({"type": "bus_booking"})
+    bus_settings = await runtime_db.settings.find_one({"type": "bus_booking"})
     require_leave_approval = bus_settings.get("require_leave_approval", False) if bus_settings else False
     
     if not require_leave_approval:
@@ -7157,14 +7329,14 @@ async def check_leave_requirement_for_booking(
         }
     
     # Get trip date
-    trip = await db.bus_trips.find_one({"_id": ObjectId(trip_id)})
+    trip = await runtime_db.bus_trips.find_one({"_id": ObjectId(trip_id)})
     if not trip:
         raise HTTPException(status_code=404, detail="Trip tidak dijumpai")
     
     departure_date = trip.get("departure_date", "")
     
     # Check for approved leave
-    approved_leave = await db.hostel_records.find_one({
+    approved_leave = await runtime_db.hostel_records.find_one({
         "student_id": ObjectId(student_id),
         "kategori": "pulang_bermalam",
         "status": "approved",
@@ -7201,7 +7373,7 @@ async def get_koperasi_categories(
     current_user: dict = Depends(get_current_user)
 ):
     """Get available product categories"""
-    return await koperasi_routes.get_product_categories(db, current_user)
+    return await koperasi_routes.get_product_categories(_runtime_db(), current_user)
 
 @app.get("/api/koperasi/kits")
 async def get_koperasi_kits(
@@ -7209,7 +7381,7 @@ async def get_koperasi_kits(
     current_user: dict = Depends(get_current_user)
 ):
     """Get all kits"""
-    return await koperasi_routes.get_kits(include_inactive, db, current_user)
+    return await koperasi_routes.get_kits(include_inactive, _runtime_db(), current_user)
 
 @app.get("/api/koperasi/kits/{kit_id}")
 async def get_koperasi_kit(
@@ -7217,7 +7389,7 @@ async def get_koperasi_kit(
     current_user: dict = Depends(get_current_user)
 ):
     """Get single kit with products"""
-    return await koperasi_routes.get_kit(kit_id, db, current_user)
+    return await koperasi_routes.get_kit(kit_id, _runtime_db(), current_user)
 
 @app.post("/api/koperasi/kits")
 async def create_koperasi_kit(
@@ -7226,7 +7398,7 @@ async def create_koperasi_kit(
 ):
     """Create new kit"""
     current_user["id"] = str(current_user["_id"])
-    result = await koperasi_routes.create_kit(kit, db, current_user)
+    result = await koperasi_routes.create_kit(kit, _runtime_db(), current_user)
     await log_audit(current_user, "CREATE_KOOP_KIT", "koperasi", f"Cipta kit: {kit.name}")
     return result
 
@@ -7238,7 +7410,7 @@ async def update_koperasi_kit(
 ):
     """Update kit"""
     current_user["id"] = str(current_user["_id"])
-    result = await koperasi_routes.update_kit(kit_id, kit, db, current_user)
+    result = await koperasi_routes.update_kit(kit_id, kit, _runtime_db(), current_user)
     await log_audit(current_user, "UPDATE_KOOP_KIT", "koperasi", f"Kemaskini kit: {kit_id}")
     return result
 
@@ -7249,7 +7421,7 @@ async def delete_koperasi_kit(
 ):
     """Delete kit (soft delete)"""
     current_user["id"] = str(current_user["_id"])
-    result = await koperasi_routes.delete_kit(kit_id, db, current_user)
+    result = await koperasi_routes.delete_kit(kit_id, _runtime_db(), current_user)
     await log_audit(current_user, "DELETE_KOOP_KIT", "koperasi", f"Padam kit: {kit_id}")
     return result
 
@@ -7262,7 +7434,7 @@ async def get_koperasi_products(
     current_user: dict = Depends(get_current_user)
 ):
     """Get all products"""
-    return await koperasi_routes.get_products(kit_id, include_inactive, db, current_user)
+    return await koperasi_routes.get_products(kit_id, include_inactive, _runtime_db(), current_user)
 
 @app.get("/api/koperasi/products/{product_id}")
 async def get_koperasi_product(
@@ -7270,7 +7442,7 @@ async def get_koperasi_product(
     current_user: dict = Depends(get_current_user)
 ):
     """Get single product"""
-    return await koperasi_routes.get_product(product_id, db, current_user)
+    return await koperasi_routes.get_product(product_id, _runtime_db(), current_user)
 
 @app.post("/api/koperasi/products")
 async def create_koperasi_product(
@@ -7279,7 +7451,7 @@ async def create_koperasi_product(
 ):
     """Create new product"""
     current_user["id"] = str(current_user["_id"])
-    result = await koperasi_routes.create_product(product, db, current_user)
+    result = await koperasi_routes.create_product(product, _runtime_db(), current_user)
     await log_audit(current_user, "CREATE_KOOP_PRODUCT", "koperasi", f"Cipta produk: {product.name}")
     return result
 
@@ -7291,7 +7463,7 @@ async def update_koperasi_product(
 ):
     """Update product"""
     current_user["id"] = str(current_user["_id"])
-    result = await koperasi_routes.update_product(product_id, product, db, current_user)
+    result = await koperasi_routes.update_product(product_id, product, _runtime_db(), current_user)
     await log_audit(current_user, "UPDATE_KOOP_PRODUCT", "koperasi", f"Kemaskini produk: {product_id}")
     return result
 
@@ -7302,7 +7474,7 @@ async def delete_koperasi_product(
 ):
     """Delete product (soft delete)"""
     current_user["id"] = str(current_user["_id"])
-    result = await koperasi_routes.delete_product(product_id, db, current_user)
+    result = await koperasi_routes.delete_product(product_id, _runtime_db(), current_user)
     await log_audit(current_user, "DELETE_KOOP_PRODUCT", "koperasi", f"Padam produk: {product_id}")
     return result
 
@@ -7315,7 +7487,7 @@ async def get_koperasi_cart(
 ):
     """Get shopping cart for a student"""
     current_user["id"] = str(current_user["_id"])
-    return await koperasi_routes.get_cart(student_id, db, current_user)
+    return await koperasi_routes.get_cart(student_id, _runtime_db(), current_user)
 
 @app.post("/api/koperasi/cart/add")
 async def add_to_koperasi_cart(
@@ -7324,7 +7496,7 @@ async def add_to_koperasi_cart(
 ):
     """Add item to cart"""
     current_user["id"] = str(current_user["_id"])
-    return await koperasi_routes.add_to_cart(request, db, current_user)
+    return await koperasi_routes.add_to_cart(request, _runtime_db(), current_user)
 
 @app.post("/api/koperasi/cart/add-kit")
 async def add_kit_to_koperasi_cart(
@@ -7334,7 +7506,7 @@ async def add_kit_to_koperasi_cart(
 ):
     """Add entire kit to cart - returns size selection if needed"""
     current_user["id"] = str(current_user["_id"])
-    return await koperasi_routes.add_kit_to_cart(kit_id, student_id, db, current_user)
+    return await koperasi_routes.add_kit_to_cart(kit_id, student_id, _runtime_db(), current_user)
 
 @app.post("/api/koperasi/cart/add-kit-with-sizes")
 async def add_kit_to_koperasi_cart_with_sizes(
@@ -7343,7 +7515,7 @@ async def add_kit_to_koperasi_cart_with_sizes(
 ):
     """Add entire kit to cart with size selections"""
     current_user["id"] = str(current_user["_id"])
-    return await koperasi_routes.add_kit_to_cart_with_sizes(request, db, current_user)
+    return await koperasi_routes.add_kit_to_cart_with_sizes(request, _runtime_db(), current_user)
 
 @app.put("/api/koperasi/cart/update")
 async def update_koperasi_cart_item(
@@ -7355,7 +7527,7 @@ async def update_koperasi_cart_item(
 ):
     """Update cart item quantity"""
     current_user["id"] = str(current_user["_id"])
-    return await koperasi_routes.update_cart_item(student_id, product_id, quantity, size, db, current_user)
+    return await koperasi_routes.update_cart_item(student_id, product_id, quantity, size, _runtime_db(), current_user)
 
 @app.delete("/api/koperasi/cart/remove")
 async def remove_from_koperasi_cart(
@@ -7366,7 +7538,7 @@ async def remove_from_koperasi_cart(
 ):
     """Remove item from cart"""
     current_user["id"] = str(current_user["_id"])
-    return await koperasi_routes.remove_from_cart(student_id, product_id, size, db, current_user)
+    return await koperasi_routes.remove_from_cart(student_id, product_id, size, _runtime_db(), current_user)
 
 @app.delete("/api/koperasi/cart/clear")
 async def clear_koperasi_cart(
@@ -7375,7 +7547,7 @@ async def clear_koperasi_cart(
 ):
     """Clear all items from cart"""
     current_user["id"] = str(current_user["_id"])
-    return await koperasi_routes.clear_cart(student_id, db, current_user)
+    return await koperasi_routes.clear_cart(student_id, _runtime_db(), current_user)
 
 # --- ORDER ENDPOINTS ---
 
@@ -7386,7 +7558,7 @@ async def create_koperasi_order(
 ):
     """Create order from cart (checkout)"""
     current_user["id"] = str(current_user["_id"])
-    result = await koperasi_routes.create_order(order, db, current_user)
+    result = await koperasi_routes.create_order(order, _runtime_db(), current_user)
     await log_audit(current_user, "CREATE_KOOP_ORDER", "koperasi", f"Cipta pesanan: {result.get('order_number')}")
     return result
 
@@ -7397,7 +7569,7 @@ async def get_koperasi_orders(
 ):
     """Get orders - Parents see their own, Admins see all"""
     current_user["id"] = str(current_user["_id"])
-    return await koperasi_routes.get_orders(status, db, current_user)
+    return await koperasi_routes.get_orders(status, _runtime_db(), current_user)
 
 @app.get("/api/koperasi/orders/{order_id}")
 async def get_koperasi_order(
@@ -7406,7 +7578,7 @@ async def get_koperasi_order(
 ):
     """Get single order"""
     current_user["id"] = str(current_user["_id"])
-    return await koperasi_routes.get_order(order_id, db, current_user)
+    return await koperasi_routes.get_order(order_id, _runtime_db(), current_user)
 
 @app.put("/api/koperasi/orders/{order_id}/status")
 async def update_koperasi_order_status(
@@ -7416,7 +7588,7 @@ async def update_koperasi_order_status(
 ):
     """Update order status"""
     current_user["id"] = str(current_user["_id"])
-    result = await koperasi_routes.update_order_status(order_id, status, db, current_user)
+    result = await koperasi_routes.update_order_status(order_id, status, _runtime_db(), current_user)
     await log_audit(current_user, "UPDATE_KOOP_ORDER", "koperasi", f"Kemaskini status pesanan {order_id}: {status}")
     return result
 
@@ -7428,7 +7600,7 @@ async def get_koperasi_admin_stats(
 ):
     """Get dashboard statistics for Koperasi admin"""
     current_user["id"] = str(current_user["_id"])
-    return await koperasi_routes.get_koperasi_stats(db, current_user)
+    return await koperasi_routes.get_koperasi_stats(_runtime_db(), current_user)
 
 # ============ INFAQ SLOT MODULE ============
 
@@ -7467,12 +7639,12 @@ class InfaqDonation(BaseModel):
 @app.get("/api/public/infaq/campaigns")
 async def get_public_infaq_campaigns(limit: int = 50):
     """Get public active infaq campaigns"""
-    return await infaq_routes.get_public_campaigns(db, limit)
+    return await infaq_routes.get_public_campaigns(_runtime_db(), limit)
 
 @app.get("/api/public/infaq/campaigns/{campaign_id}")
 async def get_public_infaq_campaign(campaign_id: str):
     """Get public infaq campaign details"""
-    campaign = await infaq_routes.get_public_campaign(campaign_id, db)
+    campaign = await infaq_routes.get_public_campaign(campaign_id, _runtime_db())
     if not campaign:
         raise HTTPException(status_code=404, detail="Kempen tidak dijumpai")
     return campaign
@@ -7480,7 +7652,7 @@ async def get_public_infaq_campaign(campaign_id: str):
 @app.get("/api/public/infaq/stats")
 async def get_public_infaq_stats():
     """Get public infaq statistics"""
-    return await infaq_routes.get_public_stats(db)
+    return await infaq_routes.get_public_stats(_runtime_db())
 
 # --- USER INFAQ ENDPOINTS ---
 
@@ -7491,7 +7663,7 @@ async def get_infaq_campaigns(
     current_user: dict = Depends(get_current_user)
 ):
     """Get infaq campaigns for logged in users"""
-    return await infaq_routes.get_campaigns(db, status, limit)
+    return await infaq_routes.get_campaigns(_runtime_db(), status, limit)
 
 @app.get("/api/infaq/campaigns/{campaign_id}")
 async def get_infaq_campaign(
@@ -7499,7 +7671,7 @@ async def get_infaq_campaign(
     current_user: dict = Depends(get_current_user)
 ):
     """Get infaq campaign details"""
-    campaign = await infaq_routes.get_campaign(campaign_id, db)
+    campaign = await infaq_routes.get_campaign(campaign_id, _runtime_db())
     if not campaign:
         raise HTTPException(status_code=404, detail="Kempen tidak dijumpai")
     return campaign
@@ -7512,7 +7684,7 @@ async def make_infaq_donation(
     """Make an infaq donation"""
     current_user["id"] = str(current_user["_id"])
     try:
-        donation = await infaq_routes.make_donation(data.dict(), db, current_user)
+        donation = await infaq_routes.make_donation(data.dict(), _runtime_db(), current_user)
         await log_audit(current_user, "INFAQ_DONATION", "infaq", f"Derma {data.slots} slot untuk kempen {data.campaign_id}")
         return donation
     except ValueError as e:
@@ -7524,7 +7696,7 @@ async def get_my_infaq_donations(
 ):
     """Get user's infaq donation history"""
     current_user["id"] = str(current_user["_id"])
-    return await infaq_routes.get_my_donations(db, current_user)
+    return await infaq_routes.get_my_donations(_runtime_db(), current_user)
 
 # --- ADMIN INFAQ ENDPOINTS ---
 
@@ -7535,7 +7707,7 @@ async def create_infaq_campaign(
 ):
     """Create a new infaq campaign"""
     current_user["id"] = str(current_user["_id"])
-    campaign = await infaq_routes.create_campaign(data.dict(), db, current_user)
+    campaign = await infaq_routes.create_campaign(data.dict(), _runtime_db(), current_user)
     await log_audit(current_user, "CREATE_INFAQ_CAMPAIGN", "infaq", f"Cipta kempen infaq: {data.title}")
     return campaign
 
@@ -7547,7 +7719,7 @@ async def update_infaq_campaign(
 ):
     """Update infaq campaign"""
     current_user["id"] = str(current_user["_id"])
-    campaign = await infaq_routes.update_campaign(campaign_id, data.dict(exclude_none=True), db)
+    campaign = await infaq_routes.update_campaign(campaign_id, data.dict(exclude_none=True), _runtime_db())
     if not campaign:
         raise HTTPException(status_code=404, detail="Kempen tidak dijumpai")
     await log_audit(current_user, "UPDATE_INFAQ_CAMPAIGN", "infaq", f"Kemaskini kempen infaq: {campaign_id}")
@@ -7560,7 +7732,7 @@ async def delete_infaq_campaign(
 ):
     """Delete (cancel) infaq campaign"""
     current_user["id"] = str(current_user["_id"])
-    success = await infaq_routes.delete_campaign(campaign_id, db)
+    success = await infaq_routes.delete_campaign(campaign_id, _runtime_db())
     if not success:
         raise HTTPException(status_code=404, detail="Kempen tidak dijumpai")
     await log_audit(current_user, "DELETE_INFAQ_CAMPAIGN", "infaq", f"Batalkan kempen infaq: {campaign_id}")
@@ -7572,14 +7744,14 @@ async def get_all_infaq_donations(
     current_user: dict = Depends(require_permission("infaq.donation.view"))
 ):
     """Get all infaq donations"""
-    return await infaq_routes.get_all_donations(db, campaign_id)
+    return await infaq_routes.get_all_donations(_runtime_db(), campaign_id)
 
 @app.get("/api/infaq/admin/stats")
 async def get_infaq_admin_stats(
     current_user: dict = Depends(require_permission("infaq.stats.view"))
 ):
     """Get infaq statistics for admin"""
-    return await infaq_routes.get_infaq_stats(db)
+    return await infaq_routes.get_infaq_stats(_runtime_db())
 
 # ============ ANALYTICS AI MODULE ============
 
@@ -7593,7 +7765,7 @@ async def get_analytics_dashboard_endpoint(current_user: dict = Depends(get_curr
     if current_user.get("role") not in staff_roles:
         raise HTTPException(status_code=403, detail="Akses ditolak")
     
-    return await analytics_routes.get_analytics_dashboard_data(db)
+    return await analytics_routes.get_analytics_dashboard_data(_runtime_db())
 
 @app.post("/api/analytics/ai-insights")
 async def get_ai_insights_endpoint(
@@ -7605,7 +7777,7 @@ async def get_ai_insights_endpoint(
     if current_user.get("role") not in staff_roles:
         raise HTTPException(status_code=403, detail="Akses ditolak")
     
-    return await analytics_routes.get_ai_insights_data(query, db)
+    return await analytics_routes.get_ai_insights_data(query, _runtime_db())
 
 @app.get("/api/analytics/module/{module_name}")
 async def get_module_analytics_endpoint(
@@ -7617,7 +7789,7 @@ async def get_module_analytics_endpoint(
     if current_user.get("role") not in staff_roles:
         raise HTTPException(status_code=403, detail="Akses ditolak")
     
-    return await analytics_routes.get_module_analytics_data(module_name, db)
+    return await analytics_routes.get_module_analytics_data(module_name, _runtime_db())
 
 @app.post("/api/analytics/chat")
 async def analytics_chat_endpoint(
@@ -7629,7 +7801,7 @@ async def analytics_chat_endpoint(
     if current_user.get("role") not in staff_roles:
         raise HTTPException(status_code=403, detail="Akses ditolak")
     
-    return await analytics_routes.analytics_chat_data(query, db)
+    return await analytics_routes.analytics_chat_data(query, _runtime_db())
 
 # ============ COMPLAINTS MODULE ============
 def get_db():
@@ -7644,49 +7816,52 @@ def get_core_db():
 
 
 def get_relational_core_db():
-    # For phased typed-table migration on yuran and tabung collections used by read-heavy modules.
+    # For phased typed-table migration on selected collections used by read-heavy modules.
     adapted_db = adapt_yuran_read_db(get_core_db())
-    return adapt_tabung_read_db(adapted_db)
+    adapted_db = adapt_tabung_read_db(adapted_db)
+    adapted_db = adapt_pwa_read_db(adapted_db)
+    adapted_db = adapt_chatbox_read_db(adapted_db)
+    return adapt_notifications_read_db(adapted_db)
 
 
 # ============ AGM ROUTES ============
-agm_routes.init_router(get_db)
+agm_routes.init_router(get_core_db)
 app.include_router(agm_routes.router)
 
 
-complaints_routes.init_router(get_db, get_current_user, require_permission, log_audit)
+complaints_routes.init_router(get_core_db, get_current_user, require_permission, log_audit)
 app.include_router(complaints_routes.router)
 
 # ============ DISCIPLINE & OLAT MODULE (Fasa 3) ============
-discipline_routes.init_router(get_db, get_current_user, log_audit)
+discipline_routes.init_router(get_core_db, get_current_user, log_audit)
 app.include_router(discipline_routes.router)
 
 # ============ AI RISIKO DISIPLIN (Fasa 6) ============
-risk_routes.init_router(get_db, get_current_user)
+risk_routes.init_router(get_core_db, get_current_user)
 app.include_router(risk_routes.router)
 
 # ============ EMAIL TEMPLATES (SES / Template Email) ============
-email_templates_routes.init_router(get_db, get_current_user)
+email_templates_routes.init_router(get_relational_core_db, get_current_user)
 app.include_router(email_templates_routes.router)
 
 # ============ WARDEN MANAGEMENT MODULE ============
-warden_routes.init_router(get_db, get_current_user, require_permission, log_audit)
+warden_routes.init_router(get_core_db, get_current_user, require_permission, log_audit)
 app.include_router(warden_routes.router)
 
 # ============ HOSTEL BLOCKS MODULE ============
-hostel_blocks_routes.init_router(get_db, get_current_user, require_permission, log_audit)
+hostel_blocks_routes.init_router(get_core_db, get_current_user, require_permission, log_audit)
 app.include_router(hostel_blocks_routes.router)
 
 # ============ UNIVERSAL INVENTORY MANAGEMENT MODULE ============
-inventory_routes.init_router(get_db, get_current_user, require_permission, log_audit)
+inventory_routes.init_router(get_core_db, get_current_user, require_permission, log_audit)
 app.include_router(inventory_routes.router)
 
 # ============ CATEGORY MANAGEMENT MODULE ============
-categories_routes.init_router(get_db, get_current_user, require_permission, log_audit)
+categories_routes.init_router(get_core_db, get_current_user, require_permission, log_audit)
 app.include_router(categories_routes.router)
 
 # ============ ACCOUNTING MODULE ============
-accounting_routes.init_router(get_db, get_current_user, require_permission, log_audit)
+accounting_routes.init_router(get_core_db, get_current_user, require_permission, log_audit)
 app.include_router(accounting_routes.router)
 
 # ============ ACCOUNTING FULL MODULE (SISTEM BERSEPADU) ============
@@ -7694,27 +7869,31 @@ accounting_full_routes.init_router(get_relational_core_db, get_current_user, req
 app.include_router(accounting_full_routes.router)
 
 # ============ BANK ACCOUNTS & FINANCIAL YEAR ============
-bank_accounts_routes.init_router(get_db, get_current_user, require_permission, log_audit)
+bank_accounts_routes.init_router(get_core_db, get_current_user, require_permission, log_audit)
 app.include_router(bank_accounts_routes.router)
 
+# ============ BANK STATEMENT AUTO RECONCILIATION ============
+bank_reconciliation_routes.init_router(get_core_db, get_current_user, require_permission, log_audit)
+app.include_router(bank_reconciliation_routes.router)
+
 # ============ AGM REPORTS ============
-agm_reports_routes.init_router(get_db, get_current_user, require_permission, log_audit)
+agm_reports_routes.init_router(get_core_db, get_current_user, require_permission, log_audit)
 app.include_router(agm_reports_routes.router)
 
 # ============ YURAN (FEES MODULE) ============
-yuran_routes.init_router(get_db, get_current_user, log_audit, ROLES, get_core_db)
+yuran_routes.init_router(get_core_db, get_current_user, log_audit, ROLES, get_core_db)
 app.include_router(yuran_routes.router)
 
 # ============ UPLOAD & IMAGE MANAGEMENT ============
-upload_routes.init_router(get_db, get_current_user, require_permission, log_audit)
+upload_routes.init_router(get_core_db, get_current_user, require_permission, log_audit)
 app.include_router(upload_routes.router)
 
 # ============ KOPERASI COMMISSION (PUM INTEGRATION) ============
-koperasi_commission_routes.init_router(get_db, get_current_user, require_permission, log_audit)
+koperasi_commission_routes.init_router(get_core_db, get_current_user, require_permission, log_audit)
 app.include_router(koperasi_commission_routes.router)
 
 # ============ MULTI-VENDOR MARKETPLACE ============
-marketplace_routes.init_router(get_db, get_current_user, require_permission, log_audit)
+marketplace_routes.init_router(get_core_db, get_current_user, require_permission, log_audit)
 app.include_router(marketplace_routes.router)
 
 # ============ TABUNG & SUMBANGAN (Unified Donation Module) ============
@@ -7722,23 +7901,23 @@ tabung_routes.init_router(get_relational_core_db, get_current_user, require_perm
 app.include_router(tabung_routes.router)
 
 # ============ STUDENTS MODULE (Paginated) ============
-students_routes.init_router(get_core_db, auth_routes.get_current_user, auth_routes.log_audit, ROLES)
+students_routes.init_router(get_core_db, get_current_user, log_audit, ROLES)
 app.include_router(students_routes.router)
 
 # ============ STUDENT IMPORT MODULE ============
-student_import_routes.init_router(get_db, get_current_user, log_audit, pwd_context)
+student_import_routes.init_router(get_core_db, get_current_user, log_audit, pwd_context)
 app.include_router(student_import_routes.router)
 
 # ============ USER MANAGEMENT MODULE (REFACTORED) ============
 users_routes.init_router(
-    get_core_db, auth_routes.get_current_user, auth_routes.log_audit, pwd_context,
+    get_core_db, get_current_user, log_audit, pwd_context,
     ROLES, ROLE_PERMISSIONS, serialize_user,
     generate_user_qr_code_data, generate_qr_code_image
 )
 app.include_router(users_routes.router)
 
 # ============ DASHBOARD MODULE (REFACTORED) ============
-dashboard_routes.init_router(get_relational_core_db, auth_routes.get_current_user, serialize_student, ROLES)
+dashboard_routes.init_router(get_relational_core_db, get_current_user, serialize_student, ROLES)
 app.include_router(dashboard_routes.router)
 
 # ============ FEES MODULE (REFACTORED) ============
@@ -7746,35 +7925,39 @@ fees_routes.init_router(get_relational_core_db, get_current_user, log_audit)
 app.include_router(fees_routes.router)
 
 # ============ PAYMENTS MODULE (REFACTORED) ============
-payments_routes.init_router(get_relational_core_db, auth_routes.get_current_user, auth_routes.log_audit)
+payments_routes.init_router(get_relational_core_db, get_current_user, log_audit)
 app.include_router(payments_routes.router)
 
 # ============ REPORTS MODULE (REFACTORED) ============
-reports_routes.init_router(get_relational_core_db, auth_routes.get_current_user)
+reports_routes.init_router(get_relational_core_db, get_current_user)
 app.include_router(reports_routes.router)
-ar_routes.init_router(get_relational_core_db, auth_routes.get_current_user)
+ar_routes.init_router(get_relational_core_db, get_current_user)
 app.include_router(ar_routes.router)
 
 # ============ HOSTEL MODULE (REFACTORED) ============
-hostel_routes.init_router(get_db, get_current_user, log_audit)
+hostel_routes.init_router(get_core_db, get_current_user, log_audit)
 app.include_router(hostel_routes.router)
 
 # ============ SICKBAY MODULE (REFACTORED) ============
-sickbay_routes.init_router(get_db, get_current_user, log_audit)
+sickbay_routes.init_router(get_core_db, get_current_user, log_audit)
 app.include_router(sickbay_routes.router)
 
 # ============ PAYMENT CENTER MODULE (CENTRALIZED PAYMENTS) ============
 payment_center_routes.init_router(get_relational_core_db, get_current_user, log_audit)
 app.include_router(payment_center_routes.router)
-chatbox_faq_routes.init_router(get_db, get_current_user)
+chatbox_faq_routes.init_router(get_relational_core_db, get_current_user)
 app.include_router(chatbox_faq_routes.router)
 
 # ============ SMART360 PWA (Push, version, device tokens) ============
-pwa_routes.init_router(get_db, get_current_user)
+pwa_routes.init_router(get_relational_core_db, get_current_user)
 app.include_router(pwa_routes.router)
 
+# ============ MULTI-TENANT ONBOARDING ============
+tenant_onboarding_routes.init_router(get_core_db, get_current_user, log_audit, pwd_context)
+app.include_router(tenant_onboarding_routes.router)
+
 # ============ FINANCIAL DASHBOARD (Integrated Reports) ============
-financial_dashboard_routes.init_router(get_relational_core_db, auth_routes.get_current_user)
+financial_dashboard_routes.init_router(get_relational_core_db, get_current_user)
 app.include_router(financial_dashboard_routes.router)
 
 # ============ SYSTEM CONFIGURATION (KELAS, BANGSA, AGAMA, NEGERI) ============
@@ -7785,7 +7968,7 @@ DEFAULT_KELAS = ["A", "B", "C", "D", "E", "F"]
 
 async def _get_valid_kelas_list():
     """Senarai Kelas dari database ketetapan - disegerakkan dengan data pelajar."""
-    config = await db.settings.find_one({"type": "system_config"})
+    config = await _runtime_db().settings.find_one({"type": "system_config"})
     return config.get("kelas", DEFAULT_KELAS) if config else DEFAULT_KELAS
 DEFAULT_BANGSA = ["Melayu", "Cina", "India", "Bumiputera Sabah", "Bumiputera Sarawak", "Lain-lain"]
 DEFAULT_AGAMA = ["Islam", "Buddha", "Hindu", "Kristian", "Sikh", "Taoisme", "Konfusianisme", "Lain-lain"]
@@ -7799,7 +7982,7 @@ DEFAULT_NEGERI = [
 @app.get("/api/settings/system-config")
 async def get_system_config(current_user: dict = Depends(get_current_user)):
     """Get all system configurations (kelas, tingkatan, bangsa, agama, negeri)"""
-    config = await db.settings.find_one({"type": "system_config"})
+    config = await _runtime_db().settings.find_one({"type": "system_config"})
     if config:
         return {
             "kelas": config.get("kelas", DEFAULT_KELAS),
@@ -7819,7 +8002,7 @@ async def get_system_config(current_user: dict = Depends(get_current_user)):
 @app.get("/api/settings/system-config/public")
 async def get_system_config_public():
     """Get system config for public use (dropdowns)"""
-    config = await db.settings.find_one({"type": "system_config"})
+    config = await _runtime_db().settings.find_one({"type": "system_config"})
     if config:
         return {
             "kelas": config.get("kelas", DEFAULT_KELAS),
@@ -7852,7 +8035,8 @@ async def save_system_config(config: dict, current_user: dict = Depends(get_curr
     if not kelas or not bangsa or not agama or not negeri:
         raise HTTPException(status_code=400, detail="Setiap kategori mesti ada sekurang-kurangnya satu item")
     
-    await db.settings.update_one(
+    runtime_db = _runtime_db()
+    await runtime_db.settings.update_one(
         {"type": "system_config"},
         {"$set": {
             "type": "system_config",
@@ -7878,7 +8062,8 @@ async def sync_system_config(current_user: dict = Depends(get_current_user)):
         raise HTTPException(status_code=403, detail="Hanya SuperAdmin atau Admin boleh melakukan sinkronisasi")
     
     # Get current config
-    config = await db.settings.find_one({"type": "system_config"})
+    runtime_db = _runtime_db()
+    config = await runtime_db.settings.find_one({"type": "system_config"})
     kelas_list = config.get("kelas", DEFAULT_KELAS) if config else DEFAULT_KELAS
     bangsa_list = config.get("bangsa", DEFAULT_BANGSA) if config else DEFAULT_BANGSA
     agama_list = config.get("agama", DEFAULT_AGAMA) if config else DEFAULT_AGAMA
@@ -7887,41 +8072,41 @@ async def sync_system_config(current_user: dict = Depends(get_current_user)):
     stats = {"kelas_updated": 0, "bangsa_updated": 0, "agama_updated": 0, "negeri_updated": 0}
     
     # Update students with invalid class_name
-    result = await db.students.update_many(
+    result = await runtime_db.students.update_many(
         {"class_name": {"$nin": kelas_list}},
         {"$set": {"class_name": kelas_list[0]}}
     )
     stats["kelas_updated"] = result.modified_count
     
     # Update students with invalid bangsa
-    result = await db.students.update_many(
+    result = await runtime_db.students.update_many(
         {"$or": [{"bangsa": {"$nin": bangsa_list}}, {"bangsa": {"$exists": False}}, {"bangsa": None}]},
         {"$set": {"bangsa": bangsa_list[0]}}
     )
     stats["bangsa_updated"] = result.modified_count
     
     # Update students with invalid religion
-    result = await db.students.update_many(
+    result = await runtime_db.students.update_many(
         {"$or": [{"religion": {"$nin": agama_list}}, {"religion": {"$exists": False}}, {"religion": None}]},
         {"$set": {"religion": agama_list[0]}}
     )
     stats["agama_updated"] = result.modified_count
     
     # Update students with invalid state/negeri
-    result = await db.students.update_many(
+    result = await runtime_db.students.update_many(
         {"$or": [{"state": {"$nin": negeri_list}}, {"state": {"$exists": False}}, {"state": None}, {"state": ""}]},
         {"$set": {"state": negeri_list[0]}}
     )
     stats["negeri_updated"] = result.modified_count
     
     # Also update users with role "pelajar"
-    await db.users.update_many(
+    await runtime_db.users.update_many(
         {"role": "pelajar", "$or": [{"religion": {"$nin": agama_list}}, {"religion": {"$exists": False}}, {"religion": None}]},
         {"$set": {"religion": agama_list[0]}}
     )
     
     # Update users with invalid state
-    await db.users.update_many(
+    await runtime_db.users.update_many(
         {"$or": [{"state": {"$nin": negeri_list}}, {"state": {"$exists": False}}, {"state": None}, {"state": ""}]},
         {"$set": {"state": negeri_list[0]}}
     )
@@ -7945,67 +8130,323 @@ DEFAULT_MODULE_SETTINGS = {
     "agm": {"enabled": True, "name": "Mesyuarat AGM", "description": "Modul mesyuarat agung tahunan"},
 }
 
+MODULE_GUARD_PREFIX_MAP = (
+    ("/api/bus", "tiket_bas"),
+    ("/api/hostel", "hostel"),
+    ("/api/sickbay", "sickbay"),
+    ("/api/koperasi", "koperasi"),
+    ("/api/marketplace", "marketplace"),
+    ("/api/inventory", "inventory"),
+    ("/api/complaints", "complaints"),
+    ("/api/agm", "agm"),
+    ("/api/guard/vehicles", "vehicle"),
+)
+
+TENANT_ENFORCEMENT_AUDIT_COLLECTIONS = (
+    "users",
+    "students",
+    "set_yuran",
+    "student_yuran",
+    "payments",
+    "yuran_payments",
+    "accounting_transactions",
+    "accounting_audit_logs",
+    "accounting_journal_entries",
+    "accounting_journal_lines",
+    "tabung_campaigns",
+    "tabung_donations",
+    "payment_reminders",
+    "payment_reminder_preferences",
+    "notifications",
+    "audit_logs",
+)
+
+
+def _clone_default_module_settings() -> Dict[str, Dict[str, Any]]:
+    return {
+        key: {
+            "enabled": bool(value.get("enabled", True)),
+            "name": value.get("name", key),
+            "description": value.get("description", ""),
+        }
+        for key, value in DEFAULT_MODULE_SETTINGS.items()
+    }
+
+
+def _merge_module_settings(raw_modules: Optional[Dict[str, Dict[str, Any]]] = None) -> Dict[str, Dict[str, Any]]:
+    modules = _clone_default_module_settings()
+    for key, value in (raw_modules or {}).items():
+        if key not in modules:
+            continue
+        payload = value if isinstance(value, dict) else {}
+        modules[key]["enabled"] = bool(payload.get("enabled", modules[key]["enabled"]))
+        if payload.get("name"):
+            modules[key]["name"] = str(payload.get("name"))
+        if payload.get("description"):
+            modules[key]["description"] = str(payload.get("description"))
+    return modules
+
+
+def _normalize_tenant_key(value: Optional[str]) -> str:
+    return str(value or "").strip()
+
+
+async def _get_tenant_doc_by_key(runtime_db, tenant_id: Optional[str] = None, tenant_code: Optional[str] = None):
+    if tenant_id:
+        tenant = await runtime_db.tenants.find_one({"_id": _id_value(tenant_id)})
+        if tenant:
+            return tenant
+    if tenant_code:
+        tenant = await runtime_db.tenants.find_one({"tenant_code": tenant_code})
+        if tenant:
+            return tenant
+    return None
+
+
+async def _get_effective_module_settings(
+    runtime_db,
+    *,
+    tenant_id: Optional[str] = None,
+    tenant_code: Optional[str] = None,
+) -> tuple[Dict[str, Dict[str, Any]], str]:
+    tenant_id = _normalize_tenant_key(tenant_id)
+    tenant_code = _normalize_tenant_key(tenant_code)
+    if tenant_id or tenant_code:
+        query: Dict[str, Any] = {}
+        if tenant_id:
+            query["tenant_id"] = tenant_id
+        elif tenant_code:
+            query["tenant_code"] = tenant_code
+        tenant_doc = await runtime_db.tenant_module_settings.find_one(query)
+        if tenant_doc:
+            return _merge_module_settings(tenant_doc.get("modules")), "tenant"
+    global_doc = await runtime_db.settings.find_one({"type": "module_settings"})
+    if global_doc:
+        return _merge_module_settings(global_doc.get("modules")), "global"
+    return _clone_default_module_settings(), "default"
+
+
+def _resolve_module_key_from_path(path: str) -> Optional[str]:
+    path_text = str(path or "").strip()
+    if not path_text:
+        return None
+    for prefix, module_key in MODULE_GUARD_PREFIX_MAP:
+        if path_text == prefix or path_text.startswith(f"{prefix}/"):
+            return module_key
+    return None
+
+
+async def _enforce_module_access_for_request(request: Optional[Request], current_user: Optional[dict]) -> None:
+    if request is None or not current_user:
+        return
+    if current_user.get("role") == "superadmin":
+        return
+    require_user_tenant_context(
+        current_user,
+        detail="Tenant context diperlukan untuk akses modul institusi.",
+    )
+
+    module_key = _resolve_module_key_from_path(request.url.path)
+    if not module_key:
+        return
+
+    tenant_id = str(current_user.get("tenant_id") or "").strip()
+    tenant_code = str(current_user.get("tenant_code") or "").strip()
+    modules, _source = await _get_effective_module_settings(
+        _runtime_db(),
+        tenant_id=tenant_id or None,
+        tenant_code=tenant_code or None,
+    )
+    module_info = modules.get(module_key) or DEFAULT_MODULE_SETTINGS.get(module_key) or {}
+    if bool(module_info.get("enabled", True)):
+        return
+    raise HTTPException(
+        status_code=403,
+        detail=f"Modul {module_info.get('name', module_key)} tidak aktif untuk institusi anda",
+    )
+
+
+def _missing_tenant_query() -> Dict[str, Any]:
+    return {
+        "$or": [
+            {"tenant_id": {"$exists": False}},
+            {"tenant_id": None},
+            {"tenant_id": ""},
+        ]
+    }
+
+
+@app.get("/api/tenants/enforcement/status")
+async def get_tenant_enforcement_status(
+    include_counts: bool = Query(True),
+    include_samples: bool = Query(False),
+    sample_limit: int = Query(20, ge=1, le=200),
+    current_user: dict = Depends(get_current_user),
+):
+    if current_user.get("role") != "superadmin":
+        raise HTTPException(status_code=403, detail="Hanya SuperAdmin dibenarkan")
+
+    snapshot = tenant_enforcement_snapshot()
+    response: Dict[str, Any] = {
+        "enforcement": snapshot,
+    }
+    if not include_counts:
+        return response
+
+    runtime_db = core_db or db
+    missing_query = _missing_tenant_query()
+    counts: Dict[str, int] = {}
+    samples: Dict[str, List[str]] = {}
+    total_missing = 0
+
+    for collection_name in TENANT_ENFORCEMENT_AUDIT_COLLECTIONS:
+        count = await runtime_db[collection_name].count_documents(missing_query)
+        count_int = int(count or 0)
+        counts[collection_name] = count_int
+        total_missing += count_int
+        if include_samples and count_int > 0:
+            rows = await (
+                runtime_db[collection_name]
+                .find(missing_query, {"_id": 1})
+                .limit(sample_limit)
+                .to_list(sample_limit)
+            )
+            samples[collection_name] = [str(row.get("_id")) for row in rows if row.get("_id") is not None]
+
+    response.update(
+        {
+            "missing_tenant_total": total_missing,
+            "missing_tenant_counts": counts,
+            "ready_for_strict_mode": total_missing == 0,
+        }
+    )
+    if include_samples:
+        response["missing_tenant_samples"] = samples
+    return response
+
+
 @app.get("/api/settings/modules")
-async def get_module_settings(current_user: dict = Depends(get_current_user)):
-    """Get module on/off settings"""
-    config = await db.settings.find_one({"type": "module_settings"})
-    if config:
-        # Merge with defaults for any new modules
-        modules = DEFAULT_MODULE_SETTINGS.copy()
-        for key, val in config.get("modules", {}).items():
-            if key in modules:
-                modules[key]["enabled"] = val.get("enabled", True)
-        return {"modules": modules}
-    return {"modules": DEFAULT_MODULE_SETTINGS}
+async def get_module_settings(
+    tenant_id: Optional[str] = None,
+    tenant_code: Optional[str] = None,
+    current_user: dict = Depends(get_current_user),
+):
+    """Get module on/off settings (global atau per-tenant)."""
+    runtime_db = _runtime_db()
+    target_tenant_id = None
+    target_tenant_code = None
+
+    if current_user.get("role") == "superadmin":
+        target_tenant_id = _normalize_tenant_key(tenant_id)
+        target_tenant_code = _normalize_tenant_key(tenant_code)
+    else:
+        target_tenant_id = _normalize_tenant_key(current_user.get("tenant_id"))
+        target_tenant_code = _normalize_tenant_key(current_user.get("tenant_code"))
+
+    if target_tenant_id or target_tenant_code:
+        tenant = await _get_tenant_doc_by_key(
+            runtime_db,
+            tenant_id=target_tenant_id or None,
+            tenant_code=target_tenant_code or None,
+        )
+        if not tenant:
+            raise HTTPException(status_code=404, detail="Tenant tidak dijumpai")
+        target_tenant_id = str(tenant.get("_id", ""))
+        target_tenant_code = tenant.get("tenant_code", target_tenant_code)
+
+    modules, source = await _get_effective_module_settings(
+        runtime_db,
+        tenant_id=target_tenant_id or None,
+        tenant_code=target_tenant_code or None,
+    )
+    return {
+        "modules": modules,
+        "source": source,
+        "tenant_id": target_tenant_id or None,
+        "tenant_code": target_tenant_code or None,
+    }
 
 @app.get("/api/settings/modules/public")
-async def get_module_settings_public():
-    """Get module settings for public/all users (for menu filtering)"""
-    config = await db.settings.find_one({"type": "module_settings"})
-    if config:
-        modules = DEFAULT_MODULE_SETTINGS.copy()
-        for key, val in config.get("modules", {}).items():
-            if key in modules:
-                modules[key]["enabled"] = val.get("enabled", True)
-        return {"modules": modules}
-    return {"modules": DEFAULT_MODULE_SETTINGS}
+async def get_module_settings_public(tenant_code: Optional[str] = None):
+    """Get module settings for public/all users (for menu filtering)."""
+    modules, source = await _get_effective_module_settings(
+        _runtime_db(),
+        tenant_code=_normalize_tenant_key(tenant_code) or None,
+    )
+    return {
+        "modules": modules,
+        "source": source,
+        "tenant_code": _normalize_tenant_key(tenant_code) or None,
+    }
 
 @app.post("/api/settings/modules")
 async def save_module_settings(data: dict, current_user: dict = Depends(get_current_user)):
-    """Save module on/off settings (SuperAdmin only)"""
+    """Save module on/off settings (global atau per-tenant; SuperAdmin only)."""
     if current_user.get("role") != "superadmin":
         raise HTTPException(status_code=403, detail="Hanya SuperAdmin boleh mengurus tetapan modul")
-    
+
+    runtime_db = _runtime_db()
     modules = data.get("modules", {})
-    
-    # Validate module keys
-    valid_modules = {}
-    for key, val in modules.items():
-        if key in DEFAULT_MODULE_SETTINGS:
-            valid_modules[key] = {
-                "enabled": val.get("enabled", True),
-                "name": DEFAULT_MODULE_SETTINGS[key]["name"],
-                "description": DEFAULT_MODULE_SETTINGS[key]["description"]
-            }
-    
-    await db.settings.update_one(
-        {"type": "module_settings"},
-        {"$set": {
-            "type": "module_settings",
-            "modules": valid_modules,
-            "updated_at": datetime.now(timezone.utc).isoformat(),
-            "updated_by": str(current_user.get("_id"))
-        }},
-        upsert=True
-    )
-    
-    # Log which modules were enabled/disabled
+    valid_modules = _merge_module_settings(modules if isinstance(modules, dict) else {})
+    tenant_id = _normalize_tenant_key(data.get("tenant_id"))
+    tenant_code = _normalize_tenant_key(data.get("tenant_code"))
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    tenant_target = None
+    if tenant_id or tenant_code:
+        tenant_target = await _get_tenant_doc_by_key(
+            runtime_db,
+            tenant_id=tenant_id or None,
+            tenant_code=tenant_code or None,
+        )
+        if not tenant_target:
+            raise HTTPException(status_code=404, detail="Tenant tidak dijumpai")
+
+    if tenant_target:
+        await runtime_db.tenant_module_settings.update_one(
+            {"tenant_id": str(tenant_target.get("_id", ""))},
+            {"$set": {
+                "tenant_id": str(tenant_target.get("_id", "")),
+                "tenant_code": tenant_target.get("tenant_code", ""),
+                "modules": valid_modules,
+                "updated_at": now_iso,
+                "updated_by": str(current_user.get("_id")),
+                "updated_by_name": current_user.get("full_name", ""),
+            }},
+            upsert=True
+        )
+        action_name = "TENANT_MODULE_SETTINGS_UPDATED"
+        details = f"Tenant {tenant_target.get('tenant_code', '')}: modules updated"
+    else:
+        await runtime_db.settings.update_one(
+            {"type": "module_settings"},
+            {"$set": {
+                "type": "module_settings",
+                "modules": valid_modules,
+                "updated_at": now_iso,
+                "updated_by": str(current_user.get("_id"))
+            }},
+            upsert=True
+        )
+        action_name = "MODULE_SETTINGS_UPDATED"
+        details = "Global module settings updated"
+
     enabled = [k for k, v in valid_modules.items() if v.get("enabled")]
     disabled = [k for k, v in valid_modules.items() if not v.get("enabled")]
-    await log_audit(current_user, "MODULE_SETTINGS_UPDATED", "settings", 
-                   f"Enabled: {enabled}, Disabled: {disabled}")
-    
-    return {"message": "Tetapan modul berjaya disimpan", "modules": valid_modules}
+    await log_audit(
+        current_user,
+        action_name,
+        "settings",
+        f"{details}. Enabled: {enabled}, Disabled: {disabled}",
+    )
+
+    return {
+        "message": "Tetapan modul berjaya disimpan",
+        "modules": valid_modules,
+        "scope": "tenant" if tenant_target else "global",
+        "tenant_id": str(tenant_target.get("_id", "")) if tenant_target else None,
+        "tenant_code": tenant_target.get("tenant_code", "") if tenant_target else None,
+    }
 
 # ============ UPLOAD DATA PELAJAR MODULE ============
 
@@ -8022,7 +8463,7 @@ async def get_upload_settings(current_user: dict = Depends(get_current_user)):
     if current_user.get("role") not in ["superadmin", "admin", "guru_kelas", "guru_homeroom"]:
         raise HTTPException(status_code=403, detail="Akses ditolak")
     
-    config = await db.settings.find_one({"type": "upload_settings"})
+    config = await _runtime_db().settings.find_one({"type": "upload_settings"})
     if config:
         return {
             "portal_url": config.get("portal_url", DEFAULT_UPLOAD_SETTINGS["portal_url"]),
@@ -8037,7 +8478,7 @@ async def save_upload_settings(data: dict, current_user: dict = Depends(get_curr
     if current_user.get("role") != "superadmin":
         raise HTTPException(status_code=403, detail="Hanya SuperAdmin boleh mengurus tetapan ini")
     
-    await db.settings.update_one(
+    await _runtime_db().settings.update_one(
         {"type": "upload_settings"},
         {"$set": {
             "type": "upload_settings",

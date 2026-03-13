@@ -8,6 +8,7 @@ import os
 from datetime import datetime, timezone
 from typing import Optional, List
 from bson import ObjectId
+from services.id_normalizer import object_id_or_none
 
 from fastapi import APIRouter, HTTPException, Depends
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -31,6 +32,31 @@ async def _pwa_current_user(credentials: HTTPAuthorizationCredentials = Depends(
     if _get_current_user is None:
         raise HTTPException(status_code=503, detail="PWA auth not initialized")
     return await _get_current_user(credentials)
+
+
+def _id_value(
+    value: object,
+    *,
+    strict: bool = False,
+    status_code: int = 400,
+    error_detail: str = "ID tidak sah",
+):
+    """Normalize ID-like inputs while supporting non-ObjectId IDs."""
+    if value is None:
+        if strict:
+            raise HTTPException(status_code=status_code, detail=error_detail)
+        return None
+    if isinstance(value, ObjectId):
+        return value
+    text = str(value).strip()
+    try:
+        if ObjectId.is_valid(text):
+            return object_id_or_none(text)
+    except Exception:
+        pass
+    if strict:
+        raise HTTPException(status_code=status_code, detail=error_detail)
+    return text
 
 
 # ---------- Pydantic models ----------
@@ -78,7 +104,7 @@ async def register_device_token(
         raise HTTPException(status_code=401, detail="User ID not found")
 
     doc = {
-        "user_id": ObjectId(user_id) if isinstance(user_id, str) and len(user_id) == 24 else user_id,
+        "user_id": _id_value(user_id),
         "fcm_token": body.fcm_token.strip(),
         "device_type": (body.device_type or "web").lower(),
         "device_name": (body.device_name or "").strip() or None,
@@ -110,10 +136,7 @@ async def send_notification(
         raise HTTPException(status_code=403, detail="Akses ditolak")
 
     user_id = body.user_id or str(current_user.get("_id") or current_user.get("id"))
-    try:
-        uid = ObjectId(user_id)
-    except Exception:
-        raise HTTPException(status_code=400, detail="user_id tidak sah")
+    uid = _id_value(user_id, strict=True, status_code=400, error_detail="user_id tidak sah")
 
     tokens_docs = await db.pwa_device_tokens.find({"user_id": uid}).to_list(100)
     tokens = [t["fcm_token"] for t in tokens_docs]

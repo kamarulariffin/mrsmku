@@ -5,7 +5,7 @@ Basic accounting dashboard showing account summaries for Muafakat, Merchandise, 
 
 from fastapi import APIRouter, HTTPException, Depends
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from typing import Optional
+from typing import Any, Optional
 from datetime import datetime, timezone, timedelta
 from bson import ObjectId
 
@@ -54,6 +54,43 @@ def _merge_by_status(a: dict, b: dict) -> dict:
     return out
 
 
+def _as_float(value: Any) -> float:
+    try:
+        return float(value or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _as_int(value: Any) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _as_datetime(value: Any) -> Optional[datetime]:
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        try:
+            dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                return dt.replace(tzinfo=timezone.utc)
+            return dt
+        except Exception:
+            pass
+        try:
+            return datetime.strptime(text[:10], "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        except Exception:
+            return None
+    return None
+
+
 @router.get("/summary")
 async def get_accounting_summary(
     start_date: Optional[str] = None,
@@ -99,16 +136,6 @@ async def get_accounting_summary(
     if date_query:
         muafakat_query["created_at"] = date_query
     
-    muafakat_pipeline = [
-        {"$match": muafakat_query},
-        {"$group": {
-            "_id": "$status",
-            "total": {"$sum": "$commission_amount"},
-            "count": {"$sum": 1}
-        }}
-    ]
-    muafakat_results = await db.commission_records.aggregate(muafakat_pipeline).to_list(10)
-    
     muafakat_summary = {
         "confirmed": 0,
         "pending": 0,
@@ -121,10 +148,14 @@ async def get_accounting_summary(
         "paid_out": 0,
         "cancelled": 0
     }
-    for r in muafakat_results:
-        if r["_id"] in muafakat_summary:
-            muafakat_summary[r["_id"]] = round(r["total"], 2)
-            muafakat_counts[r["_id"]] = r["count"]
+    async for row in db.commission_records.find(muafakat_query):
+        status = row.get("status")
+        if status not in muafakat_summary:
+            continue
+        muafakat_summary[status] += _as_float(row.get("commission_amount"))
+        muafakat_counts[status] += 1
+    for status in muafakat_summary:
+        muafakat_summary[status] = round(muafakat_summary[status], 2)
     
     muafakat_total = muafakat_summary["confirmed"] + muafakat_summary["paid_out"]
     
@@ -138,31 +169,24 @@ async def get_accounting_summary(
         merch_query = {}
         if date_query:
             merch_query["created_at"] = date_query
-        merch_pipeline = [
-            {"$match": {**merch_query, "status": {"$ne": "cancelled"}}},
-            {"$group": {
-                "_id": "$status",
-                "total": {"$sum": "$total_amount"},
-                "count": {"$sum": 1}
-            }}
-        ]
-        merch_results = await db.merchandise_orders.aggregate(merch_pipeline).to_list(10)
-        for r in merch_results:
-            merch_by_status[r["_id"]] = {"amount": round(r["total"], 2), "count": r["count"]}
-            if r["_id"] in ["paid", "processing", "ready", "delivered"]:
-                merch_total_sales += r["total"]
-            merch_total_orders += r["count"]
-        merch_inventory_pipeline = [
-            {"$match": {"is_active": True}},
-            {"$group": {
-                "_id": None,
-                "total_stock_value": {"$sum": {"$multiply": ["$price", "$stock"]}},
-                "total_items": {"$sum": "$stock"}
-            }}
-        ]
-        merch_inventory = await db.merchandise_products.aggregate(merch_inventory_pipeline).to_list(1)
-        merch_stock_value = merch_inventory[0]["total_stock_value"] if merch_inventory else 0
-        merch_stock_items = merch_inventory[0]["total_items"] if merch_inventory else 0
+        async for row in db.merchandise_orders.find({**merch_query, "status": {"$ne": "cancelled"}}):
+            status = row.get("status")
+            amount = _as_float(row.get("total_amount"))
+            if status not in merch_by_status:
+                merch_by_status[status] = {"amount": 0.0, "count": 0}
+            merch_by_status[status]["amount"] += amount
+            merch_by_status[status]["count"] += 1
+            if status in ["paid", "processing", "ready", "delivered"]:
+                merch_total_sales += amount
+            merch_total_orders += 1
+        for status in list(merch_by_status.keys()):
+            merch_by_status[status]["amount"] = round(merch_by_status[status]["amount"], 2)
+
+        async for row in db.merchandise_products.find({"is_active": True}):
+            price = _as_float(row.get("price"))
+            stock = _as_int(row.get("stock"))
+            merch_stock_value += (price * stock)
+            merch_stock_items += stock
     
     # ============ KOPERASI ACCOUNT (termasuk PUM) ============
     koop_by_status = {}
@@ -179,66 +203,52 @@ async def get_accounting_summary(
         koop_query = {}
         if date_query:
             koop_query["created_at"] = date_query
-        koop_pipeline = [
-            {"$match": {**koop_query, "status": {"$ne": "cancelled"}}},
-            {"$group": {
-                "_id": "$status",
-                "total": {"$sum": "$total_amount"},
-                "count": {"$sum": 1}
-            }}
-        ]
-        koop_results = await db.koop_orders.aggregate(koop_pipeline).to_list(10)
-        for r in koop_results:
-            koop_by_status[r["_id"]] = {"amount": round(r["total"], 2), "count": r["count"]}
-            if r["_id"] in ["paid", "processing", "ready", "collected"]:
-                koop_total_sales += r["total"]
-            koop_total_orders += r["count"]
+        async for row in db.koop_orders.find({**koop_query, "status": {"$ne": "cancelled"}}):
+            status = row.get("status")
+            amount = _as_float(row.get("total_amount"))
+            if status not in koop_by_status:
+                koop_by_status[status] = {"amount": 0.0, "count": 0}
+            koop_by_status[status]["amount"] += amount
+            koop_by_status[status]["count"] += 1
+            if status in ["paid", "processing", "ready", "collected"]:
+                koop_total_sales += amount
+            koop_total_orders += 1
+        for status in list(koop_by_status.keys()):
+            koop_by_status[status]["amount"] = round(koop_by_status[status]["amount"], 2)
+
         koop_commission_query = {"commission_type": "koperasi"}
         if date_query:
             koop_commission_query["created_at"] = date_query
-        koop_commission_pipeline = [
-            {"$match": {**koop_commission_query, "status": {"$in": ["confirmed", "paid_out"]}}},
-            {"$group": {"_id": None, "total": {"$sum": "$commission_amount"}}}
-        ]
-        koop_commission_result = await db.commission_records.aggregate(koop_commission_pipeline).to_list(1)
-        koop_commission_earned = koop_commission_result[0]["total"] if koop_commission_result else 0
+        async for row in db.commission_records.find({**koop_commission_query, "status": {"$in": ["confirmed", "paid_out"]}}):
+            koop_commission_earned += _as_float(row.get("commission_amount"))
+
         pum_query = {}
         if date_query:
             pum_query["created_at"] = date_query
-        pum_pipeline = [
-            {"$match": {**pum_query, "status": {"$ne": "cancelled"}}},
-            {"$group": {
-                "_id": "$status",
-                "total": {"$sum": "$total_amount"},
-                "count": {"$sum": 1}
-            }}
-        ]
-        pum_results = await db.pum_orders.aggregate(pum_pipeline).to_list(10)
-        for r in pum_results:
-            pum_by_status[r["_id"]] = {"amount": round(r["total"], 2), "count": r["count"]}
-            if r["_id"] in ["paid", "processing", "shipped", "delivered"]:
-                pum_total_sales += r["total"]
-            pum_total_orders += r["count"]
+        async for row in db.pum_orders.find({**pum_query, "status": {"$ne": "cancelled"}}):
+            status = row.get("status")
+            amount = _as_float(row.get("total_amount"))
+            if status not in pum_by_status:
+                pum_by_status[status] = {"amount": 0.0, "count": 0}
+            pum_by_status[status]["amount"] += amount
+            pum_by_status[status]["count"] += 1
+            if status in ["paid", "processing", "shipped", "delivered"]:
+                pum_total_sales += amount
+            pum_total_orders += 1
+        for status in list(pum_by_status.keys()):
+            pum_by_status[status]["amount"] = round(pum_by_status[status]["amount"], 2)
+
         pum_commission_query = {"commission_type": "pum"}
         if date_query:
             pum_commission_query["created_at"] = date_query
-        pum_commission_pipeline = [
-            {"$match": {**pum_commission_query, "status": {"$in": ["confirmed", "paid_out"]}}},
-            {"$group": {"_id": None, "total": {"$sum": "$commission_amount"}}}
-        ]
-        pum_commission_result = await db.commission_records.aggregate(pum_commission_pipeline).to_list(1)
-        pum_commission_earned = pum_commission_result[0]["total"] if pum_commission_result else 0
-        pum_inventory_pipeline = [
-            {"$match": {"is_active": True}},
-            {"$group": {
-                "_id": None,
-                "total_stock_value": {"$sum": {"$multiply": ["$price", "$stock"]}},
-                "total_items": {"$sum": "$stock"}
-            }}
-        ]
-        pum_inventory = await db.pum_products.aggregate(pum_inventory_pipeline).to_list(1)
-        pum_stock_value = pum_inventory[0]["total_stock_value"] if pum_inventory else 0
-        pum_stock_items = pum_inventory[0]["total_items"] if pum_inventory else 0
+        async for row in db.commission_records.find({**pum_commission_query, "status": {"$in": ["confirmed", "paid_out"]}}):
+            pum_commission_earned += _as_float(row.get("commission_amount"))
+
+        async for row in db.pum_products.find({"is_active": True}):
+            price = _as_float(row.get("price"))
+            stock = _as_int(row.get("stock"))
+            pum_stock_value += (price * stock)
+            pum_stock_items += stock
     
     # ============ GRAND TOTALS ============
     total_revenue = muafakat_total + koop_commission_earned + pum_commission_earned
@@ -335,25 +345,6 @@ async def get_monthly_trend(
     modules_config = config.get("modules", {}) if config else {}
     koperasi_enabled = modules_config.get("koperasi", {}).get("enabled", True)
     
-    # Aggregate commission records by month
-    pipeline = [
-        {"$match": {
-            "created_at": {"$gte": start_date},
-            "status": {"$in": ["confirmed", "paid_out"]}
-        }},
-        {"$group": {
-            "_id": {
-                "year": {"$year": "$created_at"},
-                "month": {"$month": "$created_at"},
-                "type": "$commission_type"
-            },
-            "amount": {"$sum": "$commission_amount"}
-        }},
-        {"$sort": {"_id.year": 1, "_id.month": 1}}
-    ]
-    
-    results = await db.commission_records.aggregate(pipeline).to_list(100)
-    
     # Process into monthly data
     monthly_data = {}
     bulan_names = {
@@ -361,22 +352,33 @@ async def get_monthly_trend(
         7: "Jul", 8: "Ogos", 9: "Sep", 10: "Okt", 11: "Nov", 12: "Dis"
     }
     
-    for r in results:
-        comm_type = r["_id"]["type"]
+    async for row in db.commission_records.find({
+        "created_at": {"$gte": start_date},
+        "status": {"$in": ["confirmed", "paid_out"]},
+    }):
+        comm_type = row.get("commission_type")
+        if not comm_type:
+            continue
         if not koperasi_enabled and comm_type in ("koperasi", "pum"):
             continue
-        key = f"{r['_id']['year']}-{r['_id']['month']:02d}"
+        created_at = _as_datetime(row.get("created_at"))
+        if created_at is None:
+            continue
+        year = created_at.year
+        month = created_at.month
+        key = f"{year}-{month:02d}"
         if key not in monthly_data:
             monthly_data[key] = {
                 "period": key,
-                "month_name": f"{bulan_names.get(r['_id']['month'], r['_id']['month'])} {r['_id']['year']}",
+                "month_name": f"{bulan_names.get(month, month)} {year}",
                 "muafakat": 0,
                 "koperasi": 0,
                 "pum": 0,
                 "total": 0
             }
-        monthly_data[key][comm_type] = round(r["amount"], 2)
-        monthly_data[key]["total"] += r["amount"]
+        amount = _as_float(row.get("commission_amount"))
+        monthly_data[key][comm_type] = round(monthly_data[key].get(comm_type, 0) + amount, 2)
+        monthly_data[key]["total"] += amount
     
     # Sort by period
     trend_data = sorted(monthly_data.values(), key=lambda x: x["period"])
@@ -474,22 +476,16 @@ async def get_commission_breakdown(
         except Exception:
             pass
     
-    pipeline = [
-        {"$match": query},
-        {"$group": {
-            "_id": {
-                "type": "$commission_type",
-                "module": "$module"
-            },
-            "total_amount": {"$sum": "$commission_amount"},
-            "total_orders": {"$sum": 1},
-            "avg_amount": {"$avg": "$commission_amount"}
-        }},
-        {"$sort": {"total_amount": -1}}
-    ]
-    
-    results = await db.commission_records.aggregate(pipeline).to_list(50)
-    
+    grouped = {}
+    async for row in db.commission_records.find(query):
+        ctype = row.get("commission_type")
+        module = row.get("module")
+        key = (ctype, module)
+        if key not in grouped:
+            grouped[key] = {"total_amount": 0.0, "total_orders": 0}
+        grouped[key]["total_amount"] += _as_float(row.get("commission_amount"))
+        grouped[key]["total_orders"] += 1
+
     breakdown = []
     type_display = {
         "muafakat": "Pendapatan Muafakat",
@@ -502,15 +498,19 @@ async def get_commission_breakdown(
         "pum": "PUM"
     }
     
-    for r in results:
+    sorted_groups = sorted(grouped.items(), key=lambda item: item[1]["total_amount"], reverse=True)
+    for (ctype, module), values in sorted_groups[:50]:
+        total_amount = values["total_amount"]
+        total_orders = values["total_orders"]
+        avg_amount = (total_amount / total_orders) if total_orders else 0
         breakdown.append({
-            "commission_type": r["_id"]["type"],
-            "commission_type_display": type_display.get(r["_id"]["type"], r["_id"]["type"]),
-            "module": r["_id"]["module"],
-            "module_display": module_display.get(r["_id"]["module"], r["_id"]["module"]),
-            "total_amount": round(r["total_amount"], 2),
-            "total_orders": r["total_orders"],
-            "avg_amount": round(r["avg_amount"], 2)
+            "commission_type": ctype,
+            "commission_type_display": type_display.get(ctype, ctype),
+            "module": module,
+            "module_display": module_display.get(module, module),
+            "total_amount": round(total_amount, 2),
+            "total_orders": total_orders,
+            "avg_amount": round(avg_amount, 2)
         })
     
     # Calculate totals by type

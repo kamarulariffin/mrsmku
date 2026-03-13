@@ -19,6 +19,7 @@ MONGO_PORT=27017
 POSTGRES_PORT=5432
 
 DB_ENGINE="${DB_ENGINE:-postgres}"
+TENANT_ENFORCEMENT_MODE="${TENANT_ENFORCEMENT_MODE:-strict}"
 START_FRONTEND=1
 DRY_RUN=0
 BACKEND_PID=""
@@ -213,22 +214,22 @@ ensure_service_on_port "${POSTGRES_PORT}" "PostgreSQL" \
   "postgresql@18" "postgresql@17" "postgresql@16" "postgresql@15" "postgresql@14" "postgresql"
 echo
 
-echo "==> Langkah 3/4: Start backend single-process (DB_ENGINE=${DB_ENGINE})"
+echo "==> Langkah 3/4: Start backend single-process (DB_ENGINE=${DB_ENGINE}, TENANT_ENFORCEMENT_MODE=${TENANT_ENFORCEMENT_MODE})"
 if [[ "$START_FRONTEND" -eq 0 ]]; then
   if [[ "$DRY_RUN" -eq 1 ]]; then
-    echo "[DRY-RUN] cd \"${BACKEND_DIR}\" && DB_ENGINE=${DB_ENGINE} ./venv/bin/uvicorn server:app --host 0.0.0.0 --port ${BACKEND_PORT}"
+    echo "[DRY-RUN] cd \"${BACKEND_DIR}\" && DB_ENGINE=${DB_ENGINE} TENANT_ENFORCEMENT_MODE=${TENANT_ENFORCEMENT_MODE} ./venv/bin/uvicorn server:app --host 0.0.0.0 --port ${BACKEND_PORT}"
     exit 0
   fi
   cd "${BACKEND_DIR}"
-  exec env DB_ENGINE="${DB_ENGINE}" ./venv/bin/uvicorn server:app --host 0.0.0.0 --port "${BACKEND_PORT}"
+  exec env DB_ENGINE="${DB_ENGINE}" TENANT_ENFORCEMENT_MODE="${TENANT_ENFORCEMENT_MODE}" ./venv/bin/uvicorn server:app --host 0.0.0.0 --port "${BACKEND_PORT}"
 fi
 
 if [[ "$DRY_RUN" -eq 1 ]]; then
-  echo "[DRY-RUN] (cd \"${BACKEND_DIR}\" && DB_ENGINE=${DB_ENGINE} ./venv/bin/uvicorn server:app --host 0.0.0.0 --port ${BACKEND_PORT}) &"
+  echo "[DRY-RUN] (cd \"${BACKEND_DIR}\" && DB_ENGINE=${DB_ENGINE} TENANT_ENFORCEMENT_MODE=${TENANT_ENFORCEMENT_MODE} ./venv/bin/uvicorn server:app --host 0.0.0.0 --port ${BACKEND_PORT}) &"
 else
   (
     cd "${BACKEND_DIR}"
-    DB_ENGINE="${DB_ENGINE}" ./venv/bin/uvicorn server:app --host 0.0.0.0 --port "${BACKEND_PORT}"
+    DB_ENGINE="${DB_ENGINE}" TENANT_ENFORCEMENT_MODE="${TENANT_ENFORCEMENT_MODE}" ./venv/bin/uvicorn server:app --host 0.0.0.0 --port "${BACKEND_PORT}"
   ) &
   BACKEND_PID=$!
 fi

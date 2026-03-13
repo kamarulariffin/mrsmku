@@ -4,15 +4,21 @@ Extracted from server.py for better code organization
 Refactored using the proper dependency injection pattern
 """
 from datetime import datetime, timezone
-from typing import List, Callable
+from typing import List, Callable, Dict, Any
 
 from fastapi import APIRouter, HTTPException, Depends
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 from bson import ObjectId
+from services.id_normalizer import object_id_or_none
 from repositories.core_store import CoreStore
 from repositories.payments_pg_repository import create_payment_with_transaction
 from services.number_sequence_service import next_sequence_value
+from services.tenant_enforcement import (
+    assert_tenant_doc_access as enforce_tenant_doc_access,
+    stamp_tenant_fields as apply_tenant_fields,
+    tenant_scope_query as build_tenant_scope_query,
+)
 
 router = APIRouter(prefix="/api/payments", tags=["Payments"])
 security = HTTPBearer(auto_error=False)
@@ -50,10 +56,8 @@ def _as_object_id_if_valid(value):
     if isinstance(value, ObjectId):
         return value
     if isinstance(value, str):
-        try:
-            return ObjectId(value)
-        except Exception:
-            return value
+        oid = object_id_or_none(value)
+        return oid if oid is not None else value
     return value
 
 
@@ -68,6 +72,21 @@ async def log_audit(user, action, module, details):
     """Wrapper for audit logging"""
     if _log_audit_func and user:
         await _log_audit_func(user, action, module, details)
+
+
+def _tenant_scope_query(current_user: dict) -> Dict[str, Any]:
+    return build_tenant_scope_query(
+        current_user,
+        detail="Tenant context diperlukan untuk operasi pembayaran.",
+    )
+
+
+def _assert_tenant_doc_access(current_user: dict, doc: dict, resource_name: str) -> None:
+    enforce_tenant_doc_access(current_user, doc, resource_name)
+
+
+def _stamp_tenant_fields(doc: Dict[str, Any], current_user: dict, fallback_doc: dict = None) -> Dict[str, Any]:
+    return apply_tenant_fields(doc, current_user, fallback_doc=fallback_doc)
 
 
 async def generate_payment_receipt_number(db) -> str:
@@ -135,10 +154,12 @@ async def create_payment(payment_data: PaymentCreate, current_user: dict = Depen
     
     fee_lookup_id = _as_object_id_if_valid(payment_data.fee_id)
     yuran = await db.student_yuran.find_one({"_id": fee_lookup_id})
+    _assert_tenant_doc_access(current_user, yuran, "rekod yuran")
     if not yuran:
         raise HTTPException(status_code=404, detail="Yuran tidak dijumpai. Sila gunakan /api/yuran/bayar/{student_yuran_id}")
     
     student = await db.students.find_one({"_id": yuran.get("student_id")})
+    _assert_tenant_doc_access(current_user, student, "rekod pelajar")
     if current_user["role"] == "parent" and student and str(student.get("parent_id")) != str(current_user["_id"]):
         raise HTTPException(status_code=403, detail="Akses ditolak")
     
@@ -149,7 +170,7 @@ async def create_payment(payment_data: PaymentCreate, current_user: dict = Depen
     receipt_number = await generate_payment_receipt_number(db)
     now_iso = datetime.now(timezone.utc).isoformat()
     
-    payment_doc = {
+    payment_doc = _stamp_tenant_fields({
         "fee_id": fee_lookup_id,
         "user_id": current_user["_id"],
         "amount": payment_data.amount,
@@ -157,12 +178,12 @@ async def create_payment(payment_data: PaymentCreate, current_user: dict = Depen
         "status": "completed",
         "receipt_number": receipt_number,
         "created_at": now_iso
-    }
+    }, current_user, fallback_doc=yuran)
     payments_insert_result = await db.payments.insert_one(payment_doc)
     payment_doc["_id"] = payments_insert_result.inserted_id
 
     # Keep canonical yuran payment ledger aligned with /api/yuran flows.
-    yuran_payment_insert_result = await db.yuran_payments.insert_one({
+    yuran_payment_doc = _stamp_tenant_fields({
         "student_yuran_id": yuran.get("_id"),
         "student_id": yuran.get("student_id"),
         "parent_id": student.get("parent_id") if student else None,
@@ -174,7 +195,8 @@ async def create_payment(payment_data: PaymentCreate, current_user: dict = Depen
         "status": "completed",
         "created_at": now_iso,
         "created_by": current_user.get("_id"),
-    })
+    }, current_user, fallback_doc=yuran)
+    yuran_payment_insert_result = await db.yuran_payments.insert_one(yuran_payment_doc)
     
     new_paid_amount = yuran.get("paid_amount", 0) + payment_data.amount
     new_status = "paid" if new_paid_amount >= yuran.get("total_amount", 0) else "partial"
@@ -219,14 +241,15 @@ async def create_payment(payment_data: PaymentCreate, current_user: dict = Depen
         raise
     
     if student and student.get("parent_id"):
-        await db.notifications.insert_one({
+        notification_doc = _stamp_tenant_fields({
             "user_id": student["parent_id"],
             "title": "Pembayaran Berjaya",
             "message": f"Pembayaran RM{payment_data.amount:.2f} untuk {student.get('full_name', yuran.get('student_name', ''))} berjaya. Resit: {receipt_number}",
             "type": "success",
             "is_read": False,
             "created_at": datetime.now(timezone.utc).isoformat()
-        })
+        }, current_user, fallback_doc=yuran)
+        await db.notifications.insert_one(notification_doc)
     
     await log_audit(current_user, "PAYMENT", "payments", f"Bayar RM{payment_data.amount} untuk {yuran.get('student_name', '')}")
     
@@ -237,8 +260,11 @@ async def create_payment(payment_data: PaymentCreate, current_user: dict = Depen
 async def get_payments(current_user: dict = Depends(get_current_user)):
     """Get payments"""
     db = get_db()
+    tenant_scope = _tenant_scope_query(current_user)
     if current_user["role"] == "parent":
-        payments = await db.payments.find({"user_id": current_user["_id"]}).to_list(1000)
+        query = {"user_id": current_user["_id"], **tenant_scope}
+        payments = await db.payments.find(query).to_list(1000)
     else:
-        payments = await db.payments.find().to_list(10000)
+        query = tenant_scope if tenant_scope else {}
+        payments = await db.payments.find(query).to_list(10000)
     return [serialize_payment(p) for p in payments]

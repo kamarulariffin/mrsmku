@@ -6,6 +6,7 @@ Semua laporan dan graf menggunakan data sebenar dari DB.
 from datetime import datetime, timezone
 from typing import Optional, Callable
 from bson import ObjectId
+from services.id_normalizer import object_id_or_none
 
 from fastapi import APIRouter, HTTPException, Depends, Query
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -259,10 +260,9 @@ async def get_yearly_students_report(
     db = get_db()
     query = {"tahun": year}
     if set_yuran_id:
-        try:
-            query["set_yuran_id"] = ObjectId(set_yuran_id)
-        except Exception:
-            pass
+        set_yuran_oid = object_id_or_none(set_yuran_id)
+        if set_yuran_oid is not None:
+            query["set_yuran_id"] = set_yuran_oid
     records = await db.student_yuran.find(query).to_list(10000)
     student_ids = list({r.get("student_id") for r in records if r.get("student_id")})
     students_map = {}

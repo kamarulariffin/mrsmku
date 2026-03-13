@@ -7,6 +7,9 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 
 from db.config import DATABASE_URL, is_postgres_mode
 from models_sql import Base
+from repositories.chatbox_relational_store import bootstrap_relational_chatbox_tables
+from repositories.notifications_relational_store import bootstrap_relational_notification_tables
+from repositories.pwa_relational_store import bootstrap_relational_pwa_tables
 from repositories.tabung_relational_store import bootstrap_relational_tabung_tables
 from repositories.yuran_relational_store import bootstrap_relational_yuran_tables
 
@@ -43,6 +46,9 @@ async def init_postgres() -> None:
     # Keep existing migrated documents usable after introducing typed relational tables.
     await bootstrap_relational_yuran_tables(_session_factory)
     await bootstrap_relational_tabung_tables(_session_factory)
+    await bootstrap_relational_pwa_tables(_session_factory)
+    await bootstrap_relational_chatbox_tables(_session_factory)
+    await bootstrap_relational_notification_tables(_session_factory)
 
     logger.info("PostgreSQL initialized for DB_ENGINE=%s", DATABASE_URL)
 

@@ -5,9 +5,10 @@ Pengurusan Akaun Bank dan Tahun Kewangan
 
 from fastapi import APIRouter, HTTPException, Depends, Query
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from typing import Optional, List
+from typing import Any, Optional, List
 from datetime import datetime, timezone
 from bson import ObjectId
+from services.id_normalizer import object_id_or_none
 
 from models.accounting import (
     BankAccountType, BankAccountCreate, BankAccountUpdate, BankAccountResponse,
@@ -15,6 +16,7 @@ from models.accounting import (
     OpeningBalanceCreate, OpeningBalanceUpdate, OpeningBalanceResponse,
     BANK_ACCOUNT_TYPE_DISPLAY
 )
+from routes.accounting_financial_year_utils import ensure_current_financial_year
 
 router = APIRouter(prefix="/api/accounting-full", tags=["Bank Accounts"])
 security = HTTPBearer(auto_error=False)
@@ -44,6 +46,21 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
 async def log_audit(user, action, module, details):
     if _log_audit_func and user:
         await _log_audit_func(user, action, module, details)
+
+
+def _id_value(value: Any) -> Any:
+    """Normalize ID-like inputs while supporting non-ObjectId IDs."""
+    if value is None:
+        return None
+    if isinstance(value, ObjectId):
+        return value
+    text = str(value)
+    try:
+        if ObjectId.is_valid(text):
+            return object_id_or_none(text)
+    except Exception:
+        pass
+    return text
 
 
 # Role checks
@@ -163,7 +180,7 @@ async def update_bank_account(
     db = get_db()
     check_bendahari_access(user)
     
-    account = await db.bank_accounts.find_one({"_id": ObjectId(account_id)})
+    account = await db.bank_accounts.find_one({"_id": _id_value(account_id)})
     if not account:
         raise HTTPException(status_code=404, detail="Akaun bank tidak dijumpai")
     
@@ -171,7 +188,7 @@ async def update_bank_account(
     if data.name is not None:
         existing = await db.bank_accounts.find_one({
             "name": data.name,
-            "_id": {"$ne": ObjectId(account_id)}
+            "_id": {"$ne": _id_value(account_id)}
         })
         if existing:
             raise HTTPException(status_code=400, detail="Akaun bank dengan nama ini sudah wujud")
@@ -194,14 +211,14 @@ async def update_bank_account(
         update_data["updated_at"] = datetime.now(timezone.utc)
         update_data["updated_by"] = user["_id"]
         await db.bank_accounts.update_one(
-            {"_id": ObjectId(account_id)},
+            {"_id": _id_value(account_id)},
             {"$set": update_data}
         )
     
     await log_audit(user, "UPDATE_BANK_ACCOUNT", "accounting", f"Kemaskini akaun bank: {account['name']}")
     
     # Fetch updated
-    updated = await db.bank_accounts.find_one({"_id": ObjectId(account_id)})
+    updated = await db.bank_accounts.find_one({"_id": _id_value(account_id)})
     balance = await calculate_account_balance(db, account_id)
     
     created_at = updated.get("created_at")
@@ -233,7 +250,7 @@ async def delete_bank_account(
     db = get_db()
     check_bendahari_access(user)
     
-    account = await db.bank_accounts.find_one({"_id": ObjectId(account_id)})
+    account = await db.bank_accounts.find_one({"_id": _id_value(account_id)})
     if not account:
         raise HTTPException(status_code=404, detail="Akaun bank tidak dijumpai")
     
@@ -241,13 +258,13 @@ async def delete_bank_account(
     tx_count = await db.accounting_transactions.count_documents({"bank_account_id": account_id})
     if tx_count > 0:
         await db.bank_accounts.update_one(
-            {"_id": ObjectId(account_id)},
+            {"_id": _id_value(account_id)},
             {"$set": {"is_active": False, "deleted_at": datetime.now(timezone.utc)}}
         )
         await log_audit(user, "SOFT_DELETE_BANK_ACCOUNT", "accounting", f"Nyahaktifkan akaun: {account['name']} ({tx_count} transaksi)")
         return {"message": f"Akaun dinyahaktifkan kerana terdapat {tx_count} transaksi berkaitan"}
     
-    await db.bank_accounts.delete_one({"_id": ObjectId(account_id)})
+    await db.bank_accounts.delete_one({"_id": _id_value(account_id)})
     await log_audit(user, "DELETE_BANK_ACCOUNT", "accounting", f"Padam akaun bank: {account['name']}")
     
     return {"message": "Akaun bank berjaya dipadam"}
@@ -293,16 +310,8 @@ async def get_current_financial_year(
     """Get current active financial year"""
     db = get_db()
     check_accounting_access(user)
-    
-    fy = await db.financial_years.find_one({"is_current": True})
-    if not fy:
-        # Try to find by current date
-        today = datetime.now().strftime("%Y-%m-%d")
-        fy = await db.financial_years.find_one({
-            "start_date": {"$lte": today},
-            "end_date": {"$gte": today}
-        })
-    
+
+    fy = await ensure_current_financial_year(db, auto_create=True)
     if not fy:
         raise HTTPException(status_code=404, detail="Tiada tahun kewangan aktif. Sila cipta tahun kewangan.")
     
@@ -394,7 +403,7 @@ async def update_financial_year(
     db = get_db()
     check_bendahari_access(user)
     
-    fy = await db.financial_years.find_one({"_id": ObjectId(year_id)})
+    fy = await db.financial_years.find_one({"_id": _id_value(year_id)})
     if not fy:
         raise HTTPException(status_code=404, detail="Tahun kewangan tidak dijumpai")
     
@@ -410,7 +419,7 @@ async def update_financial_year(
     
     if data.is_current is True:
         await db.financial_years.update_many(
-            {"_id": {"$ne": ObjectId(year_id)}},
+            {"_id": {"$ne": _id_value(year_id)}},
             {"$set": {"is_current": False}}
         )
         update_data["is_current"] = True
@@ -424,14 +433,14 @@ async def update_financial_year(
         update_data["updated_at"] = datetime.now(timezone.utc)
         update_data["updated_by"] = user["_id"]
         await db.financial_years.update_one(
-            {"_id": ObjectId(year_id)},
+            {"_id": _id_value(year_id)},
             {"$set": update_data}
         )
     
     await log_audit(user, "UPDATE_FINANCIAL_YEAR", "accounting", f"Kemaskini tahun kewangan: {fy['name']}")
     
     # Fetch updated
-    updated = await db.financial_years.find_one({"_id": ObjectId(year_id)})
+    updated = await db.financial_years.find_one({"_id": _id_value(year_id)})
     
     created_at = updated.get("created_at")
     if isinstance(created_at, datetime):
@@ -460,7 +469,7 @@ async def close_financial_year(
     if user["role"] not in ["superadmin", "juruaudit"]:
         raise HTTPException(status_code=403, detail="Hanya JuruAudit boleh tutup tahun kewangan")
     
-    fy = await db.financial_years.find_one({"_id": ObjectId(year_id)})
+    fy = await db.financial_years.find_one({"_id": _id_value(year_id)})
     if not fy:
         raise HTTPException(status_code=404, detail="Tahun kewangan tidak dijumpai")
     
@@ -476,7 +485,7 @@ async def close_financial_year(
         raise HTTPException(status_code=400, detail=f"Terdapat {pending} transaksi yang belum disahkan")
     
     await db.financial_years.update_one(
-        {"_id": ObjectId(year_id)},
+        {"_id": _id_value(year_id)},
         {"$set": {
             "is_closed": True,
             "is_current": False,
@@ -515,10 +524,10 @@ async def list_opening_balances(
     fys = {}
     accs = {}
     if fy_ids:
-        fy_docs = await db.financial_years.find({"_id": {"$in": [ObjectId(f) for f in fy_ids]}}).to_list(100)
+        fy_docs = await db.financial_years.find({"_id": {"$in": [_id_value(f) for f in fy_ids]}}).to_list(100)
         fys = {str(f["_id"]): f["name"] for f in fy_docs}
     if acc_ids:
-        acc_docs = await db.bank_accounts.find({"_id": {"$in": [ObjectId(a) for a in acc_ids]}}).to_list(100)
+        acc_docs = await db.bank_accounts.find({"_id": {"$in": [_id_value(a) for a in acc_ids]}}).to_list(100)
         accs = {str(a["_id"]): a["name"] for a in acc_docs}
     
     result = []
@@ -552,14 +561,14 @@ async def create_opening_balance(
     check_bendahari_access(user)
     
     # Validate financial year
-    fy = await db.financial_years.find_one({"_id": ObjectId(data.financial_year_id)})
+    fy = await db.financial_years.find_one({"_id": _id_value(data.financial_year_id)})
     if not fy:
         raise HTTPException(status_code=404, detail="Tahun kewangan tidak dijumpai")
     if fy.get("is_closed"):
         raise HTTPException(status_code=400, detail="Tahun kewangan sudah ditutup")
     
     # Validate bank account
-    acc = await db.bank_accounts.find_one({"_id": ObjectId(data.bank_account_id)})
+    acc = await db.bank_accounts.find_one({"_id": _id_value(data.bank_account_id)})
     if not acc:
         raise HTTPException(status_code=404, detail="Akaun bank tidak dijumpai")
     
@@ -635,16 +644,16 @@ async def delete_opening_balance(
     db = get_db()
     check_bendahari_access(user)
     
-    balance = await db.opening_balances.find_one({"_id": ObjectId(balance_id)})
+    balance = await db.opening_balances.find_one({"_id": _id_value(balance_id)})
     if not balance:
         raise HTTPException(status_code=404, detail="Baki tidak dijumpai")
     
     # Check if financial year is closed
-    fy = await db.financial_years.find_one({"_id": ObjectId(balance.get("financial_year_id"))})
+    fy = await db.financial_years.find_one({"_id": _id_value(balance.get("financial_year_id"))})
     if fy and fy.get("is_closed"):
         raise HTTPException(status_code=400, detail="Tahun kewangan sudah ditutup")
     
-    await db.opening_balances.delete_one({"_id": ObjectId(balance_id)})
+    await db.opening_balances.delete_one({"_id": _id_value(balance_id)})
     await log_audit(user, "DELETE_OPENING_BALANCE", "accounting", "Padam baki bawa ke hadapan")
     
     return {"message": "Baki bawa ke hadapan berjaya dipadam"}
@@ -670,39 +679,31 @@ async def calculate_account_balance(db, bank_account_id: str) -> float:
         if ob:
             opening_balance = ob.get("amount", 0)
     
-    # Sum all verified transactions for this account
-    income_pipeline = [
-        {"$match": {
-            "bank_account_id": bank_account_id,
-            "type": "income",
-            "status": "verified",
-            "is_deleted": {"$ne": True}
-        }},
-        {"$group": {"_id": None, "total": {"$sum": "$amount"}}}
-    ]
-    income_result = await db.accounting_transactions.aggregate(income_pipeline).to_list(1)
-    total_income = income_result[0]["total"] if income_result else 0
-    
-    expense_pipeline = [
-        {"$match": {
-            "bank_account_id": bank_account_id,
-            "type": "expense",
-            "status": "verified",
-            "is_deleted": {"$ne": True}
-        }},
-        {"$group": {"_id": None, "total": {"$sum": "$amount"}}}
-    ]
-    expense_result = await db.accounting_transactions.aggregate(expense_pipeline).to_list(1)
-    total_expense = expense_result[0]["total"] if expense_result else 0
+    # Sum all verified transactions for this account without aggregate()
+    total_income = 0.0
+    async for row in db.accounting_transactions.find({
+        "bank_account_id": bank_account_id,
+        "type": "income",
+        "status": "verified",
+        "is_deleted": {"$ne": True},
+    }):
+        total_income += float(row.get("amount", 0) or 0)
+
+    total_expense = 0.0
+    async for row in db.accounting_transactions.find({
+        "bank_account_id": bank_account_id,
+        "type": "expense",
+        "status": "verified",
+        "is_deleted": {"$ne": True},
+    }):
+        total_expense += float(row.get("amount", 0) or 0)
     
     return round(opening_balance + total_income - total_expense, 2)
 
 
 async def get_total_opening_balance(db, financial_year_id: str) -> float:
     """Get total opening balance for all accounts in a financial year"""
-    pipeline = [
-        {"$match": {"financial_year_id": financial_year_id}},
-        {"$group": {"_id": None, "total": {"$sum": "$amount"}}}
-    ]
-    result = await db.opening_balances.aggregate(pipeline).to_list(1)
-    return result[0]["total"] if result else 0
+    total = 0.0
+    async for row in db.opening_balances.find({"financial_year_id": financial_year_id}):
+        total += float(row.get("amount", 0) or 0)
+    return total

@@ -6,9 +6,10 @@ Synchronized with Koperasi, Inventory, and other modules
 
 from fastapi import APIRouter, HTTPException, Depends
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from typing import List, Optional
+from typing import Any, List, Optional
 from datetime import datetime, timezone
 from bson import ObjectId
+from services.id_normalizer import object_id_or_none
 
 from models.category import (
     CategoryCreate, CategoryUpdate, CategoryResponse,
@@ -64,6 +65,21 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
 async def log_audit(user, action, module, details):
     if _log_audit_func and user:
         await _log_audit_func(user, action, module, details)
+
+
+def _id_value(value: Any) -> Any:
+    """Normalize ID-like inputs while supporting non-ObjectId IDs."""
+    if value is None:
+        return None
+    if isinstance(value, ObjectId):
+        return value
+    text = str(value).strip()
+    try:
+        if ObjectId.is_valid(text):
+            return object_id_or_none(text)
+    except Exception:
+        pass
+    return text
 
 
 # ==================== PUBLIC ENDPOINTS ====================
@@ -137,7 +153,7 @@ async def get_all_categories(
         # Get parent name
         parent_name = None
         if cat.get("parent_id"):
-            parent = await db.product_categories.find_one({"_id": ObjectId(cat["parent_id"])})
+            parent = await db.product_categories.find_one({"_id": _id_value(cat["parent_id"])})
             parent_name = parent["name"] if parent else None
         
         # Get children
@@ -225,7 +241,7 @@ async def update_category(category_id: str, category: CategoryUpdate, user: dict
     if user["role"] not in ["superadmin", "admin", "koop_admin", "merchandise_admin", "pum_admin"]:
         raise HTTPException(status_code=403, detail="Akses ditolak")
     
-    existing = await db.product_categories.find_one({"_id": ObjectId(category_id)})
+    existing = await db.product_categories.find_one({"_id": _id_value(category_id)})
     if not existing:
         raise HTTPException(status_code=404, detail="Kategori tidak dijumpai")
     
@@ -245,7 +261,7 @@ async def update_category(category_id: str, category: CategoryUpdate, user: dict
     
     update_data["updated_at"] = datetime.now(timezone.utc)
     
-    await db.product_categories.update_one({"_id": ObjectId(category_id)}, {"$set": update_data})
+    await db.product_categories.update_one({"_id": _id_value(category_id)}, {"$set": update_data})
     
     await log_audit(user, "UPDATE_CATEGORY", "category", f"Kategori dikemaskini: {category_id}")
     
@@ -261,7 +277,7 @@ async def delete_category(category_id: str, user: dict = Depends(get_current_use
         raise HTTPException(status_code=403, detail="Akses ditolak")
     
     # Check if category has products
-    cat = await db.product_categories.find_one({"_id": ObjectId(category_id)})
+    cat = await db.product_categories.find_one({"_id": _id_value(category_id)})
     if not cat:
         raise HTTPException(status_code=404, detail="Kategori tidak dijumpai")
     
@@ -273,7 +289,7 @@ async def delete_category(category_id: str, user: dict = Depends(get_current_use
         raise HTTPException(status_code=400, detail=f"Kategori ini mempunyai {koperasi_count + merchandise_count + pum_count} produk. Sila pindahkan produk dahulu.")
     
     await db.product_categories.update_one(
-        {"_id": ObjectId(category_id)},
+        {"_id": _id_value(category_id)},
         {"$set": {"is_active": False, "updated_at": datetime.now(timezone.utc)}}
     )
     
@@ -466,7 +482,7 @@ async def get_koperasi_categories_flat(user: dict = Depends(get_current_user_opt
         # Get parent name if exists
         parent_name = None
         if cat.get("parent_id"):
-            parent = await db.product_categories.find_one({"_id": ObjectId(cat["parent_id"])})
+            parent = await db.product_categories.find_one({"_id": _id_value(cat["parent_id"])})
             parent_name = parent["name"] if parent else None
         
         result.append({
@@ -561,7 +577,7 @@ async def create_subcategory(
         raise HTTPException(status_code=403, detail="Akses ditolak")
     
     # Verify parent exists
-    parent = await db.product_categories.find_one({"_id": ObjectId(parent_id)})
+    parent = await db.product_categories.find_one({"_id": _id_value(parent_id)})
     if not parent:
         raise HTTPException(status_code=404, detail="Kategori induk tidak dijumpai")
     
@@ -609,7 +625,7 @@ async def move_category(
         raise HTTPException(status_code=403, detail="Akses ditolak")
     
     # Verify category exists
-    category = await db.product_categories.find_one({"_id": ObjectId(category_id)})
+    category = await db.product_categories.find_one({"_id": _id_value(category_id)})
     if not category:
         raise HTTPException(status_code=404, detail="Kategori tidak dijumpai")
     
@@ -632,12 +648,12 @@ async def move_category(
             raise HTTPException(status_code=400, detail="Tidak boleh pindah ke kategori anak")
         
         # Verify new parent exists
-        new_parent = await db.product_categories.find_one({"_id": ObjectId(new_parent_id)})
+        new_parent = await db.product_categories.find_one({"_id": _id_value(new_parent_id)})
         if not new_parent:
             raise HTTPException(status_code=404, detail="Kategori induk baru tidak dijumpai")
     
     await db.product_categories.update_one(
-        {"_id": ObjectId(category_id)},
+        {"_id": _id_value(category_id)},
         {"$set": {"parent_id": new_parent_id, "updated_at": datetime.now(timezone.utc)}}
     )
     

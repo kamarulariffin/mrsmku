@@ -6,6 +6,7 @@ import asyncio
 import json
 import os
 import sys
+from decimal import Decimal, ROUND_DOWN
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
@@ -42,15 +43,34 @@ def _to_async_url(url: str) -> str:
     return url
 
 
-def _normalize(value: Any) -> Any:
+def _canonical_datetime(value: datetime) -> str:
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    else:
+        value = value.astimezone(timezone.utc)
+    millis = int((Decimal(value.microsecond) / Decimal(1000)).to_integral_value(rounding=ROUND_DOWN))
+    value = value.replace(microsecond=millis * 1000)
+    return value.isoformat().replace("+00:00", "Z")
+
+
+def _normalize(value: Any, *, key_hint: str = "") -> Any:
     if isinstance(value, dict):
-        return {k: _normalize(v) for k, v in value.items()}
+        return {k: _normalize(v, key_hint=str(k)) for k, v in value.items()}
     if isinstance(value, list):
-        return [_normalize(v) for v in value]
+        return [_normalize(v, key_hint=key_hint) for v in value]
     if isinstance(value, ObjectId):
         return str(value)
     if isinstance(value, datetime):
-        return value.isoformat()
+        return _canonical_datetime(value)
+    if isinstance(value, str) and (key_hint in _MONGO_DATETIME_FIELDS or key_hint.endswith("_at")):
+        raw = value.strip()
+        if raw.endswith("Z"):
+            raw = raw[:-1] + "+00:00"
+        try:
+            parsed = datetime.fromisoformat(raw)
+            return _canonical_datetime(parsed)
+        except ValueError:
+            return value
     return value
 
 

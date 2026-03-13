@@ -9,6 +9,7 @@ import tempfile
 from datetime import datetime, timezone, timedelta
 from typing import Optional, List, Any, Dict
 from bson import ObjectId
+from services.id_normalizer import object_id_or_none
 
 from fastapi import APIRouter, HTTPException, Depends, Query
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -91,10 +92,8 @@ def _as_object_id_if_valid(value: Any) -> Any:
     if isinstance(value, ObjectId):
         return value
     if isinstance(value, str):
-        try:
-            return ObjectId(value)
-        except Exception:
-            return value
+        oid = object_id_or_none(value)
+        return oid if oid is not None else value
     return value
 
 
@@ -2710,23 +2709,14 @@ async def get_ar_notification_report(
             "triggered_by_role": row.get("triggered_by_role"),
         })
 
-    summary_pipeline = [
-        {"$match": query},
-        {
-            "$group": {
-                "_id": "$status",
-                "count": {"$sum": 1},
-                "success_count": {"$sum": {"$ifNull": ["$success_count", 0]}},
-                "failed_count": {"$sum": {"$ifNull": ["$failed_count", 0]}},
-            }
-        },
-    ]
-    summary_rows = await db[AR_NOTIFICATION_REPORT_COLLECTION].aggregate(summary_pipeline).to_list(20)
-    summary = {item.get("_id") or "unknown": {
-        "records": int(item.get("count") or 0),
-        "success_count": int(item.get("success_count") or 0),
-        "failed_count": int(item.get("failed_count") or 0),
-    } for item in summary_rows}
+    summary = {}
+    async for row in db[AR_NOTIFICATION_REPORT_COLLECTION].find(query):
+        status_key = row.get("status") or "unknown"
+        if status_key not in summary:
+            summary[status_key] = {"records": 0, "success_count": 0, "failed_count": 0}
+        summary[status_key]["records"] += 1
+        summary[status_key]["success_count"] += int(row.get("success_count") or 0)
+        summary[status_key]["failed_count"] += int(row.get("failed_count") or 0)
 
     return {
         "total": total,

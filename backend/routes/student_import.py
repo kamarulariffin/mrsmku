@@ -15,6 +15,7 @@ import base64
 from datetime import datetime, timezone
 from typing import List, Optional, Callable
 from bson import ObjectId
+from services.id_normalizer import object_id_or_none
 
 from fastapi import APIRouter, HTTPException, Depends, UploadFile, File, Query
 from fastapi.responses import StreamingResponse
@@ -992,11 +993,13 @@ async def claim_student_authenticated(
     
     # Update student with parent link if parent_id provided
     if parent_id:
-        from bson import ObjectId
         try:
+            parent_oid = object_id_or_none(parent_id)
+            if parent_oid is None:
+                raise ValueError("Invalid parent_id format")
             await db.students.update_one(
                 {"_id": student_id},
-                {"$set": {"parent_id": ObjectId(parent_id)}}
+                {"$set": {"parent_id": parent_oid}}
             )
         except Exception:
             pass  # Invalid parent_id format
@@ -1036,11 +1039,16 @@ async def get_import_stats():
     claim_codes_claimed = await db.claim_codes.count_documents({"status": "claimed"})
     
     # By tingkatan
-    pipeline = [
-        {"$group": {"_id": "$tingkatan", "count": {"$sum": 1}}},
-        {"$sort": {"_id": 1}}
-    ]
-    by_tingkatan = await db.claim_codes.aggregate(pipeline).to_list(10)
+    tingkatan_counts = {}
+    async for row in db.claim_codes.find({}):
+        tingkatan = row.get("tingkatan")
+        if tingkatan is None:
+            continue
+        tingkatan_counts[tingkatan] = tingkatan_counts.get(tingkatan, 0) + 1
+    by_tingkatan = sorted(
+        [{"_id": tingkatan, "count": count} for tingkatan, count in tingkatan_counts.items()],
+        key=lambda item: item["_id"],
+    )[:10]
     
     return {
         "students": {

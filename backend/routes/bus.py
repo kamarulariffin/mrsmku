@@ -3,8 +3,10 @@ Bus Ticket Management System - API Routes
 MRSMKU Portal
 """
 from datetime import datetime, timezone
-from typing import List, Optional
+from typing import Any, List, Optional
 from bson import ObjectId
+from services.id_normalizer import object_id_or_none
+from services.tenant_enforcement import stamp_tenant_fields as apply_tenant_fields
 from fastapi import APIRouter, HTTPException, Depends, Query
 
 from models.bus import (
@@ -30,6 +32,34 @@ def generate_booking_number():
     date_part = datetime.now().strftime("%y%m%d")
     random_part = ''.join(random.choices(string.ascii_uppercase + string.digits, k=4))
     return f"{prefix}{date_part}{random_part}"
+
+
+def _as_optional_str(value):
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.isoformat()
+    return str(value)
+
+
+def _as_string(value) -> str:
+    normalized = _as_optional_str(value)
+    return normalized if normalized is not None else ""
+
+
+def _id_value(value: Any) -> Any:
+    """Convert ID-like value while tolerating non-ObjectId IDs."""
+    if value is None:
+        return None
+    if isinstance(value, ObjectId):
+        return value
+    text = str(value)
+    try:
+        if ObjectId.is_valid(text):
+            return object_id_or_none(text)
+    except Exception:
+        pass
+    return text
 
 
 # ============ BUS COMPANY ENDPOINTS ============
@@ -59,14 +89,14 @@ def _company_to_response(company: dict, bus_count: int = 0, route_count: int = 0
         is_active=company.get("is_active", True),
         is_verified=company.get("is_verified", False),
         application_status=company.get("application_status"),
-        submitted_at=company.get("submitted_at"),
+        submitted_at=_as_optional_str(company.get("submitted_at")),
         reviewed_by=company.get("reviewed_by"),
-        approved_at=company.get("approved_at"),
+        approved_at=_as_optional_str(company.get("approved_at")),
         officer_notes=company.get("officer_notes"),
         total_buses=bus_count,
         total_routes=route_count,
-        created_at=company.get("created_at", ""),
-        verified_at=company.get("verified_at"),
+        created_at=_as_string(company.get("created_at")),
+        verified_at=_as_optional_str(company.get("verified_at")),
         verified_by=company.get("verified_by")
     )
 
@@ -160,7 +190,7 @@ async def create_bus_company_public(db, data: BusCompanyCreate) -> BusCompanyRes
 
 async def get_bus_company(db, company_id: str) -> BusCompanyResponse:
     """Get single bus company"""
-    company = await db.bus_companies.find_one({"_id": ObjectId(company_id)})
+    company = await db.bus_companies.find_one({"_id": _id_value(company_id)})
     if not company:
         raise HTTPException(status_code=404, detail="Syarikat bas tidak dijumpai")
     bus_count = await db.buses.count_documents({"company_id": company["_id"]})
@@ -174,7 +204,7 @@ async def update_bus_company(
     data: BusCompanyUpdate
 ) -> BusCompanyResponse:
     """Update bus company"""
-    company = await db.bus_companies.find_one({"_id": ObjectId(company_id)})
+    company = await db.bus_companies.find_one({"_id": _id_value(company_id)})
     if not company:
         raise HTTPException(status_code=404, detail="Syarikat bas tidak dijumpai")
     
@@ -182,7 +212,7 @@ async def update_bus_company(
     if update_data:
         update_data["updated_at"] = datetime.now(timezone.utc).isoformat()
         await db.bus_companies.update_one(
-            {"_id": ObjectId(company_id)},
+            {"_id": _id_value(company_id)},
             {"$set": update_data}
         )
     
@@ -206,7 +236,7 @@ async def approve_bus_company(
             status_code=400,
             detail="Status mestilah: approved, rejected, atau need_documents"
         )
-    company = await db.bus_companies.find_one({"_id": ObjectId(company_id)})
+    company = await db.bus_companies.find_one({"_id": _id_value(company_id)})
     if not company:
         raise HTTPException(status_code=404, detail="Syarikat bas tidak dijumpai")
     
@@ -224,7 +254,7 @@ async def approve_bus_company(
         update["approved_at"] = now
     
     await db.bus_companies.update_one(
-        {"_id": ObjectId(company_id)},
+        {"_id": _id_value(company_id)},
         {"$set": update}
     )
     return await get_bus_company(db, company_id)
@@ -232,16 +262,16 @@ async def approve_bus_company(
 
 async def delete_bus_company(db, company_id: str) -> dict:
     """Delete bus company"""
-    company = await db.bus_companies.find_one({"_id": ObjectId(company_id)})
+    company = await db.bus_companies.find_one({"_id": _id_value(company_id)})
     if not company:
         raise HTTPException(status_code=404, detail="Syarikat bas tidak dijumpai")
     
     # Check for active buses and routes
-    bus_count = await db.buses.count_documents({"company_id": ObjectId(company_id)})
+    bus_count = await db.buses.count_documents({"company_id": _id_value(company_id)})
     if bus_count > 0:
         raise HTTPException(status_code=400, detail="Tidak boleh padam syarikat yang mempunyai bas berdaftar")
     
-    await db.bus_companies.delete_one({"_id": ObjectId(company_id)})
+    await db.bus_companies.delete_one({"_id": _id_value(company_id)})
     return {"message": "Syarikat bas berjaya dipadam"}
 
 
@@ -268,19 +298,19 @@ def _bus_to_response(bus: dict, company_name: Optional[str] = None) -> BusRespon
         bus_category=bus.get("bus_category"),
         color=bus.get("color"),
         ownership_status=bus.get("ownership_status"),
-        operation_start_date=bus.get("operation_start_date"),
+        operation_start_date=_as_optional_str(bus.get("operation_start_date")),
         permit_no=bus.get("permit_no"),
-        permit_expiry=bus.get("permit_expiry"),
+        permit_expiry=_as_optional_str(bus.get("permit_expiry")),
         permit_document_url=bus.get("permit_document_url"),
-        puspakom_date=bus.get("puspakom_date"),
+        puspakom_date=_as_optional_str(bus.get("puspakom_date")),
         puspakom_result=bus.get("puspakom_result"),
         puspakom_document_url=bus.get("puspakom_document_url"),
         insurance_company=bus.get("insurance_company"),
-        insurance_expiry=bus.get("insurance_expiry"),
+        insurance_expiry=_as_optional_str(bus.get("insurance_expiry")),
         insurance_document_url=bus.get("insurance_document_url"),
         geran_document_url=bus.get("geran_document_url"),
         is_active=bus.get("is_active", True),
-        created_at=bus.get("created_at", "")
+        created_at=_as_string(bus.get("created_at"))
     )
 
 
@@ -292,7 +322,7 @@ async def get_buses(
     """Get all buses"""
     query = {}
     if company_id:
-        query["company_id"] = ObjectId(company_id)
+        query["company_id"] = _id_value(company_id)
     if is_active is not None:
         query["is_active"] = is_active
     
@@ -309,7 +339,7 @@ async def get_buses(
 async def create_bus(db, data: BusCreate, created_by: str) -> BusResponse:
     """Create new bus"""
     # Verify company exists
-    company = await db.bus_companies.find_one({"_id": ObjectId(data.company_id)})
+    company = await db.bus_companies.find_one({"_id": _id_value(data.company_id)})
     if not company:
         raise HTTPException(status_code=404, detail="Syarikat bas tidak dijumpai")
     
@@ -319,7 +349,7 @@ async def create_bus(db, data: BusCreate, created_by: str) -> BusResponse:
         raise HTTPException(status_code=400, detail="Nombor plat bas sudah didaftarkan")
     
     bus_doc = {
-        "company_id": ObjectId(data.company_id),
+        "company_id": _id_value(data.company_id),
         "plate_number": data.plate_number.upper(),
         "bus_type": data.bus_type,
         "total_seats": data.total_seats,
@@ -356,7 +386,7 @@ async def create_bus(db, data: BusCreate, created_by: str) -> BusResponse:
 
 async def get_bus(db, bus_id: str) -> BusResponse:
     """Get single bus"""
-    bus = await db.buses.find_one({"_id": ObjectId(bus_id)})
+    bus = await db.buses.find_one({"_id": _id_value(bus_id)})
     if not bus:
         raise HTTPException(status_code=404, detail="Bas tidak dijumpai")
     company = await db.bus_companies.find_one({"_id": bus["company_id"]})
@@ -366,7 +396,7 @@ async def get_bus(db, bus_id: str) -> BusResponse:
 
 async def update_bus(db, bus_id: str, data: BusUpdate) -> BusResponse:
     """Update bus"""
-    bus = await db.buses.find_one({"_id": ObjectId(bus_id)})
+    bus = await db.buses.find_one({"_id": _id_value(bus_id)})
     if not bus:
         raise HTTPException(status_code=404, detail="Bas tidak dijumpai")
     
@@ -377,7 +407,7 @@ async def update_bus(db, bus_id: str, data: BusUpdate) -> BusResponse:
     if update_data:
         update_data["updated_at"] = datetime.now(timezone.utc).isoformat()
         await db.buses.update_one(
-            {"_id": ObjectId(bus_id)},
+            {"_id": _id_value(bus_id)},
             {"$set": update_data}
         )
     
@@ -386,19 +416,19 @@ async def update_bus(db, bus_id: str, data: BusUpdate) -> BusResponse:
 
 async def delete_bus(db, bus_id: str) -> dict:
     """Delete bus"""
-    bus = await db.buses.find_one({"_id": ObjectId(bus_id)})
+    bus = await db.buses.find_one({"_id": _id_value(bus_id)})
     if not bus:
         raise HTTPException(status_code=404, detail="Bas tidak dijumpai")
     
     # Check for active trips
     trip_count = await db.bus_trips.count_documents({
-        "bus_id": ObjectId(bus_id),
+        "bus_id": _id_value(bus_id),
         "status": {"$in": ["scheduled", "in_progress"]}
     })
     if trip_count > 0:
         raise HTTPException(status_code=400, detail="Tidak boleh padam bas yang mempunyai trip aktif")
     
-    await db.buses.delete_one({"_id": ObjectId(bus_id)})
+    await db.buses.delete_one({"_id": _id_value(bus_id)})
     return {"message": "Bas berjaya dipadam"}
 
 
@@ -412,7 +442,7 @@ async def get_routes(
     """Get all routes"""
     query = {}
     if company_id:
-        query["company_id"] = ObjectId(company_id)
+        query["company_id"] = _id_value(company_id)
     if is_active is not None:
         query["is_active"] = is_active
     
@@ -432,7 +462,7 @@ async def get_routes(
         
         return_route_name = None
         if route.get("return_route_id"):
-            return_route = await db.bus_routes.find_one({"_id": ObjectId(route["return_route_id"])})
+            return_route = await db.bus_routes.find_one({"_id": _id_value(route["return_route_id"])})
             if return_route:
                 return_route_name = return_route.get("name")
         
@@ -452,7 +482,7 @@ async def get_routes(
             trip_type=route.get("trip_type", "one_way"),
             return_route_id=str(route["return_route_id"]) if route.get("return_route_id") else None,
             return_route_name=return_route_name,
-            created_at=route.get("created_at", "")
+            created_at=_as_string(route.get("created_at"))
         ))
     
     return result
@@ -461,7 +491,7 @@ async def get_routes(
 async def create_route(db, data: RouteCreate, created_by: str) -> RouteResponse:
     """Create new route"""
     # Verify company exists
-    company = await db.bus_companies.find_one({"_id": ObjectId(data.company_id)})
+    company = await db.bus_companies.find_one({"_id": _id_value(data.company_id)})
     if not company:
         raise HTTPException(status_code=404, detail="Syarikat bas tidak dijumpai")
     
@@ -469,7 +499,7 @@ async def create_route(db, data: RouteCreate, created_by: str) -> RouteResponse:
     return_route_oid = None
     if trip_type == "return" and getattr(data, "return_route_id", None):
         try:
-            return_route_oid = ObjectId(data.return_route_id)
+            return_route_oid = _id_value(data.return_route_id)
         except Exception:
             pass
     
@@ -478,7 +508,7 @@ async def create_route(db, data: RouteCreate, created_by: str) -> RouteResponse:
         pickup_locations = [p.dict() for p in data.pickup_locations]
     
     route_doc = {
-        "company_id": ObjectId(data.company_id),
+        "company_id": _id_value(data.company_id),
         "name": data.name,
         "origin": data.origin,
         "destination": data.destination,
@@ -519,13 +549,13 @@ async def create_route(db, data: RouteCreate, created_by: str) -> RouteResponse:
         trip_type=trip_type,
         return_route_id=str(return_route_oid) if return_route_oid else None,
         return_route_name=return_route_name,
-        created_at=route_doc["created_at"]
+        created_at=_as_string(route_doc.get("created_at"))
     )
 
 
 async def get_route(db, route_id: str) -> RouteResponse:
     """Get single route"""
-    route = await db.bus_routes.find_one({"_id": ObjectId(route_id)})
+    route = await db.bus_routes.find_one({"_id": _id_value(route_id)})
     if not route:
         raise HTTPException(status_code=404, detail="Route tidak dijumpai")
     
@@ -561,13 +591,13 @@ async def get_route(db, route_id: str) -> RouteResponse:
         trip_type=route.get("trip_type", "one_way"),
         return_route_id=str(route["return_route_id"]) if route.get("return_route_id") else None,
         return_route_name=return_route_name,
-        created_at=route.get("created_at", "")
+        created_at=_as_string(route.get("created_at"))
     )
 
 
 async def update_route(db, route_id: str, data: RouteUpdate) -> RouteResponse:
     """Update route"""
-    route = await db.bus_routes.find_one({"_id": ObjectId(route_id)})
+    route = await db.bus_routes.find_one({"_id": _id_value(route_id)})
     if not route:
         raise HTTPException(status_code=404, detail="Route tidak dijumpai")
     
@@ -575,18 +605,30 @@ async def update_route(db, route_id: str, data: RouteUpdate) -> RouteResponse:
     for k, v in data.dict().items():
         if v is not None:
             if k == "drop_off_points":
-                update_data[k] = [point.dict() for point in v]
+                normalized_points = []
+                for point in v:
+                    if hasattr(point, "dict"):
+                        normalized_points.append(point.dict())
+                    elif isinstance(point, dict):
+                        normalized_points.append(dict(point))
+                update_data[k] = normalized_points
             elif k == "pickup_locations":
-                update_data[k] = [p.dict() for p in v]
+                normalized_pickups = []
+                for pickup in v:
+                    if hasattr(pickup, "dict"):
+                        normalized_pickups.append(pickup.dict())
+                    elif isinstance(pickup, dict):
+                        normalized_pickups.append(dict(pickup))
+                update_data[k] = normalized_pickups
             elif k == "return_route_id":
-                update_data[k] = ObjectId(v) if v else None
+                update_data[k] = _id_value(v) if v else None
             else:
                 update_data[k] = v
     
     if update_data:
         update_data["updated_at"] = datetime.now(timezone.utc).isoformat()
         await db.bus_routes.update_one(
-            {"_id": ObjectId(route_id)},
+            {"_id": _id_value(route_id)},
             {"$set": update_data}
         )
     
@@ -595,19 +637,19 @@ async def update_route(db, route_id: str, data: RouteUpdate) -> RouteResponse:
 
 async def delete_route(db, route_id: str) -> dict:
     """Delete route"""
-    route = await db.bus_routes.find_one({"_id": ObjectId(route_id)})
+    route = await db.bus_routes.find_one({"_id": _id_value(route_id)})
     if not route:
         raise HTTPException(status_code=404, detail="Route tidak dijumpai")
     
     # Check for active trips
     trip_count = await db.bus_trips.count_documents({
-        "route_id": ObjectId(route_id),
+        "route_id": _id_value(route_id),
         "status": {"$in": ["scheduled", "in_progress"]}
     })
     if trip_count > 0:
         raise HTTPException(status_code=400, detail="Tidak boleh padam route yang mempunyai trip aktif")
     
-    await db.bus_routes.delete_one({"_id": ObjectId(route_id)})
+    await db.bus_routes.delete_one({"_id": _id_value(route_id)})
     return {"message": "Route berjaya dipadam"}
 
 
@@ -625,9 +667,9 @@ async def get_trips(
     """Get all trips"""
     query = {}
     if route_id:
-        query["route_id"] = ObjectId(route_id)
+        query["route_id"] = _id_value(route_id)
     if bus_id:
-        query["bus_id"] = ObjectId(bus_id)
+        query["bus_id"] = _id_value(bus_id)
     if status:
         query["status"] = status
     if date_from:
@@ -670,16 +712,16 @@ async def get_trips(
             company_name=company["name"] if company else "Unknown",
             origin=route["origin"] if route else "Unknown",
             destination=route["destination"] if route else "Unknown",
-            departure_date=trip["departure_date"],
-            departure_time=trip["departure_time"],
-            return_date=trip.get("return_date"),
-            return_time=trip.get("return_time"),
+            departure_date=_as_string(trip.get("departure_date")),
+            departure_time=_as_string(trip.get("departure_time")),
+            return_date=_as_optional_str(trip.get("return_date")),
+            return_time=_as_optional_str(trip.get("return_time")),
             total_seats=bus["total_seats"] if bus else 0,
             available_seats=trip.get("available_seats", bus["total_seats"] if bus else 0) - booked_count,
             booked_seats=booked_count,
             status=trip.get("status", "scheduled"),
             drop_off_points=drop_off_points,
-            created_at=trip.get("created_at", "")
+            created_at=_as_string(trip.get("created_at"))
         ))
     
     return result
@@ -688,22 +730,22 @@ async def get_trips(
 async def create_trip(db, data: TripCreate, created_by: str) -> TripResponse:
     """Create new trip"""
     # Verify route exists
-    route = await db.bus_routes.find_one({"_id": ObjectId(data.route_id)})
+    route = await db.bus_routes.find_one({"_id": _id_value(data.route_id)})
     if not route:
         raise HTTPException(status_code=404, detail="Route tidak dijumpai")
     
     # Verify bus exists
-    bus = await db.buses.find_one({"_id": ObjectId(data.bus_id)})
+    bus = await db.buses.find_one({"_id": _id_value(data.bus_id)})
     if not bus:
         raise HTTPException(status_code=404, detail="Bas tidak dijumpai")
     
     # Check bus belongs to same company as route
-    if bus["company_id"] != route["company_id"]:
+    if str(bus.get("company_id")) != str(route.get("company_id")):
         raise HTTPException(status_code=400, detail="Bas tidak dimiliki oleh syarikat yang sama dengan route")
     
     trip_doc = {
-        "route_id": ObjectId(data.route_id),
-        "bus_id": ObjectId(data.bus_id),
+        "route_id": _id_value(data.route_id),
+        "bus_id": _id_value(data.bus_id),
         "departure_date": data.departure_date,
         "departure_time": data.departure_time,
         "return_date": data.return_date,
@@ -714,6 +756,8 @@ async def create_trip(db, data: TripCreate, created_by: str) -> TripResponse:
         "created_by": created_by,
         "created_at": datetime.now(timezone.utc).isoformat()
     }
+    creator_user = await db.users.find_one({"_id": _id_value(created_by)})
+    apply_tenant_fields(trip_doc, creator_user)
     
     result = await db.bus_trips.insert_one(trip_doc)
     trip_doc["_id"] = result.inserted_id
@@ -731,22 +775,22 @@ async def create_trip(db, data: TripCreate, created_by: str) -> TripResponse:
         company_name=company["name"] if company else "Unknown",
         origin=route["origin"],
         destination=route["destination"],
-        departure_date=trip_doc["departure_date"],
-        departure_time=trip_doc["departure_time"],
-        return_date=trip_doc.get("return_date"),
-        return_time=trip_doc.get("return_time"),
+        departure_date=_as_string(trip_doc.get("departure_date")),
+        departure_time=_as_string(trip_doc.get("departure_time")),
+        return_date=_as_optional_str(trip_doc.get("return_date")),
+        return_time=_as_optional_str(trip_doc.get("return_time")),
         total_seats=bus["total_seats"],
         available_seats=trip_doc["available_seats"],
         booked_seats=0,
         status="scheduled",
         drop_off_points=drop_off_points,
-        created_at=trip_doc["created_at"]
+        created_at=_as_string(trip_doc.get("created_at"))
     )
 
 
 async def get_trip(db, trip_id: str) -> TripResponse:
     """Get single trip"""
-    trip = await db.bus_trips.find_one({"_id": ObjectId(trip_id)})
+    trip = await db.bus_trips.find_one({"_id": _id_value(trip_id)})
     if not trip:
         raise HTTPException(status_code=404, detail="Trip tidak dijumpai")
     
@@ -773,34 +817,34 @@ async def get_trip(db, trip_id: str) -> TripResponse:
         company_name=company["name"] if company else "Unknown",
         origin=route["origin"] if route else "Unknown",
         destination=route["destination"] if route else "Unknown",
-        departure_date=trip["departure_date"],
-        departure_time=trip["departure_time"],
-        return_date=trip.get("return_date"),
-        return_time=trip.get("return_time"),
+        departure_date=_as_string(trip.get("departure_date")),
+        departure_time=_as_string(trip.get("departure_time")),
+        return_date=_as_optional_str(trip.get("return_date")),
+        return_time=_as_optional_str(trip.get("return_time")),
         total_seats=bus["total_seats"] if bus else 0,
         available_seats=trip.get("available_seats", bus["total_seats"] if bus else 0) - booked_count,
         booked_seats=booked_count,
         status=trip.get("status", "scheduled"),
         drop_off_points=drop_off_points,
-        created_at=trip.get("created_at", "")
+        created_at=_as_string(trip.get("created_at"))
     )
 
 
 async def update_trip(db, trip_id: str, data: TripUpdate) -> TripResponse:
     """Update trip"""
-    trip = await db.bus_trips.find_one({"_id": ObjectId(trip_id)})
+    trip = await db.bus_trips.find_one({"_id": _id_value(trip_id)})
     if not trip:
         raise HTTPException(status_code=404, detail="Trip tidak dijumpai")
     
     update_data = {k: v for k, v in data.dict().items() if v is not None}
     
     if "bus_id" in update_data:
-        update_data["bus_id"] = ObjectId(update_data["bus_id"])
+        update_data["bus_id"] = _id_value(update_data["bus_id"])
     
     if update_data:
         update_data["updated_at"] = datetime.now(timezone.utc).isoformat()
         await db.bus_trips.update_one(
-            {"_id": ObjectId(trip_id)},
+            {"_id": _id_value(trip_id)},
             {"$set": update_data}
         )
     
@@ -809,7 +853,7 @@ async def update_trip(db, trip_id: str, data: TripUpdate) -> TripResponse:
 
 async def cancel_trip(db, trip_id: str, reason: str = None) -> dict:
     """Cancel trip"""
-    trip = await db.bus_trips.find_one({"_id": ObjectId(trip_id)})
+    trip = await db.bus_trips.find_one({"_id": _id_value(trip_id)})
     if not trip:
         raise HTTPException(status_code=404, detail="Trip tidak dijumpai")
     
@@ -818,12 +862,12 @@ async def cancel_trip(db, trip_id: str, reason: str = None) -> dict:
     
     # Cancel all bookings for this trip
     await db.bus_bookings.update_many(
-        {"trip_id": ObjectId(trip_id)},
+        {"trip_id": _id_value(trip_id)},
         {"$set": {"status": "cancelled", "cancellation_reason": "Trip dibatalkan"}}
     )
     
     await db.bus_trips.update_one(
-        {"_id": ObjectId(trip_id)},
+        {"_id": _id_value(trip_id)},
         {"$set": {
             "status": "cancelled",
             "cancellation_reason": reason,
@@ -846,11 +890,11 @@ async def get_bookings(
     """Get all bookings"""
     query = {}
     if trip_id:
-        query["trip_id"] = ObjectId(trip_id)
+        query["trip_id"] = _id_value(trip_id)
     if student_id:
-        query["student_id"] = ObjectId(student_id)
+        query["student_id"] = _id_value(student_id)
     if parent_id:
-        query["parent_id"] = ObjectId(parent_id)
+        query["parent_id"] = _id_value(parent_id)
     if status:
         query["status"] = status
     
@@ -889,14 +933,14 @@ async def get_bookings(
             destination=route["destination"] if route else "Unknown",
             drop_off_point=booking.get("drop_off_point", ""),
             drop_off_price=drop_off_price,
-            departure_date=trip["departure_date"] if trip else "",
-            departure_time=trip["departure_time"] if trip else "",
+            departure_date=_as_string(trip.get("departure_date") if trip else ""),
+            departure_time=_as_string(trip.get("departure_time") if trip else ""),
             seat_preference=booking.get("seat_preference"),
             assigned_seat=booking.get("assigned_seat"),
             status=booking.get("status", "pending"),
             payment_status=booking.get("payment_status", "pending"),
             pulang_bermalam_approved=booking.get("pulang_bermalam_approved", False),
-            created_at=booking.get("created_at", "")
+            created_at=_as_string(booking.get("created_at"))
         ))
     
     return result
@@ -909,7 +953,7 @@ async def create_booking(
 ) -> BookingResponse:
     """Create new booking"""
     # Verify trip exists and is active
-    trip = await db.bus_trips.find_one({"_id": ObjectId(data.trip_id)})
+    trip = await db.bus_trips.find_one({"_id": _id_value(data.trip_id)})
     if not trip:
         raise HTTPException(status_code=404, detail="Trip tidak dijumpai")
     
@@ -917,7 +961,7 @@ async def create_booking(
         raise HTTPException(status_code=400, detail="Trip tidak tersedia untuk tempahan")
     
     # Verify student exists and belongs to parent
-    student = await db.students.find_one({"_id": ObjectId(data.student_id)})
+    student = await db.students.find_one({"_id": _id_value(data.student_id)})
     if not student:
         raise HTTPException(status_code=404, detail="Pelajar tidak dijumpai")
     
@@ -926,7 +970,7 @@ async def create_booking(
     
     # Check available seats
     booked_count = await db.bus_bookings.count_documents({
-        "trip_id": ObjectId(data.trip_id),
+        "trip_id": _id_value(data.trip_id),
         "status": {"$nin": ["cancelled"]}
     })
     
@@ -938,8 +982,8 @@ async def create_booking(
     
     # Check for existing booking for same student on same trip
     existing = await db.bus_bookings.find_one({
-        "trip_id": ObjectId(data.trip_id),
-        "student_id": ObjectId(data.student_id),
+        "trip_id": _id_value(data.trip_id),
+        "student_id": _id_value(data.student_id),
         "status": {"$nin": ["cancelled"]}
     })
     if existing:
@@ -949,8 +993,8 @@ async def create_booking(
     pulang_bermalam_approved = False
     if data.pulang_bermalam_id:
         pb_request = await db.hostel_records.find_one({
-            "_id": ObjectId(data.pulang_bermalam_id),
-            "student_id": ObjectId(data.student_id),
+            "_id": _id_value(data.pulang_bermalam_id),
+            "student_id": _id_value(data.student_id),
             "kategori": "pulang_bermalam",
             "status": "approved"
         })
@@ -968,9 +1012,9 @@ async def create_booking(
     
     booking_doc = {
         "booking_number": generate_booking_number(),
-        "trip_id": ObjectId(data.trip_id),
-        "student_id": ObjectId(data.student_id),
-        "parent_id": ObjectId(parent_id),
+        "trip_id": _id_value(data.trip_id),
+        "student_id": _id_value(data.student_id),
+        "parent_id": _id_value(parent_id),
         "drop_off_point": data.drop_off_point,
         "drop_off_price": drop_off_price,
         "seat_preference": data.seat_preference,
@@ -986,7 +1030,7 @@ async def create_booking(
     booking_doc["_id"] = result.inserted_id
     
     company = await db.bus_companies.find_one({"_id": route["company_id"]}) if route else None
-    parent = await db.users.find_one({"_id": ObjectId(parent_id)})
+    parent = await db.users.find_one({"_id": _id_value(parent_id)})
     
     return BookingResponse(
         id=str(booking_doc["_id"]),
@@ -1004,20 +1048,20 @@ async def create_booking(
         destination=route["destination"] if route else "Unknown",
         drop_off_point=booking_doc["drop_off_point"],
         drop_off_price=drop_off_price,
-        departure_date=trip["departure_date"],
-        departure_time=trip["departure_time"],
+        departure_date=_as_string(trip.get("departure_date")),
+        departure_time=_as_string(trip.get("departure_time")),
         seat_preference=booking_doc.get("seat_preference"),
         assigned_seat=None,
         status="pending",
         payment_status="pending",
         pulang_bermalam_approved=pulang_bermalam_approved,
-        created_at=booking_doc["created_at"]
+        created_at=_as_string(booking_doc.get("created_at"))
     )
 
 
 async def get_booking(db, booking_id: str) -> BookingResponse:
     """Get single booking"""
-    booking = await db.bus_bookings.find_one({"_id": ObjectId(booking_id)})
+    booking = await db.bus_bookings.find_one({"_id": _id_value(booking_id)})
     if not booking:
         raise HTTPException(status_code=404, detail="Tempahan tidak dijumpai")
     
@@ -1046,14 +1090,14 @@ async def get_booking(db, booking_id: str) -> BookingResponse:
         destination=route["destination"] if route else "Unknown",
         drop_off_point=booking.get("drop_off_point", ""),
         drop_off_price=drop_off_price,
-        departure_date=trip["departure_date"] if trip else "",
-        departure_time=trip["departure_time"] if trip else "",
+        departure_date=_as_string(trip.get("departure_date") if trip else ""),
+        departure_time=_as_string(trip.get("departure_time") if trip else ""),
         seat_preference=booking.get("seat_preference"),
         assigned_seat=booking.get("assigned_seat"),
         status=booking.get("status", "pending"),
         payment_status=booking.get("payment_status", "pending"),
         pulang_bermalam_approved=booking.get("pulang_bermalam_approved", False),
-        created_at=booking.get("created_at", "")
+        created_at=_as_string(booking.get("created_at"))
     )
 
 
@@ -1063,7 +1107,7 @@ async def update_booking(
     data: BookingUpdate
 ) -> BookingResponse:
     """Update booking (admin/bus company)"""
-    booking = await db.bus_bookings.find_one({"_id": ObjectId(booking_id)})
+    booking = await db.bus_bookings.find_one({"_id": _id_value(booking_id)})
     if not booking:
         raise HTTPException(status_code=404, detail="Tempahan tidak dijumpai")
     
@@ -1072,7 +1116,7 @@ async def update_booking(
     if update_data:
         update_data["updated_at"] = datetime.now(timezone.utc).isoformat()
         await db.bus_bookings.update_one(
-            {"_id": ObjectId(booking_id)},
+            {"_id": _id_value(booking_id)},
             {"$set": update_data}
         )
     
@@ -1085,7 +1129,7 @@ async def assign_seat(
     seat_number: str
 ) -> BookingResponse:
     """Assign seat to booking (bus company admin)"""
-    booking = await db.bus_bookings.find_one({"_id": ObjectId(booking_id)})
+    booking = await db.bus_bookings.find_one({"_id": _id_value(booking_id)})
     if not booking:
         raise HTTPException(status_code=404, detail="Tempahan tidak dijumpai")
     
@@ -1100,7 +1144,7 @@ async def assign_seat(
         raise HTTPException(status_code=400, detail="Tempat duduk sudah diberikan kepada penumpang lain")
     
     await db.bus_bookings.update_one(
-        {"_id": ObjectId(booking_id)},
+        {"_id": _id_value(booking_id)},
         {"$set": {
             "assigned_seat": seat_number,
             "status": "assigned",
@@ -1113,7 +1157,7 @@ async def assign_seat(
 
 async def cancel_booking(db, booking_id: str, reason: str = None) -> dict:
     """Cancel booking"""
-    booking = await db.bus_bookings.find_one({"_id": ObjectId(booking_id)})
+    booking = await db.bus_bookings.find_one({"_id": _id_value(booking_id)})
     if not booking:
         raise HTTPException(status_code=404, detail="Tempahan tidak dijumpai")
     
@@ -1121,7 +1165,7 @@ async def cancel_booking(db, booking_id: str, reason: str = None) -> dict:
         raise HTTPException(status_code=400, detail="Tempahan sudah dibatalkan")
     
     await db.bus_bookings.update_one(
-        {"_id": ObjectId(booking_id)},
+        {"_id": _id_value(booking_id)},
         {"$set": {
             "status": "cancelled",
             "cancellation_reason": reason,
@@ -1180,16 +1224,16 @@ async def get_available_trips(
                 company_name=company["name"] if company else "Unknown",
                 origin=route["origin"] if route else "Unknown",
                 destination=route["destination"] if route else "Unknown",
-                departure_date=trip["departure_date"],
-                departure_time=trip["departure_time"],
-                return_date=trip.get("return_date"),
-                return_time=trip.get("return_time"),
+                departure_date=_as_string(trip.get("departure_date")),
+                departure_time=_as_string(trip.get("departure_time")),
+                return_date=_as_optional_str(trip.get("return_date")),
+                return_time=_as_optional_str(trip.get("return_time")),
                 total_seats=bus["total_seats"] if bus else 0,
                 available_seats=available,
                 booked_seats=booked_count,
                 status="scheduled",
                 drop_off_points=drop_off_points,
-                created_at=trip.get("created_at", "")
+                created_at=_as_string(trip.get("created_at"))
             ))
     
     return result
@@ -1197,7 +1241,7 @@ async def get_available_trips(
 
 async def get_trip_seat_map(db, trip_id: str) -> dict:
     """Get seat map for a trip showing available/booked seats"""
-    trip = await db.bus_trips.find_one({"_id": ObjectId(trip_id)})
+    trip = await db.bus_trips.find_one({"_id": _id_value(trip_id)})
     if not trip:
         raise HTTPException(status_code=404, detail="Trip tidak dijumpai")
     
@@ -1207,7 +1251,7 @@ async def get_trip_seat_map(db, trip_id: str) -> dict:
     
     # Get all bookings for this trip
     bookings = await db.bus_bookings.find({
-        "trip_id": ObjectId(trip_id),
+        "trip_id": _id_value(trip_id),
         "status": {"$nin": ["cancelled"]}
     }).to_list(100)
     
@@ -1258,7 +1302,7 @@ async def get_driver_trips(db, driver_user: dict) -> List[dict]:
     if not bus_id:
         return []
     try:
-        bus_oid = ObjectId(bus_id) if isinstance(bus_id, str) else bus_id
+        bus_oid = _id_value(bus_id) if isinstance(bus_id, str) else bus_id
     except Exception:
         return []
     from datetime import date
@@ -1297,17 +1341,17 @@ async def get_driver_trips(db, driver_user: dict) -> List[dict]:
 
 async def get_trip_students_for_driver(db, trip_id: str, driver_user: dict) -> dict:
     """List of students on this trip (for driver), with drop-off checkpoint. Driver must be assigned to this trip's bus."""
-    trip = await db.bus_trips.find_one({"_id": ObjectId(trip_id)})
+    trip = await db.bus_trips.find_one({"_id": _id_value(trip_id)})
     if not trip:
         raise HTTPException(status_code=404, detail="Trip tidak dijumpai")
     bus_id = driver_user.get("assigned_bus_id")
-    bus_oid = ObjectId(bus_id) if bus_id and isinstance(bus_id, str) else bus_id
+    bus_oid = _id_value(bus_id) if bus_id and isinstance(bus_id, str) else bus_id
     if not bus_oid or trip["bus_id"] != bus_oid:
         raise HTTPException(status_code=403, detail="Anda tidak ditugaskan ke bas trip ini")
     route = await db.bus_routes.find_one({"_id": trip["route_id"]})
     bus = await db.buses.find_one({"_id": trip["bus_id"]})
     bookings = await db.bus_bookings.find({
-        "trip_id": ObjectId(trip_id),
+        "trip_id": _id_value(trip_id),
         "status": {"$nin": ["cancelled"]}
     }).to_list(100)
     students = []
@@ -1343,26 +1387,28 @@ async def get_trip_students_for_driver(db, trip_id: str, driver_user: dict) -> d
 
 async def update_bus_live_location(db, trip_id: str, lat: float, lng: float, driver_user: dict) -> dict:
     """Driver updates current bus location (live tracking)."""
-    trip = await db.bus_trips.find_one({"_id": ObjectId(trip_id)})
+    trip = await db.bus_trips.find_one({"_id": _id_value(trip_id)})
     if not trip:
         raise HTTPException(status_code=404, detail="Trip tidak dijumpai")
     bus_id = driver_user.get("assigned_bus_id")
-    bus_oid = ObjectId(bus_id) if bus_id and isinstance(bus_id, str) else bus_id
+    bus_oid = _id_value(bus_id) if bus_id and isinstance(bus_id, str) else bus_id
     if not bus_oid or trip["bus_id"] != bus_oid:
         raise HTTPException(status_code=403, detail="Anda tidak ditugaskan ke bas trip ini")
     bus = await db.buses.find_one({"_id": trip["bus_id"]})
     plate = bus["plate_number"] if bus else "Unknown"
     now = datetime.now(timezone.utc).isoformat()
+    location_update = {
+        "trip_id": _id_value(trip_id),
+        "bus_id": trip["bus_id"],
+        "plate_number": plate,
+        "lat": lat,
+        "lng": lng,
+        "updated_at": now,
+    }
+    apply_tenant_fields(location_update, driver_user, fallback_doc=trip)
     await db.bus_live_locations.update_one(
-        {"trip_id": ObjectId(trip_id)},
-        {"$set": {
-            "trip_id": ObjectId(trip_id),
-            "bus_id": trip["bus_id"],
-            "plate_number": plate,
-            "lat": lat,
-            "lng": lng,
-            "updated_at": now
-        }},
+        {"trip_id": _id_value(trip_id)},
+        {"$set": location_update},
         upsert=True
     )
     return {"ok": True, "updated_at": now}
@@ -1370,7 +1416,7 @@ async def update_bus_live_location(db, trip_id: str, lat: float, lng: float, dri
 
 async def get_bus_live_location(db, trip_id: str) -> Optional[dict]:
     """Get current live location for a trip (for parent map)."""
-    doc = await db.bus_live_locations.find_one({"trip_id": ObjectId(trip_id)})
+    doc = await db.bus_live_locations.find_one({"trip_id": _id_value(trip_id)})
     if not doc:
         return None
     return {
@@ -1385,7 +1431,7 @@ async def get_bus_live_location(db, trip_id: str) -> Optional[dict]:
 
 async def get_trip_for_live_map(db, trip_id: str) -> Optional[dict]:
     """Get trip summary + route drop_off_points for parent live map (no auth required if trip_id known)."""
-    trip = await db.bus_trips.find_one({"_id": ObjectId(trip_id)})
+    trip = await db.bus_trips.find_one({"_id": _id_value(trip_id)})
     if not trip:
         return None
     route = await db.bus_routes.find_one({"_id": trip["route_id"]})

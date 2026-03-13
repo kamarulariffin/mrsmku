@@ -5,9 +5,10 @@ MRSMKU Smart360
 import re
 from fastapi import APIRouter, HTTPException, Depends
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from typing import List, Optional
+from typing import Any, List, Optional
 from datetime import datetime, timezone
 from bson import ObjectId
+from services.id_normalizer import object_id_or_none
 
 from models.hostel import (
     HostelBlockCreate, HostelBlockUpdate, HostelBlockResponse,
@@ -46,6 +47,21 @@ async def log_audit(user, action, module, details):
         await _log_audit_func(user, action, module, details)
 
 
+def _id_value(value: Any) -> Any:
+    """Normalize ID-like inputs while supporting non-ObjectId IDs."""
+    if value is None:
+        return None
+    if isinstance(value, ObjectId):
+        return value
+    text = str(value).strip()
+    try:
+        if ObjectId.is_valid(text):
+            return object_id_or_none(text)
+    except Exception:
+        pass
+    return text
+
+
 def _block_student_query(block: dict) -> dict:
     """Query to count students in a block (block_name matches code or block name)."""
     code_esc = re.escape(block["code"])
@@ -69,7 +85,7 @@ async def serialize_block(block: dict) -> dict:
     # Get warden info if assigned
     warden_name = None
     if block.get("warden_id"):
-        warden = await get_db().users.find_one({"_id": ObjectId(block["warden_id"])})
+        warden = await get_db().users.find_one({"_id": _id_value(block["warden_id"])})
         if warden:
             warden_name = warden.get("full_name", "")
     
@@ -164,7 +180,7 @@ async def get_block_bed_codes(
     role = current_user.get("role", "")
     if role not in ["superadmin", "admin", "warden"]:
         raise HTTPException(status_code=403, detail="Tiada kebenaran")
-    block = await get_db().hostel_blocks.find_one({"_id": ObjectId(block_id)})
+    block = await get_db().hostel_blocks.find_one({"_id": _id_value(block_id)})
     if not block:
         raise HTTPException(status_code=404, detail="Blok tidak dijumpai")
     beds_per_level = block.get("beds_per_level") or []
@@ -207,22 +223,21 @@ async def get_block_level_detail(
     role = current_user.get("role", "")
     if role not in ["superadmin", "admin", "warden"]:
         raise HTTPException(status_code=403, detail="Tiada kebenaran")
-    block = await get_db().hostel_blocks.find_one({"_id": ObjectId(block_id)})
+    block = await get_db().hostel_blocks.find_one({"_id": _id_value(block_id)})
     if not block:
         raise HTTPException(status_code=404, detail="Blok tidak dijumpai")
     db = get_db()
     base_query = _block_student_query(block)
     room_exists = {"$or": [{"room_number": {"$exists": True, "$ne": ""}}, {"room": {"$exists": True, "$ne": ""}}]}
     students_match = {"$and": [base_query, room_exists]} if base_query else room_exists
-    pipeline = [
-        {"$match": students_match},
-        {"$project": {
-            "room": {"$ifNull": ["$room_number", "$room"]}
-        }},
-        {"$group": {"_id": "$room", "occupants": {"$sum": 1}}}
-    ]
-    room_occupancy = await db.students.aggregate(pipeline).to_list(500)
-    by_room = { (r.get("_id") or "").strip(): r.get("occupants", 0) for r in room_occupancy if (r.get("_id") or "").strip() }
+    by_room = {}
+    async for row in db.students.find(students_match):
+        room_value = row.get("room_number")
+        if room_value in (None, ""):
+            room_value = row.get("room")
+        room_key = str(room_value).strip() if room_value not in (None, "") else ""
+        if room_key:
+            by_room[room_key] = by_room.get(room_key, 0) + 1
     beds_per_room = block.get("beds_per_room")
     cap = int(beds_per_room) if beds_per_room is not None and int(beds_per_room) > 0 else 2
     levels = block.get("levels") or []
@@ -259,7 +274,7 @@ async def get_block(
     current_user: dict = Depends(get_current_user)
 ):
     """Get block details"""
-    block = await get_db().hostel_blocks.find_one({"_id": ObjectId(block_id)})
+    block = await get_db().hostel_blocks.find_one({"_id": _id_value(block_id)})
     if not block:
         raise HTTPException(status_code=404, detail="Blok tidak dijumpai")
     
@@ -326,7 +341,7 @@ async def update_block(
     if role not in ["superadmin", "warden", "admin"]:
         raise HTTPException(status_code=403, detail="Tiada kebenaran untuk kemaskini blok")
     
-    block = await get_db().hostel_blocks.find_one({"_id": ObjectId(block_id)})
+    block = await get_db().hostel_blocks.find_one({"_id": _id_value(block_id)})
     if not block:
         raise HTTPException(status_code=404, detail="Blok tidak dijumpai")
     
@@ -340,13 +355,13 @@ async def update_block(
     update_data["updated_at"] = datetime.now(timezone.utc).isoformat()
     
     await get_db().hostel_blocks.update_one(
-        {"_id": ObjectId(block_id)},
+        {"_id": _id_value(block_id)},
         {"$set": update_data}
     )
     
     await log_audit(current_user, "UPDATE_HOSTEL_BLOCK", "hostel", f"Blok dikemaskini: {block['code']}")
     
-    updated = await get_db().hostel_blocks.find_one({"_id": ObjectId(block_id)})
+    updated = await get_db().hostel_blocks.find_one({"_id": _id_value(block_id)})
     return {
         "message": "Blok berjaya dikemaskini",
         "block": await serialize_block(updated)
@@ -363,7 +378,7 @@ async def delete_block(
     if role not in ("superadmin", "admin"):
         raise HTTPException(status_code=403, detail="Hanya SuperAdmin atau Admin boleh padam blok")
     
-    block = await get_db().hostel_blocks.find_one({"_id": ObjectId(block_id)})
+    block = await get_db().hostel_blocks.find_one({"_id": _id_value(block_id)})
     if not block:
         raise HTTPException(status_code=404, detail="Blok tidak dijumpai")
     
@@ -372,7 +387,7 @@ async def delete_block(
     if student_count > 0:
         raise HTTPException(status_code=400, detail=f"Tidak boleh padam. {student_count} pelajar masih dalam blok ini.")
     
-    await get_db().hostel_blocks.delete_one({"_id": ObjectId(block_id)})
+    await get_db().hostel_blocks.delete_one({"_id": _id_value(block_id)})
     
     await log_audit(current_user, "DELETE_HOSTEL_BLOCK", "hostel", f"Blok dipadam: {block['code']}")
     

@@ -4,8 +4,9 @@ Log kesalahan ikut seksyen rasmi, sync ke profil pelajar, trigger OLAT dalam DB.
 Semua data dari MongoDB; dipaparkan di dashboard & parent portal.
 """
 from datetime import datetime, timezone
-from typing import Optional, List, Callable
+from typing import Any, Optional, List, Callable
 from bson import ObjectId
+from services.id_normalizer import object_id_or_none
 
 from fastapi import APIRouter, HTTPException, Depends, Query
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -39,6 +40,23 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
 async def log_audit(user, action, module, details):
     if _log_audit_func and user:
         await _log_audit_func(user, action, module, details)
+
+
+def _id_value(value: Any, *, strict: bool = False) -> Any:
+    """Normalize ID-like inputs while supporting non-ObjectId IDs."""
+    if value is None:
+        return None
+    if isinstance(value, ObjectId):
+        return value
+    text = str(value).strip()
+    try:
+        if ObjectId.is_valid(text):
+            return object_id_or_none(text)
+    except Exception:
+        pass
+    if strict:
+        raise ValueError("Invalid ObjectId")
+    return text
 
 
 def require_warden_admin():
@@ -212,7 +230,7 @@ def _parse_category_ids(category_ids: Optional[list]) -> Optional[list]:
         if not cid:
             continue
         try:
-            out.append(ObjectId(cid))
+            out.append(_id_value(cid, strict=True))
         except Exception:
             pass
     return out if out else None
@@ -299,7 +317,7 @@ async def update_offence_section(
     """Kemaskini seksyen rasmi."""
     db = get_db()
     try:
-        oid = ObjectId(section_id)
+        oid = _id_value(section_id, strict=True)
     except Exception:
         raise HTTPException(status_code=400, detail="ID tidak sah")
     section = await db.offence_sections.find_one({"_id": oid})
@@ -330,7 +348,7 @@ async def delete_offence_section(
     """Padam seksyen rasmi (hanya jika tiada kesalahan guna seksyen ini)."""
     db = get_db()
     try:
-        oid = ObjectId(section_id)
+        oid = _id_value(section_id, strict=True)
     except Exception:
         raise HTTPException(status_code=400, detail="ID tidak sah")
     section = await db.offence_sections.find_one({"_id": oid})
@@ -365,7 +383,7 @@ async def create_offence(
     student_matric = student.get("matric_number", student.get("matric", ""))
     now_iso = datetime.now(timezone.utc).isoformat()
     doc = {
-        "student_id": ObjectId(body.student_id),
+        "student_id": _id_value(body.student_id),
         "student_name": student_name,
         "student_matric": student_matric,
         "seksyen": body.seksyen,
@@ -382,25 +400,25 @@ async def create_offence(
     offence_id = str(result.inserted_id)
     # Sync to student profile: increment total_offences, set last_offence_at (students or users)
     await db.students.update_one(
-        {"$or": [{"_id": ObjectId(body.student_id)}, {"user_id": ObjectId(body.student_id)}]},
+        {"$or": [{"_id": _id_value(body.student_id)}, {"user_id": _id_value(body.student_id)}]},
         {
             "$inc": {"total_offences": 1},
             "$set": {"last_offence_at": now_iso, "updated_at": now_iso},
         },
     )
     await db.users.update_one(
-        {"_id": ObjectId(body.student_id), "role": "pelajar"},
+        {"_id": _id_value(body.student_id), "role": "pelajar"},
         {
             "$inc": {"total_offences": 1},
             "$set": {"last_offence_at": now_iso},
         },
     )
     if body.rujuk_olat:
-        case_number = f"OLAT-{datetime.now(timezone.utc).strftime('%Y%m%d')}-{result.inserted_id.hex[:6].upper()}"
+        case_number = f"OLAT-{datetime.now(timezone.utc).strftime('%Y%m%d')}-{str(result.inserted_id)[:6].upper()}"
         olat_doc = {
             "case_number": case_number,
             "offence_id": result.inserted_id,
-            "student_id": ObjectId(body.student_id),
+            "student_id": _id_value(body.student_id),
             "student_name": student_name,
             "student_matric": student_matric,
             "status": OLAT_STATUS_OPEN,
@@ -441,7 +459,7 @@ async def list_offences(
     db = get_db()
     query = {}
     if student_id:
-        query["student_id"] = ObjectId(student_id)
+        query["student_id"] = _id_value(student_id)
     if status:
         query["status"] = status
     if current_user.get("role") == "warden":
@@ -471,7 +489,7 @@ async def get_offences_by_student(
     elif current_user.get("role") == "pelajar":
         if str(current_user["_id"]) != student_id:
             raise HTTPException(status_code=403, detail="Akses ditolak")
-    rows = await db.offences.find({"student_id": ObjectId(student_id)}).sort("created_at", -1).to_list(100)
+    rows = await db.offences.find({"student_id": _id_value(student_id)}).sort("created_at", -1).to_list(100)
     sections_map = await _get_sections_map(db)
     return [_serialize_offence(r, sections_map) for r in rows]
 
@@ -485,7 +503,7 @@ async def create_olat_case(
 ):
     """Trigger OLAT dari kesalahan sedia ada."""
     db = get_db()
-    offence = await db.offences.find_one({"_id": ObjectId(body.offence_id)})
+    offence = await db.offences.find_one({"_id": _id_value(body.offence_id)})
     if not offence:
         raise HTTPException(status_code=404, detail="Rekod kesalahan tidak dijumpai")
     if offence.get("olat_case_id"):
@@ -530,7 +548,7 @@ async def list_olat_cases(
     db = get_db()
     query = {}
     if student_id:
-        query["student_id"] = ObjectId(student_id)
+        query["student_id"] = _id_value(student_id)
     if status:
         query["status"] = status
     if current_user.get("role") == "warden":
@@ -553,7 +571,7 @@ async def get_olat_count_for_student(
     """Jumlah kesalahan OLAT yang pernah pelajar ini lakukan (untuk paparan warden)."""
     db = get_db()
     try:
-        sid = ObjectId(student_id)
+        sid = _id_value(student_id, strict=True)
     except Exception:
         raise HTTPException(status_code=400, detail="ID pelajar tidak sah")
     count = await db.olat_cases.count_documents({"student_id": sid})
@@ -577,7 +595,7 @@ async def create_olat_manual(
     olat_doc = {
         "case_number": case_number,
         "offence_id": None,
-        "student_id": ObjectId(body.student_id),
+        "student_id": _id_value(body.student_id),
         "student_name": student_name,
         "student_matric": student_matric,
         "status": OLAT_STATUS_OPEN,
@@ -619,13 +637,13 @@ async def update_olat_case(
     if body.detention_end_date is not None:
         updates["detention_end_date"] = body.detention_end_date
     result = await db.olat_cases.update_one(
-        {"_id": ObjectId(case_id)},
+        {"_id": _id_value(case_id)},
         {"$set": updates},
     )
     if result.matched_count == 0:
         raise HTTPException(status_code=404, detail="Kes OLAT tidak dijumpai")
     if body.status == OLAT_STATUS_CLOSED:
-        case_doc = await db.olat_cases.find_one({"_id": ObjectId(case_id)})
+        case_doc = await db.olat_cases.find_one({"_id": _id_value(case_id)})
         if case_doc:
             await _notify_parent_student_event(
                 db, str(case_doc["student_id"]),
@@ -701,13 +719,13 @@ async def update_olat_category(
     if body.label is not None:
         updates["label"] = body.label.strip()
     result = await db.olat_categories.update_one(
-        {"_id": ObjectId(category_id)},
+        {"_id": _id_value(category_id)},
         {"$set": updates},
     )
     if result.matched_count == 0:
         raise HTTPException(status_code=404, detail="Kategori tidak dijumpai")
     await log_audit(current_user, "UPDATE_OLAT_CATEGORY", "discipline", f"Kategori id {category_id}")
-    updated = await db.olat_categories.find_one({"_id": ObjectId(category_id)})
+    updated = await db.olat_categories.find_one({"_id": _id_value(category_id)})
     return {"message": "Kategori dikemaskini", "category": _serialize_olat_category(updated)}
 
 
@@ -718,7 +736,7 @@ async def delete_olat_category(
 ):
     """Padam kategori OLAT."""
     db = get_db()
-    result = await db.olat_categories.delete_one({"_id": ObjectId(category_id)})
+    result = await db.olat_categories.delete_one({"_id": _id_value(category_id)})
     if result.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Kategori tidak dijumpai")
     await log_audit(current_user, "DELETE_OLAT_CATEGORY", "discipline", f"Kategori id {category_id}")

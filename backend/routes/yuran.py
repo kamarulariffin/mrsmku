@@ -3,26 +3,37 @@ Modul Yuran Komprehensif - MRSMKU Portal
 Pengurusan Set Yuran, Pelajar Tingkatan, dan Tunggakan
 """
 import asyncio
+import csv
 import re
 from datetime import datetime, timezone, timedelta
+from io import StringIO
 from typing import Any, Dict, List, Optional
 from collections import defaultdict
 from bson import ObjectId
+from services.id_normalizer import object_id_or_none
 from fastapi import APIRouter, HTTPException, Depends, Query
+from fastapi.responses import Response, StreamingResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, Field
 
 from repositories.tabung_relational_store import adapt_tabung_read_db
 from repositories.yuran_relational_store import adapt_yuran_read_db
 from services.number_sequence_service import next_sequence_value
+from services.tenant_enforcement import (
+    assert_tenant_doc_access as enforce_tenant_doc_access,
+    stamp_tenant_fields as apply_tenant_fields,
+    tenant_scope_query as build_tenant_scope_query,
+)
 
 try:
-    from sqlalchemy import select, func
+    from sqlalchemy import func, select
     from models_sql.yuran_tables import YuranPaymentRecord
+    from models_sql.yuran_charge_job_tables import YuranChargeJobResultRowRecord
 except Exception:  # pragma: no cover - fallback for environments without SQLAlchemy runtime
     select = None
     func = None
     YuranPaymentRecord = None
+    YuranChargeJobResultRowRecord = None
 
 router = APIRouter(prefix="/api/yuran", tags=["Yuran"])
 security = HTTPBearer(auto_error=False)
@@ -38,6 +49,26 @@ _ROLES = None
 YURAN_CATEGORY_ID = "69925c67637e5c7fde5e0f44"  # "Yuran Pelajar" category
 _RECEIPT_NUMBER_LOCK = asyncio.Lock()
 _ACCOUNTING_TRANSACTION_NUMBER_LOCK = asyncio.Lock()
+YURAN_CHARGE_JOB_COLLECTION = "yuran_charge_jobs"
+YURAN_CHARGE_JOB_TYPE = "yuran_charge_bulk"
+YURAN_CHARGE_ALLOWED_SCOPES = {"tingkatan", "kelas", "kelab", "manual"}
+YURAN_CHARGE_ALLOWED_APPLY_MODES = {"append_existing_invoice", "new_invoice_special_case"}
+YURAN_CHARGE_ALLOWED_STATUSES = {"previewed", "processing", "completed", "partial", "failed"}
+YURAN_CHARGE_RESULT_ROWS_CAP = 800
+YURAN_CHARGE_ASYNC_THRESHOLD = 250
+YURAN_CHARGE_EXPORT_ACTIONS = {"all", "append", "new_invoice", "skip", "error"}
+YURAN_CHARGE_EXPORT_HEADERS = [
+    "student_id",
+    "student_name",
+    "matric_number",
+    "action",
+    "reason",
+    "invoice_id",
+    "delta_amount",
+]
+YURAN_CHARGE_ROW_INSERT_BATCH_SIZE = 250
+YURAN_CHARGE_EXPORT_FETCH_BATCH_SIZE = 1000
+_YURAN_CHARGE_JOB_TASKS: Dict[str, asyncio.Task] = {}
 
 
 def init_router(get_db_func, auth_func, audit_func, roles, get_core_db_func=None):
@@ -181,12 +212,13 @@ async def create_yuran_accounting_transaction(db, user, amount, receipt_number, 
             "created_by": str(user.get("_id")) if user.get("_id") is not None else None,
             "created_by_name": user.get("full_name", "")
         }
+        _stamp_tenant_fields(doc, user)
         
         result = await db.accounting_transactions.insert_one(doc)
         await _invalidate_financial_dashboard_cache_safely(db, scope="accounting")
         
         # Log accounting audit
-        await db.accounting_audit_logs.insert_one({
+        audit_doc = {
             "transaction_id": result.inserted_id,
             "transaction_number": tx_number,
             "action": "created",
@@ -197,7 +229,9 @@ async def create_yuran_accounting_transaction(db, user, amount, receipt_number, 
             "performed_by_role": user.get("role", ""),
             "performed_at": now,
             "notes": "Auto-created from Yuran payment"
-        })
+        }
+        _stamp_tenant_fields(audit_doc, user, fallback_doc=doc)
+        await db.accounting_audit_logs.insert_one(audit_doc)
         
         return {
             "success": True,
@@ -226,10 +260,8 @@ def _as_object_id_if_valid(value):
     if isinstance(value, ObjectId):
         return value
     if isinstance(value, str):
-        try:
-            return ObjectId(value)
-        except Exception:
-            return value
+        oid = object_id_or_none(value)
+        return oid if oid is not None else value
     return value
 
 
@@ -262,6 +294,42 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
 async def log_audit(user, action, module, details):
     if _log_audit_func and user:
         await _log_audit_func(user, action, module, details)
+
+
+def _tenant_id_value(current_user: Dict[str, Any]) -> str:
+    return str(current_user.get("tenant_id") or "").strip()
+
+
+def _tenant_code_value(current_user: Dict[str, Any]) -> str:
+    return str(current_user.get("tenant_code") or "").strip()
+
+
+def _tenant_scope_query(current_user: Dict[str, Any]) -> Dict[str, Any]:
+    return build_tenant_scope_query(
+        current_user,
+        detail="Tenant context diperlukan untuk operasi yuran.",
+    )
+
+
+def _apply_tenant_scope(query: Dict[str, Any], current_user: Dict[str, Any]) -> Dict[str, Any]:
+    scoped = dict(query or {})
+    tenant_scope = _tenant_scope_query(current_user)
+    if tenant_scope:
+        scoped.update(tenant_scope)
+    return scoped
+
+
+def _assert_tenant_doc_access(current_user: Dict[str, Any], doc: Optional[Dict[str, Any]], resource_name: str) -> None:
+    enforce_tenant_doc_access(current_user, doc, resource_name)
+
+
+def _stamp_tenant_fields(
+    doc: Dict[str, Any],
+    current_user: Dict[str, Any],
+    *,
+    fallback_doc: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    return apply_tenant_fields(doc, current_user, fallback_doc=fallback_doc)
 
 
 async def _invalidate_financial_dashboard_cache_safely(db, scope: str = "all") -> None:
@@ -344,6 +412,52 @@ class AssignYuranRequest(BaseModel):
         default=None,
         description="Cohort source for pre-billing context"
     )
+
+
+class YuranChargePackInput(BaseModel):
+    pack_id: Optional[str] = None
+    pack_code: Optional[str] = None
+    pack_name: Optional[str] = None
+    sequence: Optional[int] = Field(None, ge=1, le=3)
+    amount: Optional[float] = Field(None, ge=0)
+    due_date: Optional[str] = None
+    item_codes: List[str] = Field(default_factory=list)
+    notes: Optional[str] = None
+    is_special_case: bool = True
+
+
+class YuranChargePackConfigInput(BaseModel):
+    enabled: bool = False
+    mode: str = "single"
+    packs: List[YuranChargePackInput] = Field(default_factory=list)
+
+
+class YuranChargePayload(BaseModel):
+    charge_name: str = Field(..., min_length=2, max_length=160)
+    charge_code: str = Field(..., min_length=1, max_length=64)
+    charge_type: str = Field(..., min_length=1, max_length=64)
+    amount: float = Field(..., gt=0)
+    due_date: Optional[str] = Field(None, description="Tarikh tamat (ISO date, YYYY-MM-DD)")
+    tahun: int = Field(..., ge=2020, le=2100)
+    target_scope: str = Field(..., description="tingkatan | kelas | kelab | manual")
+    target_filters: Optional[Dict[str, Any]] = None
+    target_ids: List[str] = Field(default_factory=list)
+    apply_mode: str = Field(
+        default="append_existing_invoice",
+        description="append_existing_invoice | new_invoice_special_case",
+    )
+    pack_config: YuranChargePackConfigInput = Field(default_factory=YuranChargePackConfigInput)
+
+
+class YuranChargePreviewRequest(YuranChargePayload):
+    pass
+
+
+class YuranChargeApplyRequest(BaseModel):
+    preview_id: Optional[str] = None
+    confirm: bool = False
+    run_async: Optional[bool] = None
+    payload: Optional[YuranChargePayload] = None
 
 
 # ============ HELPER FUNCTIONS ============
@@ -605,7 +719,10 @@ async def _sync_set_changes_to_existing_invoices(
         return summary
 
     set_id = set_yuran_doc.get("_id")
-    invoices = await db.student_yuran.find({"set_yuran_id": set_id}).to_list(10000)
+    tenant_scope = {}
+    if set_yuran_doc.get("tenant_id"):
+        tenant_scope["tenant_id"] = str(set_yuran_doc.get("tenant_id"))
+    invoices = await db.student_yuran.find({"set_yuran_id": set_id, **tenant_scope}).to_list(10000)
     summary["candidate_invoices"] = len(invoices)
     now_iso = datetime.now(timezone.utc).isoformat()
 
@@ -675,7 +792,7 @@ async def _sync_set_changes_to_existing_invoices(
             adjustment_reference = generate_payment_reference(prefix="ADJ")
 
             await db.student_yuran.update_one(
-                {"_id": invoice["_id"]},
+                {"_id": invoice["_id"], **tenant_scope},
                 {
                     "$set": {
                         "items": invoice_items,
@@ -706,7 +823,7 @@ async def _sync_set_changes_to_existing_invoices(
 
             parent_id = invoice.get("parent_id")
             if parent_id:
-                await db.notifications.insert_one({
+                notification_doc = {
                     "user_id": parent_id,
                     "title": "Pelarasan Invoice Yuran",
                     "message": (
@@ -725,13 +842,811 @@ async def _sync_set_changes_to_existing_invoices(
                     },
                     "is_read": False,
                     "created_at": now_iso,
-                })
+                }
+                if tenant_scope:
+                    notification_doc.update(tenant_scope)
+                await db.notifications.insert_one(notification_doc)
 
         except Exception as e:
             summary["errors"].append(f"{invoice.get('student_name', 'Pelajar')}: {str(e)}")
 
     summary["total_delta_amount"] = round(summary["total_delta_amount"], 2)
     return summary
+
+
+def _id_str(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    return str(value)
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except Exception:
+        return float(default)
+
+
+def _normalize_iso_date(value: Any, field_name: str = "due_date") -> str:
+    text = str(value or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail=f"{field_name} diperlukan (format YYYY-MM-DD)")
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        try:
+            parsed = datetime.strptime(text, "%Y-%m-%d")
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=f"{field_name} mesti format YYYY-MM-DD") from exc
+    return parsed.date().isoformat()
+
+
+def _normalize_text_list(value: Any) -> List[str]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        raw_list = value
+    else:
+        raw_list = str(value).replace("\n", ",").split(",")
+    result: List[str] = []
+    seen = set()
+    for raw in raw_list:
+        token = str(raw or "").strip()
+        if not token:
+            continue
+        key = token.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(token)
+    return result
+
+
+def _normalize_int_list(value: Any) -> List[int]:
+    result: List[int] = []
+    seen = set()
+    for raw in _normalize_text_list(value):
+        try:
+            num = int(raw)
+        except Exception:
+            continue
+        if num in seen:
+            continue
+        seen.add(num)
+        result.append(num)
+    return result
+
+
+def _normalize_charge_pack_config(raw_pack_config: Any, charge_amount: float, default_due_date: str) -> Dict[str, Any]:
+    pack_config = raw_pack_config if isinstance(raw_pack_config, dict) else {}
+    enabled = bool(pack_config.get("enabled", False))
+    mode = str(pack_config.get("mode") or "single").strip().lower()
+    if mode not in {"single", "hybrid"}:
+        raise HTTPException(status_code=400, detail="pack_config.mode mesti 'single' atau 'hybrid'")
+
+    if not enabled:
+        return {"enabled": False, "mode": "single", "packs": []}
+
+    if mode == "single":
+        return {"enabled": True, "mode": "single", "packs": []}
+
+    packs_raw = pack_config.get("packs")
+    if not isinstance(packs_raw, list):
+        packs_raw = []
+    if not packs_raw:
+        packs_raw = [{}]
+    if len(packs_raw) > 3:
+        raise HTTPException(status_code=400, detail="Maksimum 3 billing packs dibenarkan")
+
+    normalized_packs: List[Dict[str, Any]] = []
+    seen_sequences = set()
+    seen_item_codes = set()
+    provided_amount_count = 0
+    provided_amount_total = 0.0
+
+    for idx, raw_pack in enumerate(packs_raw, start=1):
+        pack = raw_pack if isinstance(raw_pack, dict) else {}
+        sequence_value = pack.get("sequence")
+        sequence = int(sequence_value) if sequence_value is not None else idx
+        if sequence < 1 or sequence > 3:
+            raise HTTPException(status_code=400, detail="sequence pack mesti antara 1 hingga 3")
+        if sequence in seen_sequences:
+            raise HTTPException(status_code=400, detail="sequence pack tidak boleh berulang")
+        seen_sequences.add(sequence)
+
+        pack_code = str(pack.get("pack_code") or f"PK{sequence}").strip().upper()[:12]
+        pack_name = str(pack.get("pack_name") or f"Pack {sequence}").strip()[:80]
+        pack_id = str(pack.get("pack_id") or f"pack-{sequence}").strip()[:64]
+        due_date = _normalize_iso_date(pack.get("due_date") or default_due_date, field_name=f"pack[{sequence}].due_date")
+        notes = str(pack.get("notes") or "").strip()[:240]
+
+        item_codes: List[str] = []
+        for raw_code in _normalize_text_list(pack.get("item_codes")):
+            item_code = _normalize_item_code(raw_code)
+            if not item_code:
+                continue
+            if item_code in seen_item_codes:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"item_codes tidak boleh bertindih antara pack (kod berulang: {item_code})",
+                )
+            seen_item_codes.add(item_code)
+            item_codes.append(item_code)
+
+        configured_amount = pack.get("amount")
+        amount_value = None
+        if configured_amount is not None and str(configured_amount).strip() != "":
+            amount_value = _safe_float(configured_amount, default=-1)
+            if amount_value < 0:
+                raise HTTPException(status_code=400, detail=f"pack[{sequence}].amount mesti >= 0")
+            provided_amount_count += 1
+            provided_amount_total += amount_value
+
+        normalized_packs.append({
+            "pack_id": pack_id,
+            "pack_code": pack_code,
+            "pack_name": pack_name,
+            "sequence": sequence,
+            "amount": round(amount_value, 2) if amount_value is not None else None,
+            "paid_amount": 0.0,
+            "status": "pending",
+            "due_date": due_date,
+            "item_codes": item_codes,
+            "is_special_case": bool(pack.get("is_special_case", True)),
+            "notes": notes,
+        })
+
+    if provided_amount_count > 0 and abs(provided_amount_total - charge_amount) > 0.01:
+        raise HTTPException(
+            status_code=400,
+            detail="Jumlah amount pack mesti sama dengan amount caj (toleransi 0.01)",
+        )
+
+    normalized_packs.sort(key=lambda entry: int(entry.get("sequence") or 0))
+    return {"enabled": True, "mode": "hybrid", "packs": normalized_packs}
+
+
+def _normalize_charge_payload(raw_payload: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(raw_payload, dict):
+        raise HTTPException(status_code=400, detail="payload caj tidak sah")
+
+    charge_name = str(raw_payload.get("charge_name") or "").strip()
+    charge_code = _normalize_item_code(raw_payload.get("charge_code"))
+    charge_type = str(raw_payload.get("charge_type") or "").strip().lower()
+    charge_type = re.sub(r"[^a-z0-9_]+", "_", charge_type).strip("_")
+    if not charge_name:
+        raise HTTPException(status_code=400, detail="charge_name diperlukan")
+    if not charge_code:
+        raise HTTPException(status_code=400, detail="charge_code diperlukan")
+    if not charge_type:
+        raise HTTPException(status_code=400, detail="charge_type diperlukan")
+
+    amount = _safe_float(raw_payload.get("amount"), default=-1)
+    if amount <= 0:
+        raise HTTPException(status_code=400, detail="amount mesti lebih daripada 0")
+
+    try:
+        tahun = int(raw_payload.get("tahun"))
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="tahun tidak sah") from exc
+
+    target_scope = str(raw_payload.get("target_scope") or "").strip().lower()
+    if target_scope not in YURAN_CHARGE_ALLOWED_SCOPES:
+        raise HTTPException(
+            status_code=400,
+            detail="target_scope mesti salah satu: tingkatan | kelas | kelab | manual",
+        )
+
+    apply_mode = str(raw_payload.get("apply_mode") or "append_existing_invoice").strip().lower()
+    if apply_mode not in YURAN_CHARGE_ALLOWED_APPLY_MODES:
+        raise HTTPException(
+            status_code=400,
+            detail="apply_mode mesti append_existing_invoice atau new_invoice_special_case",
+        )
+
+    due_date_value = raw_payload.get("due_date")
+    if due_date_value is None or str(due_date_value).strip() == "":
+        due_date = _normalize_iso_date(f"{tahun}-12-31", field_name="due_date")
+    else:
+        due_date = _normalize_iso_date(due_date_value, field_name="due_date")
+
+    target_filters = raw_payload.get("target_filters")
+    if not isinstance(target_filters, dict):
+        target_filters = {}
+
+    target_ids: List[str] = []
+    for raw_id in raw_payload.get("target_ids") or []:
+        student_id = str(raw_id or "").strip()
+        if student_id:
+            target_ids.append(student_id)
+    target_ids = list(dict.fromkeys(target_ids))
+    if target_scope == "manual" and not target_ids:
+        raise HTTPException(status_code=400, detail="target_ids diperlukan untuk target_scope=manual")
+
+    pack_config = _normalize_charge_pack_config(raw_payload.get("pack_config"), amount, due_date)
+
+    return {
+        "charge_name": charge_name[:160],
+        "charge_code": charge_code[:64],
+        "charge_type": charge_type[:64],
+        "amount": round(amount, 2),
+        "due_date": due_date,
+        "tahun": tahun,
+        "target_scope": target_scope,
+        "target_filters": target_filters,
+        "target_ids": target_ids,
+        "apply_mode": apply_mode,
+        "pack_config": pack_config,
+    }
+
+
+def _derive_pack_status(amount: float, paid_amount: float, due_date: str) -> str:
+    amount_value = round(max(0.0, _safe_float(amount)), 2)
+    paid_value = round(max(0.0, _safe_float(paid_amount)), 2)
+    if amount_value <= 0:
+        return "pending"
+    if paid_value >= amount_value - 0.01:
+        return "paid"
+    if paid_value > 0:
+        return "partial"
+    try:
+        due = datetime.strptime(due_date, "%Y-%m-%d").date()
+        if due < datetime.now(timezone.utc).date():
+            return "overdue"
+    except Exception:
+        pass
+    return "pending"
+
+
+def _derive_invoice_billing_packs(
+    invoice_items: List[Dict[str, Any]],
+    invoice_paid_amount: float,
+    default_due_date: str,
+    pack_config: Dict[str, Any],
+) -> Dict[str, Any]:
+    enabled = bool(pack_config.get("enabled", False))
+    mode = str(pack_config.get("mode") or "single").strip().lower()
+    if not enabled:
+        return {
+            "billing_pack_enabled": False,
+            "billing_pack_mode": "single",
+            "billing_packs": [],
+        }
+    if mode != "hybrid":
+        return {
+            "billing_pack_enabled": True,
+            "billing_pack_mode": "single",
+            "billing_packs": [],
+        }
+
+    pack_defs = list(pack_config.get("packs") or [])
+    if not pack_defs:
+        pack_defs = [{
+            "pack_id": "pack-1",
+            "pack_code": "PK1",
+            "pack_name": "Pack 1",
+            "sequence": 1,
+            "due_date": default_due_date,
+            "item_codes": [],
+            "notes": "",
+            "is_special_case": True,
+        }]
+
+    pack_defs = sorted(pack_defs[:3], key=lambda p: int(p.get("sequence") or 0))
+    code_to_pack_idx: Dict[str, int] = {}
+    for idx, pack in enumerate(pack_defs):
+        for item_code in pack.get("item_codes") or []:
+            normalized_code = _normalize_item_code(item_code)
+            if not normalized_code or normalized_code in code_to_pack_idx:
+                continue
+            code_to_pack_idx[normalized_code] = idx
+
+    amounts_by_idx = [0.0 for _ in pack_defs]
+    for item in invoice_items or []:
+        amount = _safe_float(item.get("amount"), default=0)
+        if amount <= 0:
+            continue
+        item_code = _normalize_item_code(item.get("code"))
+        target_idx = code_to_pack_idx.get(item_code, 0)
+        amounts_by_idx[target_idx] = round(amounts_by_idx[target_idx] + amount, 2)
+
+    total_invoice_amount = round(sum(amounts_by_idx), 2)
+    remaining_paid = round(min(max(0.0, _safe_float(invoice_paid_amount, 0.0)), total_invoice_amount), 2)
+    paid_by_idx = [0.0 for _ in pack_defs]
+    for idx, _ in enumerate(pack_defs):
+        alloc = min(remaining_paid, amounts_by_idx[idx])
+        paid_by_idx[idx] = round(max(0.0, alloc), 2)
+        remaining_paid = round(max(0.0, remaining_paid - alloc), 2)
+
+    billing_packs: List[Dict[str, Any]] = []
+    for idx, pack in enumerate(pack_defs):
+        due_date = _normalize_iso_date(pack.get("due_date") or default_due_date, field_name="pack_due_date")
+        amount = round(amounts_by_idx[idx], 2)
+        paid_amount = round(paid_by_idx[idx], 2)
+        billing_packs.append({
+            "pack_id": str(pack.get("pack_id") or f"pack-{idx + 1}")[:64],
+            "pack_code": str(pack.get("pack_code") or f"PK{idx + 1}").upper()[:12],
+            "pack_name": str(pack.get("pack_name") or f"Pack {idx + 1}")[:80],
+            "sequence": int(pack.get("sequence") or (idx + 1)),
+            "amount": amount,
+            "paid_amount": paid_amount,
+            "status": _derive_pack_status(amount, paid_amount, due_date),
+            "due_date": due_date,
+            "item_codes": [_normalize_item_code(code) for code in (pack.get("item_codes") or []) if _normalize_item_code(code)],
+            "is_special_case": bool(pack.get("is_special_case", True)),
+            "notes": str(pack.get("notes") or "")[:240],
+        })
+
+    return {
+        "billing_pack_enabled": True,
+        "billing_pack_mode": "hybrid",
+        "billing_packs": billing_packs,
+    }
+
+
+def _derive_invoice_status(total_amount: float, paid_amount: float, due_date: str) -> str:
+    _ = due_date
+    total_value = round(max(0.0, _safe_float(total_amount)), 2)
+    paid_value = round(max(0.0, _safe_float(paid_amount)), 2)
+    if total_value <= 0:
+        return "pending"
+    if paid_value >= total_value - 0.01:
+        return "paid"
+    if paid_value > 0:
+        return "partial"
+    return "pending"
+
+
+async def _resolve_charge_target_students(
+    db,
+    payload: Dict[str, Any],
+    tenant_scope: Optional[Dict[str, Any]] = None,
+) -> List[Dict[str, Any]]:
+    target_scope = payload.get("target_scope")
+    filters = payload.get("target_filters") or {}
+    tahun = int(payload.get("tahun"))
+    tenant_scope = dict(tenant_scope or {})
+
+    if target_scope == "manual":
+        target_ids = payload.get("target_ids") or []
+        lookup_ids = [_as_object_id_if_valid(student_id) for student_id in target_ids]
+        query = {"_id": {"$in": lookup_ids}, **tenant_scope}
+        students = await db.students.find(query).to_list(len(lookup_ids) + 10)
+        student_map = {str(student.get("_id")): student for student in students}
+        ordered_students: List[Dict[str, Any]] = []
+        for student_id in target_ids:
+            student = student_map.get(str(student_id))
+            if student:
+                ordered_students.append(student)
+        return ordered_students
+
+    query: Dict[str, Any] = {"year": tahun, "status": "approved", **tenant_scope}
+    tingkatan_values = _normalize_int_list(
+        filters.get("tingkatan")
+        or filters.get("tingkatan_list")
+        or filters.get("forms")
+    )
+    if tingkatan_values:
+        if len(tingkatan_values) == 1:
+            query["form"] = tingkatan_values[0]
+        else:
+            query["form"] = {"$in": tingkatan_values}
+
+    if target_scope == "kelas":
+        kelas_values = _normalize_text_list(filters.get("kelas") or filters.get("class_name"))
+        if not kelas_values:
+            raise HTTPException(status_code=400, detail="target_filters.kelas diperlukan untuk target_scope=kelas")
+        if len(kelas_values) == 1:
+            query["class_name"] = kelas_values[0]
+        else:
+            query["class_name"] = {"$in": kelas_values}
+
+    students = await db.students.find(query).to_list(10000)
+
+    if target_scope == "kelab":
+        kelab_values = [value.lower() for value in _normalize_text_list(
+            filters.get("kelab") or filters.get("club") or filters.get("persatuan")
+        )]
+        if not kelab_values:
+            raise HTTPException(status_code=400, detail="target_filters.kelab diperlukan untuk target_scope=kelab")
+
+        def _match_kelab(student_doc: Dict[str, Any]) -> bool:
+            candidates = [
+                student_doc.get("club_name"),
+                student_doc.get("club"),
+                student_doc.get("kelab"),
+                student_doc.get("persatuan"),
+                student_doc.get("association"),
+            ]
+            for candidate in candidates:
+                for token in _normalize_text_list(candidate):
+                    if token.lower() in kelab_values:
+                        return True
+            return False
+
+        students = [student for student in students if _match_kelab(student)]
+
+    deduped_students: List[Dict[str, Any]] = []
+    seen_ids = set()
+    for student in students:
+        student_id = str(student.get("_id"))
+        if not student_id or student_id in seen_ids:
+            continue
+        seen_ids.add(student_id)
+        deduped_students.append(student)
+    return deduped_students
+
+
+async def _find_charge_invoice_candidate(
+    db,
+    student_id: Any,
+    tahun: int,
+    tenant_scope: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    query = {
+        "student_id": _as_object_id_if_valid(student_id),
+        "tahun": int(tahun),
+        **(tenant_scope or {}),
+    }
+    invoices = await db.student_yuran.find(
+        query
+    ).sort([("created_at", -1)]).to_list(20)
+    latest_invoice = invoices[0] if invoices else None
+    append_invoice = None
+    for invoice in invoices:
+        status = str(invoice.get("status") or "").strip().lower()
+        if status in {"pending", "partial", "overdue"}:
+            append_invoice = invoice
+            break
+    return {
+        "latest_invoice": latest_invoice,
+        "append_invoice": append_invoice,
+    }
+
+
+def _build_charge_line_item(payload: Dict[str, Any], charge_reference: str, job_id: Optional[str]) -> Dict[str, Any]:
+    return {
+        "category": "Caj Tambahan",
+        "sub_category": payload.get("charge_type", "").replace("_", " ").title(),
+        "code": payload.get("charge_code"),
+        "name": payload.get("charge_name"),
+        "amount": round(_safe_float(payload.get("amount")), 2),
+        "mandatory": True,
+        "paid": False,
+        "paid_amount": 0,
+        "paid_date": None,
+        "charge_type": payload.get("charge_type"),
+        "charge_source": "manual_bulk_charge",
+        "charge_reference": charge_reference,
+        "charge_job_id": job_id,
+    }
+
+
+def _serialize_charge_job(doc: Dict[str, Any]) -> Dict[str, Any]:
+    job_id = str(doc.get("_id"))
+    running_task = _YURAN_CHARGE_JOB_TASKS.get(job_id)
+    is_running = bool(running_task and not running_task.done())
+    target_summary = doc.get("target_summary") or {}
+    result_summary = doc.get("result_summary") or {}
+    return {
+        "id": job_id,
+        "job_number": doc.get("job_number"),
+        "job_type": doc.get("job_type") or YURAN_CHARGE_JOB_TYPE,
+        "status": doc.get("status"),
+        "is_running": is_running,
+        "tahun": doc.get("tahun"),
+        "charge_type": doc.get("charge_type"),
+        "apply_mode": doc.get("apply_mode"),
+        "charge_payload": doc.get("charge_payload") or {},
+        "target_summary": target_summary,
+        "result_summary": result_summary,
+        "result_rows": doc.get("result_rows") or [],
+        "warnings": doc.get("warnings") or [],
+        "preview_id": _id_str(doc.get("preview_id")),
+        "applied_job_id": _id_str(doc.get("applied_job_id")),
+        "created_by": _id_str(doc.get("created_by")),
+        "created_by_name": doc.get("created_by_name"),
+        "created_at": doc.get("created_at"),
+        "started_at": doc.get("started_at"),
+        "completed_at": doc.get("completed_at"),
+        "updated_at": doc.get("updated_at"),
+    }
+
+
+def _normalize_charge_export_action(action: Optional[str]) -> str:
+    normalized = str(action or "all").strip().lower()
+    if normalized not in YURAN_CHARGE_EXPORT_ACTIONS:
+        raise HTTPException(
+            status_code=400,
+            detail="action mesti salah satu: all | append | new_invoice | skip | error",
+        )
+    return normalized
+
+
+def _filter_charge_export_rows(rows: Any, action: str) -> List[Dict[str, Any]]:
+    if not isinstance(rows, list):
+        return []
+    normalized_rows = [row for row in rows if isinstance(row, dict)]
+    if action == "all":
+        return normalized_rows
+    return [row for row in normalized_rows if str(row.get("action") or "").strip().lower() == action]
+
+
+def _build_charge_export_csv_line(values: List[Any]) -> str:
+    output = StringIO()
+    writer = csv.writer(output)
+    writer.writerow(values)
+    return output.getvalue()
+
+
+def _is_charge_row_store_supported(db) -> bool:
+    return (
+        _resolve_session_factory(db) is not None
+        and select is not None
+        and func is not None
+        and YuranChargeJobResultRowRecord is not None
+    )
+
+
+def _to_charge_result_row(
+    *,
+    student_id: Any,
+    student_name: Any,
+    matric_number: Any,
+    action: Any,
+    reason: Any,
+    invoice_id: Any,
+    delta_amount: Any,
+) -> Dict[str, Any]:
+    return {
+        "student_id": _id_str(student_id),
+        "student_name": str(student_name or ""),
+        "matric_number": str(matric_number or ""),
+        "action": str(action or "").strip().lower(),
+        "reason": str(reason or ""),
+        "invoice_id": _id_str(invoice_id),
+        "delta_amount": round(_safe_float(delta_amount), 2),
+    }
+
+
+async def _insert_charge_result_rows_batch(
+    session_factory,
+    *,
+    job_id: str,
+    rows: List[Dict[str, Any]],
+    start_index: int,
+    created_at: str,
+) -> int:
+    if not rows:
+        return 0
+    if (
+        session_factory is None
+        or YuranChargeJobResultRowRecord is None
+    ):
+        return 0
+
+    model_rows = []
+    for offset, row in enumerate(rows):
+        row_index = start_index + offset
+        row_payload = _to_charge_result_row(
+            student_id=row.get("student_id"),
+            student_name=row.get("student_name"),
+            matric_number=row.get("matric_number"),
+            action=row.get("action"),
+            reason=row.get("reason"),
+            invoice_id=row.get("invoice_id"),
+            delta_amount=row.get("delta_amount"),
+        )
+        model_rows.append(
+            YuranChargeJobResultRowRecord(
+                id=f"{job_id}:{row_index}",
+                job_id=str(job_id),
+                row_index=int(row_index),
+                action=row_payload.get("action") or "skip",
+                student_id=row_payload.get("student_id"),
+                student_name=row_payload.get("student_name"),
+                matric_number=row_payload.get("matric_number"),
+                reason=row_payload.get("reason"),
+                invoice_id=row_payload.get("invoice_id"),
+                delta_amount=row_payload.get("delta_amount", 0.0),
+                extra_data={},
+                created_at=created_at,
+            )
+        )
+
+    async with session_factory() as session:
+        session.add_all(model_rows)
+        await session.commit()
+    return len(model_rows)
+
+
+async def _count_charge_result_rows(
+    session_factory,
+    *,
+    job_id: str,
+    action_filter: str,
+) -> int:
+    if (
+        session_factory is None
+        or select is None
+        or func is None
+        or YuranChargeJobResultRowRecord is None
+    ):
+        return 0
+    try:
+        async with session_factory() as session:
+            stmt = select(func.count()).select_from(YuranChargeJobResultRowRecord).where(
+                YuranChargeJobResultRowRecord.job_id == str(job_id)
+            )
+            if action_filter != "all":
+                stmt = stmt.where(YuranChargeJobResultRowRecord.action == action_filter)
+            return int((await session.scalar(stmt)) or 0)
+    except Exception:
+        return 0
+
+
+async def _iter_charge_result_rows_for_export(
+    session_factory,
+    *,
+    job_id: str,
+    action_filter: str,
+):
+    if (
+        session_factory is None
+        or select is None
+        or YuranChargeJobResultRowRecord is None
+    ):
+        return
+    offset = 0
+    async with session_factory() as session:
+        while True:
+            stmt = (
+                select(YuranChargeJobResultRowRecord)
+                .where(YuranChargeJobResultRowRecord.job_id == str(job_id))
+                .order_by(YuranChargeJobResultRowRecord.row_index.asc())
+                .offset(offset)
+                .limit(YURAN_CHARGE_EXPORT_FETCH_BATCH_SIZE)
+            )
+            if action_filter != "all":
+                stmt = stmt.where(YuranChargeJobResultRowRecord.action == action_filter)
+            rows = await session.scalars(stmt)
+            chunk = list(rows.all())
+            if not chunk:
+                break
+            for row in chunk:
+                yield {
+                    "student_id": row.student_id,
+                    "student_name": row.student_name,
+                    "matric_number": row.matric_number,
+                    "action": row.action,
+                    "reason": row.reason,
+                    "invoice_id": row.invoice_id,
+                    "delta_amount": row.delta_amount,
+                }
+            offset += len(chunk)
+
+
+async def _iter_charge_export_csv_bytes(
+    session_factory,
+    *,
+    job_id: str,
+    action_filter: str,
+):
+    yield "\ufeff".encode("utf-8")
+    yield _build_charge_export_csv_line(YURAN_CHARGE_EXPORT_HEADERS).encode("utf-8")
+    async for row in _iter_charge_result_rows_for_export(
+        session_factory,
+        job_id=job_id,
+        action_filter=action_filter,
+    ):
+        line = _build_charge_export_csv_line(
+            [
+                row.get("student_id", ""),
+                row.get("student_name", ""),
+                row.get("matric_number", ""),
+                row.get("action", ""),
+                row.get("reason", ""),
+                row.get("invoice_id", ""),
+                row.get("delta_amount", ""),
+            ]
+        )
+        yield line.encode("utf-8")
+
+
+def _expected_charge_export_rows_from_summary(doc: Dict[str, Any], action_filter: str) -> Optional[int]:
+    summary = doc.get("result_summary") or {}
+    summary_field_map = {
+        "all": "processed_count",
+        "append": "append_count",
+        "new_invoice": "new_invoice_count",
+        "skip": "skip_count",
+        "error": "error_count",
+    }
+    target_field = summary_field_map.get(action_filter, "processed_count")
+    raw_value = summary.get(target_field)
+    if raw_value is None:
+        return None
+    try:
+        value = int(raw_value)
+        return max(0, value)
+    except Exception:
+        return None
+
+
+async def _resolve_charge_export_row_info(
+    db,
+    *,
+    doc: Dict[str, Any],
+    job_id: str,
+    action_filter: str,
+) -> Dict[str, Any]:
+    session_factory = _resolve_session_factory(db)
+    if _is_charge_row_store_supported(db):
+        total_rows_any = await _count_charge_result_rows(
+            session_factory,
+            job_id=job_id,
+            action_filter="all",
+        )
+        if total_rows_any > 0:
+            total_rows = (
+                total_rows_any
+                if action_filter == "all"
+                else await _count_charge_result_rows(
+                    session_factory,
+                    job_id=job_id,
+                    action_filter=action_filter,
+                )
+            )
+            return {
+                "row_count": int(total_rows),
+                "source": "row_store",
+                "is_full_export": True,
+                "expected_row_count": int(total_rows),
+                "snapshot_row_count": len(_filter_charge_export_rows(doc.get("result_rows"), action_filter)),
+            }
+
+    snapshot_rows = _filter_charge_export_rows(doc.get("result_rows"), action_filter)
+    snapshot_count = len(snapshot_rows)
+    expected_rows = _expected_charge_export_rows_from_summary(doc, action_filter)
+    status_normalized = str(doc.get("status") or "").strip().lower()
+    is_preview_job = status_normalized == "previewed"
+    is_truncated = bool(is_preview_job)
+    if not is_truncated and expected_rows is not None:
+        is_truncated = expected_rows > snapshot_count
+
+    return {
+        "row_count": int(snapshot_count),
+        "source": "snapshot",
+        "is_full_export": not is_truncated,
+        "expected_row_count": expected_rows,
+        "snapshot_row_count": int(snapshot_count),
+    }
+
+
+def _build_charge_export_csv(rows: List[Dict[str, Any]]) -> str:
+    output = StringIO()
+    writer = csv.writer(output)
+    writer.writerow(YURAN_CHARGE_EXPORT_HEADERS)
+    for row in rows:
+        writer.writerow(
+            [
+                row.get("student_id", ""),
+                row.get("student_name", ""),
+                row.get("matric_number", ""),
+                row.get("action", ""),
+                row.get("reason", ""),
+                row.get("invoice_id", ""),
+                row.get("delta_amount", ""),
+            ]
+        )
+    return output.getvalue()
+
+
+def _build_charge_export_filename(job_number: Optional[str], job_id: str, action: str) -> str:
+    token = str(job_number or job_id or "job").strip().lower()
+    safe_token = re.sub(r"[^a-z0-9_-]+", "-", token).strip("-") or "job"
+    suffix = "all" if action == "all" else action
+    return f"yuran-charge-{safe_token}-{suffix}.csv"
 
 
 def serialize_student_yuran(doc: dict) -> dict:
@@ -751,6 +1666,10 @@ def serialize_student_yuran(doc: dict) -> dict:
         "paid_amount": doc.get("paid_amount", 0),
         "due_date": doc.get("due_date", ""),
         "status": doc.get("status", "pending"),
+        "billing_pack_enabled": bool(doc.get("billing_pack_enabled", False)),
+        "billing_pack_mode": doc.get("billing_pack_mode", "single"),
+        "billing_packs": doc.get("billing_packs", []),
+        "charge_context": doc.get("charge_context"),
         "billing_mode": doc.get("billing_mode", "standard"),
         "billing_target_cohort": doc.get("billing_target_cohort"),
         "billing_source_cohort": doc.get("billing_source_cohort"),
@@ -788,6 +1707,8 @@ def serialize_student_yuran_list_item(doc: dict) -> dict:
         "balance": balance_value,
         "due_date": doc.get("due_date", ""),
         "status": doc.get("status", "pending"),
+        "billing_pack_enabled": bool(doc.get("billing_pack_enabled", False)),
+        "billing_pack_mode": doc.get("billing_pack_mode", "single"),
         "billing_mode": billing_mode,
         "billing_target_cohort": doc.get("billing_target_cohort"),
         "billing_source_cohort": doc.get("billing_source_cohort"),
@@ -816,14 +1737,23 @@ async def get_available_years(
         raise HTTPException(status_code=403, detail="Akses ditolak")
     
     db = get_read_db()
+    tenant_scope = _tenant_scope_query(current_user)
     # Get distinct years
-    years = await db.set_yuran.distinct("tahun")
+    try:
+        years = await db.set_yuran.distinct("tahun", tenant_scope)
+    except TypeError:
+        years = await db.set_yuran.distinct("tahun")
+        if tenant_scope:
+            years = [
+                year for year in years
+                if await db.set_yuran.count_documents({"tahun": year, **tenant_scope}) > 0
+            ]
     years.sort(reverse=True)
     
     # Get count for each year
     result = []
     for year in years:
-        count = await db.set_yuran.count_documents({"tahun": year})
+        count = await db.set_yuran.count_documents({"tahun": year, **tenant_scope})
         result.append({
             "tahun": year,
             "set_count": count,
@@ -842,9 +1772,10 @@ async def copy_set_yuran_from_year(
     if current_user.get("role") not in ["superadmin", "admin", "bendahari"]:
         raise HTTPException(status_code=403, detail="Hanya Bendahari boleh salin Set Yuran")
     db = get_read_db()
+    tenant_scope = _tenant_scope_query(current_user)
     
     # Build query for source
-    query = {"tahun": data.source_year}
+    query = {"tahun": data.source_year, **tenant_scope}
     if data.tingkatan:
         query["tingkatan"] = data.tingkatan
     
@@ -863,7 +1794,8 @@ async def copy_set_yuran_from_year(
         # Check if target already exists
         existing = await db.set_yuran.find_one({
             "tahun": data.target_year,
-            "tingkatan": source["tingkatan"]
+            "tingkatan": source["tingkatan"],
+            **tenant_scope,
         })
         
         if existing:
@@ -892,6 +1824,7 @@ async def copy_set_yuran_from_year(
                 "set_id": str(source["_id"])
             }
         }
+        _stamp_tenant_fields(new_set, current_user, fallback_doc=source)
         
         await db.set_yuran.insert_one(new_set)
         copied_count += 1
@@ -926,7 +1859,7 @@ async def get_all_set_yuran(
 
     db = get_read_db()
 
-    query = {}
+    query = _tenant_scope_query(current_user)
     if tahun:
         query["tahun"] = tahun
     if tingkatan:
@@ -939,7 +1872,10 @@ async def get_all_set_yuran(
     # Get student count for each set
     result = []
     for s in sets:
-        count = await db.student_yuran.count_documents({"set_yuran_id": s["_id"]})
+        count = await db.student_yuran.count_documents({
+            "set_yuran_id": s["_id"],
+            **_tenant_scope_query(current_user),
+        })
         s["student_count"] = count
         result.append(serialize_set_yuran(s))
 
@@ -957,11 +1893,13 @@ async def get_set_yuran(
 
     db = get_read_db()
     set_lookup_id = _as_object_id_if_valid(set_id)
-    set_yuran = await db.set_yuran.find_one({"_id": set_lookup_id})
+    set_yuran = await db.set_yuran.find_one(_apply_tenant_scope({"_id": set_lookup_id}, current_user))
     if not set_yuran:
         raise HTTPException(status_code=404, detail="Set Yuran tidak dijumpai")
 
-    count = await db.student_yuran.count_documents({"set_yuran_id": set_yuran["_id"]})
+    count = await db.student_yuran.count_documents(
+        _apply_tenant_scope({"set_yuran_id": set_yuran["_id"]}, current_user)
+    )
     set_yuran["student_count"] = count
 
     return serialize_set_yuran(set_yuran)
@@ -978,11 +1916,11 @@ async def create_set_yuran(
     db = get_read_db()
 
     # Check if already exists
-    existing = await db.set_yuran.find_one({
+    existing = await db.set_yuran.find_one(_apply_tenant_scope({
         "tahun": data.tahun,
         "tingkatan": data.tingkatan,
         "is_active": True
-    })
+    }, current_user))
     if existing:
         raise HTTPException(
             status_code=400,
@@ -1006,6 +1944,7 @@ async def create_set_yuran(
         "created_by": str(current_user["_id"]),
         "created_by_name": current_user.get("full_name", "")
     }
+    _stamp_tenant_fields(doc, current_user)
 
     result = await db.set_yuran.insert_one(doc)
     doc["_id"] = result.inserted_id
@@ -1032,7 +1971,7 @@ async def update_set_yuran(
     db = get_read_db()
 
     set_lookup_id = _as_object_id_if_valid(set_id)
-    set_yuran = await db.set_yuran.find_one({"_id": set_lookup_id})
+    set_yuran = await db.set_yuran.find_one(_apply_tenant_scope({"_id": set_lookup_id}, current_user))
     if not set_yuran:
         raise HTTPException(status_code=404, detail="Set Yuran tidak dijumpai")
 
@@ -1072,7 +2011,10 @@ async def update_set_yuran(
     if data.is_active is not None:
         update_data["is_active"] = data.is_active
 
-    await db.set_yuran.update_one({"_id": set_lookup_id}, {"$set": update_data})
+    await db.set_yuran.update_one(
+        _apply_tenant_scope({"_id": set_lookup_id}, current_user),
+        {"$set": update_data},
+    )
     await _invalidate_financial_dashboard_cache_safely(db, scope="yuran")
 
     await log_audit(
@@ -1085,7 +2027,7 @@ async def update_set_yuran(
         )
     )
 
-    updated = await db.set_yuran.find_one({"_id": set_lookup_id})
+    updated = await db.set_yuran.find_one(_apply_tenant_scope({"_id": set_lookup_id}, current_user))
     payload = serialize_set_yuran(updated)
     payload["sync_summary"] = sync_summary
     return payload
@@ -1103,22 +2045,24 @@ async def delete_set_yuran(
     db = get_read_db()
 
     set_lookup_id = _as_object_id_if_valid(set_id)
-    set_yuran = await db.set_yuran.find_one({"_id": set_lookup_id})
+    set_yuran = await db.set_yuran.find_one(_apply_tenant_scope({"_id": set_lookup_id}, current_user))
     if not set_yuran:
         raise HTTPException(status_code=404, detail="Set Yuran tidak dijumpai")
 
     # Check if has assigned students
     set_id_value = _as_object_id_if_valid(set_id)
-    student_count = await db.student_yuran.count_documents({"set_yuran_id": set_id_value})
+    student_count = await db.student_yuran.count_documents(
+        _apply_tenant_scope({"set_yuran_id": set_id_value}, current_user)
+    )
     if student_count > 0:
         # Soft delete
         await db.set_yuran.update_one(
-            {"_id": set_lookup_id},
+            _apply_tenant_scope({"_id": set_lookup_id}, current_user),
             {"$set": {"is_active": False, "deleted_at": datetime.now(timezone.utc).isoformat()}}
         )
     else:
         # Hard delete
-        await db.set_yuran.delete_one({"_id": set_lookup_id})
+        await db.set_yuran.delete_one(_apply_tenant_scope({"_id": set_lookup_id}, current_user))
     await _invalidate_financial_dashboard_cache_safely(db, scope="yuran")
 
     await log_audit(
@@ -1143,15 +2087,15 @@ async def assign_yuran_to_students(
     if not data.student_ids:
         raise HTTPException(status_code=400, detail="Senarai pelajar tidak boleh kosong")
 
-    mongo_db = get_db()
     core_db = get_read_db()
+    tenant_scope = _tenant_scope_query(current_user)
     unique_student_ids = list(dict.fromkeys(str(student_id) for student_id in data.student_ids if str(student_id).strip()))
     if not unique_student_ids:
         raise HTTPException(status_code=400, detail="Senarai pelajar tidak sah")
 
     # Get set yuran
     set_yuran_lookup_id = _as_object_id_if_valid(data.set_yuran_id)
-    set_yuran = await core_db.set_yuran.find_one({"_id": set_yuran_lookup_id})
+    set_yuran = await core_db.set_yuran.find_one({"_id": set_yuran_lookup_id, **tenant_scope})
     if not set_yuran:
         raise HTTPException(status_code=404, detail="Set Yuran tidak dijumpai")
 
@@ -1162,7 +2106,7 @@ async def assign_yuran_to_students(
         try:
             # Get student
             student_lookup_id = _as_object_id_if_valid(student_id)
-            student = await core_db.students.find_one({"_id": student_lookup_id})
+            student = await core_db.students.find_one({"_id": student_lookup_id, **tenant_scope})
             if not student:
                 errors.append(f"Pelajar {student_id} tidak dijumpai")
                 continue
@@ -1171,7 +2115,8 @@ async def assign_yuran_to_students(
             existing = await core_db.student_yuran.find_one({
                 "student_id": student_lookup_id,
                 "tahun": set_yuran["tahun"],
-                "tingkatan": set_yuran["tingkatan"]
+                "tingkatan": set_yuran["tingkatan"],
+                **tenant_scope,
             })
             if existing:
                 errors.append(f"Pelajar {student.get('full_name')} sudah ada yuran untuk tahun ini")
@@ -1229,12 +2174,17 @@ async def assign_yuran_to_students(
                 "paid_amount": 0,
                 "status": "pending",
                 "due_date": due_date,
+                "billing_pack_enabled": False,
+                "billing_pack_mode": "single",
+                "billing_packs": [],
+                "charge_context": None,
                 "created_at": datetime.now(timezone.utc).isoformat(),
                 "payments": [],
                 "billing_mode": data.billing_mode or "standard",
                 "billing_target_cohort": data.billing_target_cohort,
                 "billing_source_cohort": data.billing_source_cohort,
             }
+            _stamp_tenant_fields(student_yuran_doc, current_user, fallback_doc=set_yuran)
 
             res = await core_db.student_yuran.insert_one(student_yuran_doc)
             assigned_count += 1
@@ -1244,7 +2194,7 @@ async def assign_yuran_to_students(
             try:
                 from services.ar_journal import post_ar_invoice
                 await post_ar_invoice(
-                    mongo_db,
+                    core_db,
                     sy_id,
                     total_amount,
                     YURAN_CATEGORY_ID,
@@ -1260,7 +2210,7 @@ async def assign_yuran_to_students(
             # Notify parent - In-app notification
             if student.get("parent_id"):
                 fee_type = "Islam" if is_muslim else "Bukan Islam"
-                await core_db.notifications.insert_one({
+                notification_doc = {
                     "user_id": student.get("parent_id"),
                     "title": "Yuran Baru Dikenakan",
                     "message": f"Yuran untuk {student.get('full_name')} ({set_yuran.get('nama')}) - Kategori {fee_type} berjumlah RM {total_amount:.2f} telah dikenakan.",
@@ -1274,13 +2224,18 @@ async def assign_yuran_to_students(
                     },
                     "is_read": False,
                     "created_at": datetime.now(timezone.utc).isoformat()
-                })
+                }
+                _stamp_tenant_fields(notification_doc, current_user, fallback_doc=set_yuran)
+                await core_db.notifications.insert_one(notification_doc)
                 
                 # Send email notification
                 try:
                     from services.email_service import send_new_fee_notification, RESEND_ENABLED
                     if RESEND_ENABLED:
-                        parent = await core_db.users.find_one({"_id": student.get("parent_id")})
+                        parent = await core_db.users.find_one({
+                            "_id": student.get("parent_id"),
+                            **tenant_scope,
+                        })
                         if parent and parent.get("email"):
                             await send_new_fee_notification(
                                 parent_email=parent.get("email"),
@@ -1323,12 +2278,14 @@ async def assign_yuran_by_tingkatan(
         raise HTTPException(status_code=403, detail="Akses ditolak")
 
     core_db = get_read_db()
+    tenant_scope = _tenant_scope_query(current_user)
 
     # Get set yuran for this tingkatan
     set_yuran = await core_db.set_yuran.find_one({
         "tahun": tahun,
         "tingkatan": tingkatan,
-        "is_active": True
+        "is_active": True,
+        **tenant_scope,
     })
     if not set_yuran:
         raise HTTPException(status_code=404, detail=f"Set Yuran untuk Tingkatan {tingkatan} Tahun {tahun} tidak dijumpai")
@@ -1340,7 +2297,8 @@ async def assign_yuran_by_tingkatan(
     students = await core_db.students.find({
         "form": tingkatan,
         "year": tahun,
-        "status": "approved"
+        "status": "approved",
+        **tenant_scope,
     }).to_list(1000)
 
     if not students:
@@ -1353,7 +2311,8 @@ async def assign_yuran_by_tingkatan(
             students = await core_db.students.find({
                 "form": source_form,
                 "year": source_year,
-                "status": "approved"
+                "status": "approved",
+                **tenant_scope,
             }).to_list(1000)
             if students:
                 assignment_mode = "prebill_next_year_from_current_students"
@@ -1407,6 +2366,911 @@ async def assign_yuran_by_tingkatan(
     return assign_result
 
 
+# ============ CAJ TAMBAHAN (PHASE 1) ============
+
+def _require_yuran_charge_roles(current_user: Dict[str, Any]) -> None:
+    role = current_user.get("role")
+    if role not in ["superadmin", "admin", "bendahari", "sub_bendahari"]:
+        raise HTTPException(status_code=403, detail="Akses ditolak")
+
+
+def _coerce_charge_payload_from_apply(
+    apply_data: YuranChargeApplyRequest,
+    preview_doc: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    if apply_data.payload is not None:
+        return _normalize_charge_payload(apply_data.payload.dict())
+    if preview_doc and isinstance(preview_doc.get("charge_payload"), dict):
+        return _normalize_charge_payload(dict(preview_doc.get("charge_payload") or {}))
+    raise HTTPException(status_code=400, detail="payload diperlukan atau preview_id yang sah")
+
+
+async def _run_yuran_charge_preview(
+    db,
+    payload: Dict[str, Any],
+    tenant_scope: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    students = await _resolve_charge_target_students(db, payload, tenant_scope=tenant_scope)
+    target_count = len(students)
+    append_count = 0
+    new_invoice_count = 0
+    skip_paid_count = 0
+    skip_no_invoice_count = 0
+    sample_rows: List[Dict[str, Any]] = []
+
+    for student in students:
+        student_id = student.get("_id")
+        student_name = student.get("full_name") or student.get("name") or "Pelajar"
+        candidate = await _find_charge_invoice_candidate(
+            db,
+            student_id,
+            payload.get("tahun"),
+            tenant_scope=tenant_scope,
+        )
+        latest_invoice = candidate.get("latest_invoice")
+        append_invoice = candidate.get("append_invoice")
+        action = "skip"
+        reason = "tiada_invoice"
+
+        if payload.get("apply_mode") == "new_invoice_special_case":
+            action = "new_invoice"
+            reason = "ok"
+            new_invoice_count += 1
+        elif append_invoice is not None:
+            action = "append"
+            reason = "ok"
+            append_count += 1
+        elif latest_invoice is not None and str(latest_invoice.get("status") or "").lower() == "paid":
+            reason = "invoice_sudah_paid"
+            skip_paid_count += 1
+        else:
+            reason = "invoice_pending_partial_tiada"
+            skip_no_invoice_count += 1
+
+        if len(sample_rows) < 120:
+            sample_rows.append({
+                "student_id": _id_str(student_id),
+                "student_name": student_name,
+                "matric_number": student.get("matric_number"),
+                "tingkatan": student.get("form"),
+                "kelas": student.get("class_name"),
+                "invoice_id": _id_str(append_invoice.get("_id")) if append_invoice else _id_str(latest_invoice.get("_id")) if latest_invoice else None,
+                "invoice_status": latest_invoice.get("status") if latest_invoice else None,
+                "action": action,
+                "reason": reason,
+                "amount": payload.get("amount"),
+            })
+
+    eligible_count = append_count + new_invoice_count
+    skip_count = skip_paid_count + skip_no_invoice_count
+    warnings: List[str] = []
+    if payload.get("target_scope") == "manual" and target_count == 0:
+        warnings.append("Tiada pelajar sah ditemui untuk target_ids yang diberikan.")
+    if skip_paid_count > 0 and payload.get("apply_mode") == "append_existing_invoice":
+        warnings.append(f"{skip_paid_count} pelajar di-skip kerana invoice semasa sudah paid.")
+    if skip_no_invoice_count > 0 and payload.get("apply_mode") == "append_existing_invoice":
+        warnings.append(f"{skip_no_invoice_count} pelajar di-skip kerana tiada invoice pending/partial untuk append.")
+
+    return {
+        "target_count": target_count,
+        "eligible_count": eligible_count,
+        "append_count": append_count,
+        "new_invoice_count": new_invoice_count,
+        "skip_paid_count": skip_paid_count,
+        "skip_no_invoice_count": skip_no_invoice_count,
+        "skip_count": skip_count,
+        "estimated_total": round(eligible_count * _safe_float(payload.get("amount")), 2),
+        "warnings": warnings,
+        "sample_rows": sample_rows,
+    }
+
+
+async def _apply_yuran_charge_payload(
+    db,
+    payload: Dict[str, Any],
+    current_user: Dict[str, Any],
+    *,
+    job_id: Optional[str],
+    preview_id: Optional[str],
+    tenant_scope: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    students = await _resolve_charge_target_students(db, payload, tenant_scope=tenant_scope)
+    now_iso = datetime.now(timezone.utc).isoformat()
+    charge_reference = generate_payment_reference(prefix="CHG")
+    rows_snapshot: List[Dict[str, Any]] = []
+    persist_rows = bool(job_id) and _is_charge_row_store_supported(db)
+    session_factory = _resolve_session_factory(db) if persist_rows else None
+    row_batch: List[Dict[str, Any]] = []
+    persisted_row_count = 0
+    row_store_failed = False
+    summary = {
+        "processed_count": len(students),
+        "success_count": 0,
+        "append_count": 0,
+        "new_invoice_count": 0,
+        "skip_count": 0,
+        "skip_paid_count": 0,
+        "skip_no_invoice_count": 0,
+        "error_count": 0,
+        "total_delta_amount": 0.0,
+    }
+    set_yuran_cache: Dict[int, Dict[str, Any]] = {}
+
+    for student in students:
+        try:
+            student_id = student.get("_id")
+            student_name = student.get("full_name") or student.get("name") or "Pelajar"
+            candidate = await _find_charge_invoice_candidate(
+                db,
+                student_id,
+                payload.get("tahun"),
+                tenant_scope=tenant_scope,
+            )
+            latest_invoice = candidate.get("latest_invoice")
+            append_invoice = candidate.get("append_invoice")
+            action = "skip"
+            reason = "unknown"
+            updated_invoice_id = None
+            delta_amount = 0.0
+
+            if payload.get("apply_mode") == "append_existing_invoice":
+                if append_invoice is None:
+                    if latest_invoice is not None and str(latest_invoice.get("status") or "").lower() == "paid":
+                        summary["skip_paid_count"] += 1
+                        reason = "invoice_sudah_paid"
+                    else:
+                        summary["skip_no_invoice_count"] += 1
+                        reason = "tiada_invoice_pending_partial"
+                    summary["skip_count"] += 1
+                else:
+                    invoice_items = list(append_invoice.get("items") or [])
+                    line_item = _build_charge_line_item(payload, charge_reference, job_id)
+                    invoice_items.append(line_item)
+
+                    old_total = _safe_float(append_invoice.get("total_amount"))
+                    new_total = round(old_total + _safe_float(payload.get("amount")), 2)
+                    paid_amount = _safe_float(append_invoice.get("paid_amount"))
+                    due_date = append_invoice.get("due_date") or payload.get("due_date")
+                    due_date = _normalize_iso_date(due_date, field_name="invoice_due_date")
+                    new_status = _derive_invoice_status(new_total, paid_amount, due_date)
+                    billing_updates: Dict[str, Any] = {}
+                    if payload.get("pack_config", {}).get("enabled"):
+                        billing_updates = _derive_invoice_billing_packs(
+                            invoice_items,
+                            paid_amount,
+                            due_date,
+                            payload.get("pack_config") or {},
+                        )
+
+                    charge_context = append_invoice.get("charge_context")
+                    if not isinstance(charge_context, dict):
+                        charge_context = {}
+                    recent_charges = list(charge_context.get("recent_charges") or [])
+                    recent_charges.insert(0, {
+                        "reference": charge_reference,
+                        "name": payload.get("charge_name"),
+                        "code": payload.get("charge_code"),
+                        "type": payload.get("charge_type"),
+                        "amount": round(_safe_float(payload.get("amount")), 2),
+                        "job_id": job_id,
+                        "preview_id": preview_id,
+                        "applied_at": now_iso,
+                    })
+                    charge_context["recent_charges"] = recent_charges[:10]
+                    charge_context["last_charge_reference"] = charge_reference
+                    charge_context["last_charge_amount"] = round(_safe_float(payload.get("amount")), 2)
+                    charge_context["last_charge_type"] = payload.get("charge_type")
+                    charge_context["last_charge_name"] = payload.get("charge_name")
+                    charge_context["last_charge_job_id"] = job_id
+                    charge_context["last_charge_at"] = now_iso
+
+                    update_payload: Dict[str, Any] = {
+                        "items": invoice_items,
+                        "total_amount": new_total,
+                        "balance": max(0.0, round(new_total - paid_amount, 2)),
+                        "status": new_status,
+                        "due_date": due_date,
+                        "charge_context": charge_context,
+                        "updated_at": now_iso,
+                    }
+                    update_payload.update(billing_updates)
+                    await db.student_yuran.update_one(
+                        {"_id": append_invoice.get("_id")},
+                        {
+                            "$set": update_payload,
+                            "$push": {
+                                "invoice_adjustments": {
+                                    "reference_number": charge_reference,
+                                    "adjusted_by": str(current_user.get("_id")),
+                                    "adjusted_by_name": current_user.get("full_name", ""),
+                                    "adjusted_at": now_iso,
+                                    "delta_amount": round(_safe_float(payload.get("amount")), 2),
+                                    "old_total_amount": old_total,
+                                    "new_total_amount": new_total,
+                                    "charge_name": payload.get("charge_name"),
+                                    "charge_code": payload.get("charge_code"),
+                                    "charge_type": payload.get("charge_type"),
+                                    "source": "bulk_charge_apply",
+                                    "job_id": job_id,
+                                }
+                            },
+                        },
+                    )
+                    action = "append"
+                    reason = "ok"
+                    delta_amount = round(_safe_float(payload.get("amount")), 2)
+                    updated_invoice_id = _id_str(append_invoice.get("_id"))
+                    summary["success_count"] += 1
+                    summary["append_count"] += 1
+                    summary["total_delta_amount"] += delta_amount
+            else:
+                student_form = int(student.get("form") or payload.get("target_filters", {}).get("tingkatan") or 1)
+                if student_form not in set_yuran_cache:
+                    set_yuran_cache[student_form] = await db.set_yuran.find_one({
+                        "tahun": payload.get("tahun"),
+                        "tingkatan": student_form,
+                        "is_active": True,
+                        **(tenant_scope or {}),
+                    })
+                set_yuran = set_yuran_cache.get(student_form)
+                line_item = _build_charge_line_item(payload, charge_reference, job_id)
+                invoice_items = [line_item]
+                due_date = _normalize_iso_date(payload.get("due_date"), field_name="due_date")
+                billing_state = _derive_invoice_billing_packs(
+                    invoice_items,
+                    0.0,
+                    due_date,
+                    payload.get("pack_config") or {},
+                )
+
+                new_invoice_doc = {
+                    "student_id": student_id,
+                    "student_name": student_name,
+                    "matric_number": student.get("matric_number"),
+                    "parent_id": student.get("parent_id"),
+                    "tahun": int(payload.get("tahun")),
+                    "tingkatan": student_form,
+                    "set_yuran_id": set_yuran.get("_id") if set_yuran else latest_invoice.get("set_yuran_id") if latest_invoice else None,
+                    "set_yuran_nama": set_yuran.get("nama") if set_yuran else latest_invoice.get("set_yuran_nama") if latest_invoice else "Caj Tambahan",
+                    "religion": student.get("religion") or (latest_invoice.get("religion") if latest_invoice else "Islam"),
+                    "items": invoice_items,
+                    "payments": [],
+                    "total_amount": round(_safe_float(payload.get("amount")), 2),
+                    "paid_amount": 0.0,
+                    "balance": round(_safe_float(payload.get("amount")), 2),
+                    "status": "pending",
+                    "due_date": due_date,
+                    "billing_pack_enabled": billing_state.get("billing_pack_enabled", False),
+                    "billing_pack_mode": billing_state.get("billing_pack_mode", "single"),
+                    "billing_packs": billing_state.get("billing_packs", []),
+                    "charge_context": {
+                        "last_charge_reference": charge_reference,
+                        "last_charge_name": payload.get("charge_name"),
+                        "last_charge_amount": round(_safe_float(payload.get("amount")), 2),
+                        "last_charge_type": payload.get("charge_type"),
+                        "last_charge_job_id": job_id,
+                        "last_charge_at": now_iso,
+                        "recent_charges": [{
+                            "reference": charge_reference,
+                            "name": payload.get("charge_name"),
+                            "code": payload.get("charge_code"),
+                            "type": payload.get("charge_type"),
+                            "amount": round(_safe_float(payload.get("amount")), 2),
+                            "job_id": job_id,
+                            "preview_id": preview_id,
+                            "applied_at": now_iso,
+                        }],
+                    },
+                    "billing_mode": "special_charge",
+                    "billing_target_cohort": {"tahun": payload.get("tahun"), "tingkatan": student_form},
+                    "billing_source_cohort": None,
+                    "created_at": now_iso,
+                    "updated_at": now_iso,
+                }
+                if tenant_scope:
+                    new_invoice_doc.update(tenant_scope)
+                insert_result = await db.student_yuran.insert_one(new_invoice_doc)
+                updated_invoice_id = _id_str(insert_result.inserted_id)
+                action = "new_invoice"
+                reason = "ok"
+                delta_amount = round(_safe_float(payload.get("amount")), 2)
+                summary["success_count"] += 1
+                summary["new_invoice_count"] += 1
+                summary["total_delta_amount"] += delta_amount
+
+            result_row = _to_charge_result_row(
+                student_id=student.get("_id"),
+                student_name=student_name,
+                matric_number=student.get("matric_number"),
+                action=action,
+                reason=reason,
+                invoice_id=updated_invoice_id,
+                delta_amount=delta_amount,
+            )
+            if len(rows_snapshot) < YURAN_CHARGE_RESULT_ROWS_CAP:
+                rows_snapshot.append(result_row)
+            if persist_rows and not row_store_failed:
+                row_batch.append(result_row)
+                if len(row_batch) >= YURAN_CHARGE_ROW_INSERT_BATCH_SIZE:
+                    try:
+                        inserted_count = await _insert_charge_result_rows_batch(
+                            session_factory,
+                            job_id=str(job_id),
+                            rows=row_batch,
+                            start_index=persisted_row_count + 1,
+                            created_at=now_iso,
+                        )
+                        persisted_row_count += inserted_count
+                    except Exception:
+                        row_store_failed = True
+                    row_batch = []
+
+            if action in {"append", "new_invoice"} and student.get("parent_id"):
+                notification_doc = {
+                    "user_id": student.get("parent_id"),
+                    "title": "Caj Tambahan Yuran",
+                    "message": (
+                        f"Caj tambahan '{payload.get('charge_name')}' berjumlah "
+                        f"RM {round(_safe_float(payload.get('amount')), 2):.2f} telah ditambah "
+                        f"untuk {student_name}."
+                    ),
+                    "type": "info",
+                    "category": "fees",
+                    "action_url": "/payment-center?bulk=all-yuran",
+                    "action_label": "Lihat & Bayar",
+                    "metadata": {
+                        "student_id": _id_str(student.get("_id")),
+                        "charge_reference": charge_reference,
+                        "charge_type": payload.get("charge_type"),
+                        "charge_code": payload.get("charge_code"),
+                        "job_id": job_id,
+                    },
+                    "is_read": False,
+                    "created_at": now_iso,
+                }
+                if tenant_scope:
+                    notification_doc.update(tenant_scope)
+                await db.notifications.insert_one(notification_doc)
+        except Exception as exc:
+            summary["error_count"] += 1
+            result_row = _to_charge_result_row(
+                student_id=student.get("_id"),
+                student_name=student.get("full_name") or student.get("name") or "Pelajar",
+                matric_number=student.get("matric_number"),
+                action="error",
+                reason=str(exc),
+                invoice_id=None,
+                delta_amount=0.0,
+            )
+            if len(rows_snapshot) < YURAN_CHARGE_RESULT_ROWS_CAP:
+                rows_snapshot.append(result_row)
+            if persist_rows and not row_store_failed:
+                row_batch.append(result_row)
+                if len(row_batch) >= YURAN_CHARGE_ROW_INSERT_BATCH_SIZE:
+                    try:
+                        inserted_count = await _insert_charge_result_rows_batch(
+                            session_factory,
+                            job_id=str(job_id),
+                            rows=row_batch,
+                            start_index=persisted_row_count + 1,
+                            created_at=now_iso,
+                        )
+                        persisted_row_count += inserted_count
+                    except Exception:
+                        row_store_failed = True
+                    row_batch = []
+
+    if persist_rows and not row_store_failed and row_batch:
+        try:
+            inserted_count = await _insert_charge_result_rows_batch(
+                session_factory,
+                job_id=str(job_id),
+                rows=row_batch,
+                start_index=persisted_row_count + 1,
+                created_at=now_iso,
+            )
+            persisted_row_count += inserted_count
+        except Exception:
+            row_store_failed = True
+
+    summary["total_delta_amount"] = round(summary["total_delta_amount"], 2)
+    summary["skip_count"] = int(summary["skip_count"])
+    summary["stored_result_rows_count"] = int(persisted_row_count)
+    summary["result_rows_store_failed"] = bool(row_store_failed)
+    return {"summary": summary, "rows": rows_snapshot}
+
+
+def _compute_yuran_charge_final_status(summary: Dict[str, Any]) -> str:
+    error_count = int(summary.get("error_count", 0))
+    success_count = int(summary.get("success_count", 0))
+    skip_count = int(summary.get("skip_count", 0))
+    if error_count > 0:
+        return "partial" if success_count > 0 else "failed"
+    if skip_count > 0:
+        return "partial"
+    return "completed"
+
+
+async def _finalize_yuran_charge_apply_job(
+    db,
+    *,
+    job_lookup_id: Any,
+    job_id: str,
+    payload: Dict[str, Any],
+    current_user: Dict[str, Any],
+    preview_id: Optional[str],
+    tenant_scope: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    result = await _apply_yuran_charge_payload(
+        db,
+        payload,
+        current_user,
+        job_id=job_id,
+        preview_id=preview_id,
+        tenant_scope=tenant_scope,
+    )
+    summary = result.get("summary", {})
+    rows = result.get("rows", [])
+    target_summary = {
+        "target_count": int(summary.get("processed_count", 0)),
+        "eligible_count": int(summary.get("success_count", 0)),
+        "skip_count": int(summary.get("skip_count", 0)),
+    }
+    final_status = _compute_yuran_charge_final_status(summary)
+
+    finished_iso = datetime.now(timezone.utc).isoformat()
+    await db[YURAN_CHARGE_JOB_COLLECTION].update_one(
+        {"_id": job_lookup_id},
+        {"$set": {
+            "status": final_status,
+            "target_summary": target_summary,
+            "result_summary": summary,
+            "result_rows": rows[:YURAN_CHARGE_RESULT_ROWS_CAP],
+            "completed_at": finished_iso,
+            "updated_at": finished_iso,
+        }},
+    )
+
+    if preview_id:
+        await db[YURAN_CHARGE_JOB_COLLECTION].update_one(
+            {"_id": _as_object_id_if_valid(preview_id)},
+            {"$set": {"applied_job_id": job_id, "updated_at": finished_iso}},
+        )
+
+    if int(summary.get("success_count", 0)) > 0:
+        await _invalidate_financial_dashboard_cache_safely(db, scope="yuran")
+
+    await log_audit(
+        current_user,
+        "APPLY_BULK_YURAN_CHARGE",
+        "yuran",
+        (
+            f"job_id={job_id}; charge={payload.get('charge_name')}; "
+            f"success={summary.get('success_count', 0)}; "
+            f"skip={summary.get('skip_count', 0)}; "
+            f"error={summary.get('error_count', 0)}"
+        ),
+    )
+
+    applied_job = await db[YURAN_CHARGE_JOB_COLLECTION].find_one({"_id": job_lookup_id})
+    return {
+        "job": applied_job,
+        "summary": summary,
+        "rows": rows,
+        "final_status": final_status,
+    }
+
+
+async def _run_yuran_charge_apply_task(
+    job_id: str,
+    payload: Dict[str, Any],
+    current_user: Dict[str, Any],
+    preview_id: Optional[str],
+) -> None:
+    db = get_read_db()
+    job_lookup_id = _as_object_id_if_valid(job_id)
+    try:
+        tenant_scope = _tenant_scope_query(current_user)
+        await _finalize_yuran_charge_apply_job(
+            db,
+            job_lookup_id=job_lookup_id,
+            job_id=job_id,
+            payload=payload,
+            current_user=current_user,
+            preview_id=preview_id,
+            tenant_scope=tenant_scope,
+        )
+    except Exception as exc:
+        finished_iso = datetime.now(timezone.utc).isoformat()
+        fail_summary = {
+            "processed_count": 0,
+            "success_count": 0,
+            "append_count": 0,
+            "new_invoice_count": 0,
+            "skip_count": 0,
+            "error_count": 1,
+            "total_delta_amount": 0.0,
+        }
+        await db[YURAN_CHARGE_JOB_COLLECTION].update_one(
+            {"_id": job_lookup_id},
+            {"$set": {
+                "status": "failed",
+                "result_summary": fail_summary,
+                "result_rows": [{
+                    "student_id": None,
+                    "student_name": None,
+                    "matric_number": None,
+                    "action": "error",
+                    "reason": str(exc),
+                    "invoice_id": None,
+                    "delta_amount": 0.0,
+                }],
+                "completed_at": finished_iso,
+                "updated_at": finished_iso,
+            }},
+        )
+    finally:
+        _YURAN_CHARGE_JOB_TASKS.pop(job_id, None)
+
+
+def _start_yuran_charge_apply_task(
+    job_id: str,
+    payload: Dict[str, Any],
+    current_user: Dict[str, Any],
+    preview_id: Optional[str],
+) -> None:
+    task = asyncio.create_task(_run_yuran_charge_apply_task(job_id, payload, current_user, preview_id))
+    _YURAN_CHARGE_JOB_TASKS[job_id] = task
+
+    def _cleanup(_task: asyncio.Task) -> None:
+        _YURAN_CHARGE_JOB_TASKS.pop(job_id, None)
+
+    task.add_done_callback(_cleanup)
+
+
+@router.post("/charges/preview")
+async def preview_yuran_charge_bulk(
+    data: YuranChargePreviewRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    _require_yuran_charge_roles(current_user)
+    db = get_read_db()
+    tenant_scope = _tenant_scope_query(current_user)
+    payload = _normalize_charge_payload(data.dict())
+    preview = await _run_yuran_charge_preview(db, payload, tenant_scope=tenant_scope)
+    now_iso = datetime.now(timezone.utc).isoformat()
+    job_doc = {
+        "job_number": generate_payment_reference(prefix="CHPRE"),
+        "job_type": YURAN_CHARGE_JOB_TYPE,
+        "status": "previewed",
+        "tahun": payload.get("tahun"),
+        "charge_type": payload.get("charge_type"),
+        "apply_mode": payload.get("apply_mode"),
+        "charge_payload": payload,
+        "target_summary": {
+            "target_count": preview.get("target_count", 0),
+            "eligible_count": preview.get("eligible_count", 0),
+            "skip_count": preview.get("skip_count", 0),
+        },
+        "result_summary": {
+            "processed_count": 0,
+            "success_count": 0,
+            "append_count": 0,
+            "new_invoice_count": 0,
+            "skip_count": 0,
+            "error_count": 0,
+            "total_delta_amount": 0.0,
+        },
+        "result_rows": preview.get("sample_rows", [])[:YURAN_CHARGE_RESULT_ROWS_CAP],
+        "warnings": preview.get("warnings", []),
+        "preview_id": None,
+        "applied_job_id": None,
+        "created_by": str(current_user.get("_id")) if current_user.get("_id") is not None else None,
+        "created_by_name": current_user.get("full_name", ""),
+        "created_at": now_iso,
+        "started_at": None,
+        "completed_at": None,
+        "updated_at": now_iso,
+    }
+    if tenant_scope:
+        job_doc.update(tenant_scope)
+    insert_result = await db[YURAN_CHARGE_JOB_COLLECTION].insert_one(job_doc)
+    preview_id = _id_str(insert_result.inserted_id)
+    await db[YURAN_CHARGE_JOB_COLLECTION].update_one(
+        {"_id": insert_result.inserted_id},
+        {"$set": {"preview_id": preview_id, "updated_at": now_iso}},
+    )
+
+    return {
+        "preview_id": preview_id,
+        "target_count": preview.get("target_count", 0),
+        "eligible_count": preview.get("eligible_count", 0),
+        "append_count": preview.get("append_count", 0),
+        "new_invoice_count": preview.get("new_invoice_count", 0),
+        "skip_paid_count": preview.get("skip_paid_count", 0),
+        "skip_no_invoice_count": preview.get("skip_no_invoice_count", 0),
+        "skip_count": preview.get("skip_count", 0),
+        "estimated_total": preview.get("estimated_total", 0),
+        "warnings": preview.get("warnings", []),
+        "sample_rows": preview.get("sample_rows", []),
+    }
+
+
+@router.post("/charges/apply")
+async def apply_yuran_charge_bulk(
+    data: YuranChargeApplyRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    _require_yuran_charge_roles(current_user)
+    if data.confirm is not True:
+        raise HTTPException(status_code=400, detail="confirm=true diperlukan untuk apply")
+
+    db = get_read_db()
+    tenant_scope = _tenant_scope_query(current_user)
+    preview_doc = None
+    preview_id = _id_str(data.preview_id)
+    preview_target_count = 0
+    if data.preview_id:
+        preview_doc = await db[YURAN_CHARGE_JOB_COLLECTION].find_one({
+            "_id": _as_object_id_if_valid(data.preview_id),
+            "job_type": YURAN_CHARGE_JOB_TYPE,
+            **tenant_scope,
+        })
+        if not preview_doc:
+            raise HTTPException(status_code=404, detail="preview_id tidak dijumpai")
+        preview_target_count = int((preview_doc.get("target_summary") or {}).get("target_count") or 0)
+
+    payload = _coerce_charge_payload_from_apply(data, preview_doc)
+    run_async = bool(data.run_async) if data.run_async is not None else preview_target_count >= YURAN_CHARGE_ASYNC_THRESHOLD
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    job_doc = {
+        "job_number": generate_payment_reference(prefix="CHAPP"),
+        "job_type": YURAN_CHARGE_JOB_TYPE,
+        "status": "processing",
+        "tahun": payload.get("tahun"),
+        "charge_type": payload.get("charge_type"),
+        "apply_mode": payload.get("apply_mode"),
+        "charge_payload": payload,
+        "target_summary": (preview_doc.get("target_summary") or {}) if preview_doc else {},
+        "result_summary": {},
+        "result_rows": [],
+        "warnings": (preview_doc.get("warnings") or []) if preview_doc else [],
+        "preview_id": preview_id,
+        "applied_job_id": None,
+        "created_by": str(current_user.get("_id")) if current_user.get("_id") is not None else None,
+        "created_by_name": current_user.get("full_name", ""),
+        "created_at": now_iso,
+        "started_at": now_iso,
+        "completed_at": None,
+        "updated_at": now_iso,
+    }
+    if tenant_scope:
+        job_doc.update(tenant_scope)
+    insert_result = await db[YURAN_CHARGE_JOB_COLLECTION].insert_one(job_doc)
+    job_id = _id_str(insert_result.inserted_id)
+    job_lookup_id = insert_result.inserted_id
+
+    if preview_doc:
+        await db[YURAN_CHARGE_JOB_COLLECTION].update_one(
+            {"_id": preview_doc.get("_id"), **tenant_scope},
+            {"$set": {"applied_job_id": job_id, "updated_at": now_iso}},
+        )
+
+    if run_async:
+        user_snapshot = {
+            "_id": current_user.get("_id"),
+            "full_name": current_user.get("full_name", ""),
+            "role": current_user.get("role"),
+            "tenant_id": current_user.get("tenant_id"),
+            "tenant_code": current_user.get("tenant_code"),
+        }
+        _start_yuran_charge_apply_task(
+            job_id=job_id,
+            payload=payload,
+            current_user=user_snapshot,
+            preview_id=preview_id,
+        )
+        queued_job = await db[YURAN_CHARGE_JOB_COLLECTION].find_one({"_id": job_lookup_id})
+        return {
+            "job_id": job_id,
+            "job_number": queued_job.get("job_number") if queued_job else None,
+            "status": "processing",
+            "queued": True,
+            "mode": "background",
+            "message": "Job sedang diproses di latar belakang. Sila semak status pada senarai job.",
+            "target_count_estimate": preview_target_count if preview_target_count > 0 else None,
+            "job": _serialize_charge_job(queued_job or {"_id": job_id, **job_doc}),
+        }
+
+    finalized = await _finalize_yuran_charge_apply_job(
+        db,
+        job_lookup_id=job_lookup_id,
+        job_id=job_id,
+        payload=payload,
+        current_user=current_user,
+        preview_id=preview_id,
+        tenant_scope=tenant_scope,
+    )
+    summary = finalized.get("summary", {})
+    rows = finalized.get("rows", [])
+    final_status = finalized.get("final_status", "completed")
+    applied_job = finalized.get("job")
+    return {
+        "job_id": job_id,
+        "job_number": applied_job.get("job_number") if applied_job else None,
+        "status": final_status,
+        "queued": False,
+        "mode": "sync",
+        "processed_count": int(summary.get("processed_count", 0)),
+        "success_count": int(summary.get("success_count", 0)),
+        "append_count": int(summary.get("append_count", 0)),
+        "new_invoice_count": int(summary.get("new_invoice_count", 0)),
+        "skip_count": int(summary.get("skip_count", 0)),
+        "error_count": int(summary.get("error_count", 0)),
+        "total_delta_amount": round(_safe_float(summary.get("total_delta_amount")), 2),
+        "result_summary": summary,
+        "result_rows": rows[:120],
+        "job": _serialize_charge_job(applied_job or {"_id": job_id, **job_doc}),
+    }
+
+
+@router.get("/charges/jobs")
+async def list_yuran_charge_jobs(
+    status: Optional[str] = Query(None, description="previewed | processing | completed | partial | failed"),
+    tahun: Optional[int] = Query(None),
+    charge_type: Optional[str] = Query(None),
+    created_by: Optional[str] = Query(None),
+    date_from: Optional[str] = Query(None, description="YYYY-MM-DD"),
+    date_to: Optional[str] = Query(None, description="YYYY-MM-DD"),
+    page: int = Query(1, ge=1),
+    limit: int = Query(20, ge=1, le=100),
+    current_user: dict = Depends(get_current_user),
+):
+    _require_yuran_charge_roles(current_user)
+    db = get_read_db()
+    query: Dict[str, Any] = {"job_type": YURAN_CHARGE_JOB_TYPE, **_tenant_scope_query(current_user)}
+
+    if status:
+        normalized_status = str(status).strip().lower()
+        if normalized_status not in YURAN_CHARGE_ALLOWED_STATUSES:
+            raise HTTPException(status_code=400, detail="status tidak sah")
+        query["status"] = normalized_status
+    if tahun is not None:
+        query["tahun"] = int(tahun)
+    if charge_type:
+        query["charge_type"] = str(charge_type).strip().lower()
+    if created_by:
+        query["created_by"] = str(created_by).strip()
+    if date_from or date_to:
+        created_at_query: Dict[str, str] = {}
+        if date_from:
+            created_at_query["$gte"] = f"{_normalize_iso_date(date_from, field_name='date_from')}T00:00:00"
+        if date_to:
+            created_at_query["$lte"] = f"{_normalize_iso_date(date_to, field_name='date_to')}T23:59:59"
+        query["created_at"] = created_at_query
+
+    skip = (page - 1) * limit
+    total = await db[YURAN_CHARGE_JOB_COLLECTION].count_documents(query)
+    rows = await db[YURAN_CHARGE_JOB_COLLECTION].find(query).sort("created_at", -1).skip(skip).limit(limit).to_list(limit)
+    return {
+        "total": total,
+        "page": page,
+        "limit": limit,
+        "total_pages": (total + limit - 1) // limit if limit else 1,
+        "data": [_serialize_charge_job(row) for row in rows],
+    }
+
+
+@router.get("/charges/jobs/{job_id}/export")
+async def export_yuran_charge_job_rows_csv(
+    job_id: str,
+    action: Optional[str] = Query("all", description="all | append | new_invoice | skip | error"),
+    current_user: dict = Depends(get_current_user),
+):
+    _require_yuran_charge_roles(current_user)
+    db = get_read_db()
+    tenant_scope = _tenant_scope_query(current_user)
+    doc = await db[YURAN_CHARGE_JOB_COLLECTION].find_one({
+        "_id": _as_object_id_if_valid(job_id),
+        "job_type": YURAN_CHARGE_JOB_TYPE,
+        **tenant_scope,
+    })
+    if not doc:
+        raise HTTPException(status_code=404, detail="Job tidak dijumpai")
+
+    action_filter = _normalize_charge_export_action(action)
+    filename = _build_charge_export_filename(doc.get("job_number"), job_id, action_filter)
+    export_info = await _resolve_charge_export_row_info(
+        db,
+        doc=doc,
+        job_id=job_id,
+        action_filter=action_filter,
+    )
+    if export_info.get("source") == "row_store":
+        session_factory = _resolve_session_factory(db)
+        headers = {
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "X-Yuran-Export-Row-Count": str(int(export_info.get("row_count", 0))),
+        }
+        return StreamingResponse(
+            _iter_charge_export_csv_bytes(
+                session_factory,
+                job_id=job_id,
+                action_filter=action_filter,
+            ),
+            media_type="text/csv; charset=utf-8",
+            headers=headers,
+        )
+
+    rows = _filter_charge_export_rows(doc.get("result_rows"), action_filter)
+    csv_text = _build_charge_export_csv(rows)
+    headers = {
+        "Content-Disposition": f'attachment; filename="{filename}"',
+        "X-Yuran-Export-Row-Count": str(len(rows)),
+    }
+    return Response(
+        content="\ufeff" + csv_text,
+        media_type="text/csv; charset=utf-8",
+        headers=headers,
+    )
+
+
+@router.get("/charges/jobs/{job_id}/export-meta")
+async def get_yuran_charge_job_export_meta(
+    job_id: str,
+    action: Optional[str] = Query("all", description="all | append | new_invoice | skip | error"),
+    current_user: dict = Depends(get_current_user),
+):
+    _require_yuran_charge_roles(current_user)
+    db = get_read_db()
+    tenant_scope = _tenant_scope_query(current_user)
+    doc = await db[YURAN_CHARGE_JOB_COLLECTION].find_one({
+        "_id": _as_object_id_if_valid(job_id),
+        "job_type": YURAN_CHARGE_JOB_TYPE,
+        **tenant_scope,
+    })
+    if not doc:
+        raise HTTPException(status_code=404, detail="Job tidak dijumpai")
+
+    action_filter = _normalize_charge_export_action(action)
+    export_info = await _resolve_charge_export_row_info(
+        db,
+        doc=doc,
+        job_id=job_id,
+        action_filter=action_filter,
+    )
+    return {
+        "job_id": job_id,
+        "job_number": doc.get("job_number"),
+        "status": doc.get("status"),
+        "action": action_filter,
+        "row_count": int(export_info.get("row_count", 0)),
+        "source": export_info.get("source"),
+        "is_full_export": bool(export_info.get("is_full_export", False)),
+        "expected_row_count": export_info.get("expected_row_count"),
+        "snapshot_row_count": int(export_info.get("snapshot_row_count", 0)),
+    }
+
+
+@router.get("/charges/jobs/{job_id}")
+async def get_yuran_charge_job(
+    job_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    _require_yuran_charge_roles(current_user)
+    db = get_read_db()
+    tenant_scope = _tenant_scope_query(current_user)
+    doc = await db[YURAN_CHARGE_JOB_COLLECTION].find_one({
+        "_id": _as_object_id_if_valid(job_id),
+        "job_type": YURAN_CHARGE_JOB_TYPE,
+        **tenant_scope,
+    })
+    if not doc:
+        raise HTTPException(status_code=404, detail="Job tidak dijumpai")
+    return {"job": _serialize_charge_job(doc)}
+
+
 # ============ STUDENT YURAN ENDPOINTS ============
 
 @router.get("/pelajar")
@@ -1434,9 +3298,10 @@ async def get_student_yuran_list(
     db = get_read_db()
     search_text = str(search or "").strip()
     search_escaped = re.escape(search_text) if search_text else ""
+    tenant_scope = _tenant_scope_query(current_user)
 
     # Fast SQL path in Postgres mode for high-volume list requests.
-    if compact and hasattr(db.student_yuran, "find_admin_page"):
+    if compact and hasattr(db.student_yuran, "find_admin_page") and not tenant_scope:
         records, total = await db.student_yuran.find_admin_page(
             tahun=tahun,
             tingkatan=tingkatan,
@@ -1448,6 +3313,8 @@ async def get_student_yuran_list(
         )
     else:
         query_filters: List[dict] = []
+        if tenant_scope:
+            query_filters.append(tenant_scope)
         if tahun:
             query_filters.append({"tahun": tahun})
         if tingkatan:
@@ -1540,24 +3407,27 @@ async def get_student_yuran_history(
     """Dapatkan sejarah yuran seorang pelajar dari Tingkatan 1-5"""
     # Check permission
     db = get_read_db()
+    tenant_scope = _tenant_scope_query(current_user)
     student_lookup_id = _as_object_id_if_valid(student_id)
     user_role = current_user.get("role")
     if user_role == "parent":
         # Check if student belongs to parent
-        student = await db.students.find_one({"_id": student_lookup_id})
+        student = await db.students.find_one({"_id": student_lookup_id, **tenant_scope})
         if not student or str(student.get("parent_id")) != str(current_user["_id"]):
             raise HTTPException(status_code=403, detail="Akses ditolak")
     elif user_role not in ["superadmin", "admin", "bendahari", "sub_bendahari", "guru_kelas"]:
         raise HTTPException(status_code=403, detail="Akses ditolak")
 
     # Get student info
-    student = await db.students.find_one({"_id": student_lookup_id})
+    student = await db.students.find_one({"_id": student_lookup_id, **tenant_scope})
+    _assert_tenant_doc_access(current_user, student, "rekod pelajar")
     if not student:
         raise HTTPException(status_code=404, detail="Pelajar tidak dijumpai")
 
     # Get all yuran records for this student
     records = await db.student_yuran.find({
-        "student_id": student_lookup_id
+        "student_id": student_lookup_id,
+        **tenant_scope,
     }).sort([("tahun", 1), ("tingkatan", 1)]).to_list(10)
 
     # Calculate totals
@@ -1618,17 +3488,20 @@ async def get_my_children_yuran(
         raise HTTPException(status_code=403, detail="Endpoint untuk ibu bapa sahaja")
 
     db = get_read_db()
+    tenant_scope = _tenant_scope_query(current_user)
     # Get all children
     children = await db.students.find({
         "parent_id": current_user["_id"],
-        "status": "approved"
+        "status": "approved",
+        **tenant_scope,
     }).to_list(20)
 
     result = []
     for child in children:
         # Get yuran for this child
         yuran_records = await db.student_yuran.find({
-            "student_id": child["_id"]
+            "student_id": child["_id"],
+            **tenant_scope,
         }).sort([("tahun", -1), ("tingkatan", -1)]).to_list(10)
 
         # Get child's religion
@@ -1686,12 +3559,13 @@ async def make_payment(
     current_user: dict = Depends(get_current_user)
 ):
     """Buat bayaran yuran (MOCKED)"""
-    mongo_db = get_db()
     core_db = get_read_db()
+    tenant_scope = _tenant_scope_query(current_user)
     student_yuran_lookup_id = _as_object_id_if_valid(student_yuran_id)
 
     # Get student yuran record
-    student_yuran = await core_db.student_yuran.find_one({"_id": student_yuran_lookup_id})
+    student_yuran = await core_db.student_yuran.find_one({"_id": student_yuran_lookup_id, **tenant_scope})
+    _assert_tenant_doc_access(current_user, student_yuran, "rekod yuran")
     if not student_yuran:
         raise HTTPException(status_code=404, detail="Rekod yuran tidak dijumpai")
 
@@ -1783,6 +3657,7 @@ async def make_payment(
         "created_at": now_dt,
         "created_by": current_user.get("_id"),
     }
+    _stamp_tenant_fields(payment_record_doc, current_user, fallback_doc=student_yuran)
     if accounting_result.get("success"):
         payment_record_doc["accounting_tx_number"] = accounting_result.get("transaction_number")
 
@@ -1791,7 +3666,7 @@ async def make_payment(
     # Update student yuran with appended payment record.
     try:
         await core_db.student_yuran.update_one(
-            {"_id": student_yuran_lookup_id},
+            {"_id": student_yuran_lookup_id, **tenant_scope},
             {
                 "$set": {
                     "paid_amount": new_paid,
@@ -1810,7 +3685,7 @@ async def make_payment(
         inserted_payment_id = getattr(payment_insert_result, "inserted_id", None)
         if inserted_payment_id is not None:
             try:
-                await core_db.yuran_payments.delete_one({"_id": inserted_payment_id})
+                await core_db.yuran_payments.delete_one({"_id": inserted_payment_id, **tenant_scope})
             except Exception:
                 pass
         raise
@@ -1820,7 +3695,7 @@ async def make_payment(
     try:
         from services.ar_journal import post_ar_payment
         await post_ar_payment(
-            mongo_db,
+            core_db,
             amount,
             student_yuran_id,
             receipt_number,
@@ -1837,7 +3712,7 @@ async def make_payment(
     try:
         from services.email_service import send_payment_confirmation, RESEND_ENABLED
         if RESEND_ENABLED and student_yuran.get("parent_id"):
-            parent = await core_db.users.find_one({"_id": student_yuran.get("parent_id")})
+            parent = await core_db.users.find_one({"_id": student_yuran.get("parent_id"), **tenant_scope})
             if parent and parent.get("email"):
                 await send_payment_confirmation(
                     parent_email=parent.get("email"),
@@ -1887,11 +3762,13 @@ async def promote_students(
         raise HTTPException(status_code=400, detail="Tahun baru mesti tahun semasa + 1")
 
     db = get_read_db()
+    tenant_scope = _tenant_scope_query(current_user)
 
     # Get all students with year = from_year
     students = await db.students.find({
         "year": data.from_year,
-        "status": "approved"
+        "status": "approved",
+        **tenant_scope,
     }).to_list(2000)
 
     promoted = 0
@@ -1906,7 +3783,7 @@ async def promote_students(
             if current_form >= 5:
                 # Student graduates
                 await db.students.update_one(
-                    {"_id": student["_id"]},
+                    {"_id": student["_id"], **tenant_scope},
                     {"$set": {
                         "status": "graduated",
                         "graduated_year": data.from_year,
@@ -1918,7 +3795,7 @@ async def promote_students(
                 # Promote to next form
                 new_form = current_form + 1
                 await db.students.update_one(
-                    {"_id": student["_id"]},
+                    {"_id": student["_id"], **tenant_scope},
                     {"$set": {
                         "year": data.to_year,
                         "form": new_form,
@@ -1948,7 +3825,8 @@ async def promote_students(
         set_yuran = await db.set_yuran.find_one({
             "tahun": data.to_year,
             "tingkatan": form,
-            "is_active": True
+            "is_active": True,
+            **tenant_scope,
         })
         if not set_yuran:
             auto_assign_summary["missing_set_yuran"].append(form)
@@ -1999,7 +3877,7 @@ async def get_outstanding_report(
         raise HTTPException(status_code=403, detail="Akses ditolak")
 
     db = get_read_db()
-    query = {"status": {"$ne": "paid"}}
+    query = {"status": {"$ne": "paid"}, **_tenant_scope_query(current_user)}
     if tahun:
         query["tahun"] = tahun
     if tingkatan:
@@ -2056,7 +3934,7 @@ async def get_collection_report(
 
     db = get_read_db()
     # Get all yuran for the year
-    query = {"tahun": tahun}
+    query = {"tahun": tahun, **_tenant_scope_query(current_user)}
     records = await db.student_yuran.find(query).to_list(2000)
 
     # Calculate totals
@@ -2120,8 +3998,9 @@ async def get_yuran_statistics(
         raise HTTPException(status_code=403, detail="Akses ditolak")
 
     db = get_read_db()
+    tenant_scope = _tenant_scope_query(current_user)
     # Get all yuran for the year
-    records = await db.student_yuran.find({"tahun": tahun}).to_list(2000)
+    records = await db.student_yuran.find({"tahun": tahun, **tenant_scope}).to_list(2000)
 
     total_expected = sum(r.get("total_amount", 0) for r in records)
     total_collected = sum(r.get("paid_amount", 0) for r in records)
@@ -2131,7 +4010,7 @@ async def get_yuran_statistics(
     pending_students = len([r for r in records if r.get("status") == "pending"])
 
     # Set Yuran count
-    set_yuran_count = await db.set_yuran.count_documents({"tahun": tahun, "is_active": True})
+    set_yuran_count = await db.set_yuran.count_documents({"tahun": tahun, "is_active": True, **tenant_scope})
 
     return {
         "tahun": tahun,
@@ -2179,9 +4058,10 @@ async def send_fee_reminders(
         }
     
     db = get_read_db()
+    tenant_scope = _tenant_scope_query(current_user)
 
     # Get all parents with outstanding fees (aggregation done in Python for CoreStore compatibility).
-    records = await db.student_yuran.find({"status": {"$ne": "paid"}}).to_list(10000)
+    records = await db.student_yuran.find({"status": {"$ne": "paid"}, **tenant_scope}).to_list(10000)
     parents_map: Dict[str, Dict[str, Any]] = {}
     for rec in records:
         parent_id = rec.get("parent_id")
@@ -2215,7 +4095,7 @@ async def send_fee_reminders(
             continue
             
         # Get parent info
-        parent = await db.users.find_one({"_id": _as_object_id_if_valid(parent_id)})
+        parent = await db.users.find_one({"_id": _as_object_id_if_valid(parent_id), **tenant_scope})
         if not parent:
             continue
         
@@ -2247,14 +4127,14 @@ async def send_fee_reminders(
         
         # Get student details
         for student_id, data in records_by_student.items():
-            student = await db.students.find_one({"_id": _as_object_id_if_valid(student_id)})
+            student = await db.students.find_one({"_id": _as_object_id_if_valid(student_id), **tenant_scope})
             if student:
                 data["form"] = student.get("form")
                 data["class_name"] = student.get("class_name", "")
             children_outstanding.append(data)
         
         # Create in-app notification
-        await db.notifications.insert_one({
+        reminder_notification_doc = {
             "user_id": parent_id,
             "title": "Peringatan Tunggakan Yuran",
             "message": f"Anda mempunyai tunggakan yuran berjumlah RM {parent_data['total_outstanding']:.2f}. Sila jelaskan secepat mungkin.",
@@ -2267,7 +4147,10 @@ async def send_fee_reminders(
             },
             "is_read": False,
             "created_at": datetime.now(timezone.utc).isoformat()
-        })
+        }
+        if tenant_scope:
+            reminder_notification_doc.update(tenant_scope)
+        await db.notifications.insert_one(reminder_notification_doc)
         notifications_sent += 1
         
         # Send email if parent has email
@@ -2309,8 +4192,10 @@ async def get_parent_notifications(
         raise HTTPException(status_code=403, detail="Endpoint untuk ibu bapa sahaja")
     
     db = get_read_db()
+    tenant_scope = _tenant_scope_query(current_user)
     notifications = await db.notifications.find({
-        "user_id": current_user["_id"]
+        "user_id": current_user["_id"],
+        **tenant_scope,
     }).sort("created_at", -1).limit(limit).to_list(limit)
     
     # Serialize
@@ -2332,7 +4217,8 @@ async def get_parent_notifications(
     # Count unread
     unread_count = await db.notifications.count_documents({
         "user_id": current_user["_id"],
-        "is_read": False
+        "is_read": False,
+        **tenant_scope,
     })
     
     return {
@@ -2348,8 +4234,9 @@ async def mark_notification_read(
 ):
     """Mark a notification as read"""
     db = get_read_db()
+    tenant_scope = _tenant_scope_query(current_user)
     result = await db.notifications.update_one(
-        {"_id": _as_object_id_if_valid(notification_id), "user_id": current_user["_id"]},
+        {"_id": _as_object_id_if_valid(notification_id), "user_id": current_user["_id"], **tenant_scope},
         {"$set": {"is_read": True, "read_at": datetime.now(timezone.utc).isoformat()}}
     )
     
@@ -2365,14 +4252,15 @@ async def mark_all_notifications_read(
 ):
     """Mark all notifications as read for current user"""
     db = get_read_db()
+    tenant_scope = _tenant_scope_query(current_user)
     unread = await db.notifications.find(
-        {"user_id": current_user["_id"], "is_read": False}
+        {"user_id": current_user["_id"], "is_read": False, **tenant_scope}
     ).to_list(10000)
     updated_count = 0
     now_iso = datetime.now(timezone.utc).isoformat()
     for notif in unread:
         result = await db.notifications.update_one(
-            {"_id": notif.get("_id"), "user_id": current_user["_id"]},
+            {"_id": notif.get("_id"), "user_id": current_user["_id"], **tenant_scope},
             {"$set": {"is_read": True, "read_at": now_iso}},
         )
         updated_count += getattr(result, "modified_count", 0)
@@ -2656,6 +4544,60 @@ async def get_payment_policy_settings(db=None):
     }
 
 
+class InstallmentSettingsUpdate(BaseModel):
+    max_installment_months: int = Field(..., ge=1, le=9, description="Bilangan maksimum ansuran (1-9)")
+
+
+@router.get("/settings/installment")
+async def get_installment_settings(current_user: dict = Depends(get_current_user)):
+    """
+    Backward-compatible endpoint for legacy frontend/tests.
+    Mirrors payment policy setting using `max_installment_months`.
+    """
+    settings = await get_payment_policy_settings(get_read_db())
+    return {
+        "max_installment_months": int(settings.get("max_payments", DEFAULT_MAX_PAYMENTS)),
+        "deadline_month": int(settings.get("deadline_month", DEADLINE_MONTH_TWO_PAYMENTS)),
+    }
+
+
+@router.put("/settings/installment")
+async def update_installment_settings(
+    data: InstallmentSettingsUpdate,
+    current_user: dict = Depends(get_current_user),
+):
+    """
+    Backward-compatible endpoint for legacy frontend/tests.
+    Persists into the same settings key as payment policy.
+    """
+    role = current_user.get("role")
+    if role not in ("bendahari", "sub_bendahari", "superadmin", "admin"):
+        raise HTTPException(status_code=403, detail="Hanya bendahari/admin boleh mengemas kini tetapan ini")
+    db = get_read_db()
+    now = datetime.now(timezone.utc)
+    doc = {
+        "key": SETTINGS_KEY_PAYMENT_POLICY,
+        "max_payments": int(data.max_installment_months),
+        "deadline_month": DEADLINE_MONTH_TWO_PAYMENTS,
+        "updated_at": now.isoformat(),
+        "updated_by": str(current_user["_id"]),
+        "updated_by_name": current_user.get("full_name", ""),
+    }
+    await db.settings.update_one(
+        {"key": SETTINGS_KEY_PAYMENT_POLICY},
+        {"$set": doc},
+        upsert=True
+    )
+    return {
+        "max_installment_months": int(data.max_installment_months),
+        "deadline_month": DEADLINE_MONTH_TWO_PAYMENTS,
+        "description": (
+            "Ibu bapa boleh bayar yuran sebelum bulan 10 setiap tahun "
+            f"(dalam masa 9 bulan) sebanyak maksimum {int(data.max_installment_months)} kali bayaran."
+        ),
+    }
+
+
 @router.get("/settings/payment-policy")
 async def get_payment_policy(current_user: dict = Depends(get_current_user)):
     """Get yuran payment policy - bilangan maksimum bayaran dalam 9 bulan (tetapan bendahari)"""
@@ -2886,20 +4828,25 @@ async def get_payment_options(
         raise HTTPException(status_code=403, detail="Endpoint untuk ibu bapa sahaja")
     
     read_db = get_read_db()
+    tenant_scope = _tenant_scope_query(current_user)
 
     # Get yuran record
-    yuran = await read_db.student_yuran.find_one({"_id": _as_object_id_if_valid(yuran_id)})
+    yuran = await read_db.student_yuran.find_one({"_id": _as_object_id_if_valid(yuran_id), **tenant_scope})
+    _assert_tenant_doc_access(current_user, yuran, "rekod yuran")
     if not yuran:
         raise HTTPException(status_code=404, detail="Rekod yuran tidak dijumpai")
     
     # Verify this yuran belongs to parent's child
-    student = await read_db.students.find_one({"_id": yuran.get("student_id")})
+    student = await read_db.students.find_one({"_id": yuran.get("student_id"), **tenant_scope})
     if not student or str(student.get("parent_id")) != str(current_user["_id"]):
         raise HTTPException(status_code=403, detail="Akses ditolak")
     
     # Get set_yuran for category breakdown
     set_yuran_ref = yuran.get("set_yuran_id")
-    set_yuran = await read_db.set_yuran.find_one({"_id": _as_object_id_if_valid(set_yuran_ref)})
+    set_yuran = await read_db.set_yuran.find_one({
+        "_id": _as_object_id_if_valid(set_yuran_ref),
+        **tenant_scope,
+    })
     policy_settings = await get_payment_policy_settings(read_db)
     max_payments = policy_settings["max_payments"]
     deadline_month = policy_settings["deadline_month"]
@@ -3031,15 +4978,17 @@ async def process_parent_payment(
         raise HTTPException(status_code=403, detail="Endpoint untuk ibu bapa sahaja")
 
     core_db = get_read_db()
+    tenant_scope = _tenant_scope_query(current_user)
     yuran_lookup_id = _as_object_id_if_valid(yuran_id)
 
     # Get yuran record
-    yuran = await core_db.student_yuran.find_one({"_id": yuran_lookup_id})
+    yuran = await core_db.student_yuran.find_one({"_id": yuran_lookup_id, **tenant_scope})
+    _assert_tenant_doc_access(current_user, yuran, "rekod yuran")
     if not yuran:
         raise HTTPException(status_code=404, detail="Rekod yuran tidak dijumpai")
     
     # Verify this yuran belongs to parent's child
-    student = await core_db.students.find_one({"_id": yuran.get("student_id")})
+    student = await core_db.students.find_one({"_id": yuran.get("student_id"), **tenant_scope})
     if not student or str(student.get("parent_id")) != str(current_user["_id"]):
         raise HTTPException(status_code=403, detail="Akses ditolak")
     
@@ -3064,7 +5013,10 @@ async def process_parent_payment(
         raise HTTPException(status_code=400, detail="Anda telah mula bayaran ansuran. Sila selesaikan baki atau bayar mengikut kategori.")
     
     # Get set_yuran for category calculation
-    set_yuran = await core_db.set_yuran.find_one({"_id": _as_object_id_if_valid(yuran.get("set_yuran_id"))})
+    set_yuran = await core_db.set_yuran.find_one({
+        "_id": _as_object_id_if_valid(yuran.get("set_yuran_id")),
+        **tenant_scope,
+    })
     is_muslim = student.get("religion", "").lower() in ["islam", "muslim"]
     
     # Calculate payment amount based on type
@@ -3155,7 +5107,7 @@ async def process_parent_payment(
             new_two_plan["started_at"] = datetime.now(timezone.utc).isoformat()
         
         await core_db.student_yuran.update_one(
-            {"_id": yuran_lookup_id},
+            {"_id": yuran_lookup_id, **tenant_scope},
             {"$set": {"two_payment_plan": new_two_plan}}
         )
     else:
@@ -3189,6 +5141,7 @@ async def process_parent_payment(
         "created_at": now,
         "created_by": current_user["_id"]
     }
+    _stamp_tenant_fields(payment_record, current_user, fallback_doc=yuran)
     
     if data.payment_type == "two_payments":
         payment_record["payment_number"] = next_payment
@@ -3216,7 +5169,7 @@ async def process_parent_payment(
     if items and data.payment_type in ("full", "two_payments"):
         update_fields["items"] = items
     await core_db.student_yuran.update_one(
-        {"_id": yuran_lookup_id},
+        {"_id": yuran_lookup_id, **tenant_scope},
         {
             "$set": update_fields,
             "$push": {
@@ -3241,7 +5194,7 @@ async def process_parent_payment(
     if excess_to_dana > 0:
         # Route excess contributions through migrated tabung collection path.
         await core_db.tabung_donations.insert_one(
-            {
+            _stamp_tenant_fields({
                 "campaign_id": None,
                 "campaign_title": "Dana Kecemerlangan",
                 "campaign_type": "amount",
@@ -3260,7 +5213,7 @@ async def process_parent_payment(
                 "parent_id": current_user["_id"],
                 "reference": receipt_number,
                 "created_at": now,
-            }
+            }, current_user, fallback_doc=yuran)
         )
     
     # Create accounting transaction

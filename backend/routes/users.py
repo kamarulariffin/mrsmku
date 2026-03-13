@@ -4,8 +4,14 @@ Pengurusan Pengguna dengan RBAC
 Extracted from server.py for better code organization
 """
 from datetime import datetime, timezone
-from typing import Optional, List, Callable
+from typing import Any, Optional, List, Callable
+import uuid
 from bson import ObjectId
+from services.id_normalizer import object_id_or_none
+from services.tenant_enforcement import (
+    is_tenant_strict_mode,
+    tenant_scope_query as build_tenant_scope_query,
+)
 import re
 
 from fastapi import APIRouter, HTTPException, Depends, Query
@@ -75,6 +81,41 @@ async def log_audit(user, action, module, details):
     """Wrapper for audit logging"""
     if _log_audit_func and user:
         await _log_audit_func(user, action, module, details)
+
+
+def _id_value(value: Any) -> Any:
+    """Normalize ID-like inputs while supporting non-ObjectId IDs."""
+    if value is None:
+        return None
+    if isinstance(value, ObjectId):
+        return value
+    text = str(value).strip()
+    try:
+        if ObjectId.is_valid(text):
+            return object_id_or_none(text)
+    except Exception:
+        pass
+    return text
+
+
+def _tenant_scope_query(current_user: dict) -> dict:
+    """Return tenant scope filter for non-superadmin users."""
+    return build_tenant_scope_query(
+        current_user,
+        detail="Tenant context diperlukan untuk pengurusan pengguna.",
+    )
+
+
+def _enforce_same_tenant(current_user: dict, target_user: dict) -> None:
+    if current_user.get("role") == "superadmin":
+        return
+    current_tenant_id = str(current_user.get("tenant_id") or "").strip()
+    target_tenant_id = str(target_user.get("tenant_id") or "").strip()
+    if current_tenant_id and target_tenant_id and current_tenant_id == target_tenant_id:
+        return
+    if not current_tenant_id and not target_tenant_id and not is_tenant_strict_mode():
+        return
+    raise HTTPException(status_code=403, detail="Akses tenant tidak dibenarkan")
 
 
 # ============ VALIDATION HELPERS ============
@@ -254,12 +295,13 @@ async def get_all_users(
     curr_role = current_user.get("role")
     if curr_role not in ["superadmin", "admin", "bus_admin"]:
         raise HTTPException(status_code=403, detail="Akses ditolak untuk role ini")
+    tenant_scope = _tenant_scope_query(current_user)
     if curr_role == "bus_admin":
         if role and role != "bus_driver":
             raise HTTPException(status_code=403, detail="Admin Bas hanya boleh lihat senarai Driver Bas")
-        query = {"role": "bus_driver"}
+        query = {**tenant_scope, "role": "bus_driver"}
     else:
-        query = {}
+        query = dict(tenant_scope)
     if role and curr_role != "bus_admin":
         query["role"] = role
     if is_active is not None:
@@ -331,6 +373,9 @@ async def create_user(
     if existing:
         raise HTTPException(status_code=400, detail="Email sudah didaftarkan")
     
+    tenant_id = str(current_user.get("tenant_id") or "").strip()
+    tenant_code = str(current_user.get("tenant_code") or "").strip()
+
     user_doc = {
         "email": user_data.email,
         "password": _pwd_context.hash(user_data.password),
@@ -349,6 +394,9 @@ async def create_user(
         "created_by": str(current_user["_id"]),
         "created_at": datetime.now(timezone.utc).isoformat()
     }
+    if tenant_id:
+        user_doc["tenant_id"] = tenant_id
+        user_doc["tenant_code"] = tenant_code or None
     result = await db.users.insert_one(user_doc)
     user_doc["_id"] = result.inserted_id
     
@@ -365,6 +413,26 @@ async def create_user(
         }}
     )
     user_doc["qr_code"] = qr_code
+
+    if tenant_id:
+        await db.tenant_user_memberships.update_one(
+            {"tenant_id": tenant_id, "user_id": str(result.inserted_id)},
+            {"$set": {
+                "tenant_id": tenant_id,
+                "tenant_code": tenant_code,
+                "user_id": str(result.inserted_id),
+                "email": user_data.email,
+                "role": user_data.role,
+                "status": "active",
+                "is_primary": True,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            },
+             "$setOnInsert": {
+                 "_id": uuid.uuid4().hex,
+                 "created_at": datetime.now(timezone.utc).isoformat(),
+             }},
+            upsert=True,
+        )
     
     await log_audit(current_user, "CREATE_USER", "users", f"Cipta user baru: {user_data.email} ({user_data.role})")
     
@@ -385,9 +453,10 @@ async def update_user(
     if curr_role not in ["superadmin", "admin", "bus_admin"]:
         raise HTTPException(status_code=403, detail="Akses ditolak untuk role ini")
     
-    user = await db.users.find_one({"_id": ObjectId(user_id)})
+    user = await db.users.find_one({"_id": _id_value(user_id)})
     if not user:
         raise HTTPException(status_code=404, detail="Pengguna tidak dijumpai")
+    _enforce_same_tenant(current_user, user)
     
     # Only superadmin can edit admin/superadmin
     if user["role"] in ["superadmin", "admin"] and curr_role != "superadmin":
@@ -404,7 +473,7 @@ async def update_user(
             unset_data["assigned_bus_id"] = 1
         else:
             try:
-                update_data["assigned_bus_id"] = ObjectId(val)
+                update_data["assigned_bus_id"] = _id_value(val)
             except Exception:
                 pass
     else:
@@ -415,17 +484,17 @@ async def update_user(
                 unset_data["assigned_bus_id"] = 1
             else:
                 try:
-                    update_data["assigned_bus_id"] = ObjectId(val)
+                    update_data["assigned_bus_id"] = _id_value(val)
                 except Exception:
                     pass
     if update_data:
-        await db.users.update_one({"_id": ObjectId(user_id)}, {"$set": update_data})
+        await db.users.update_one({"_id": _id_value(user_id)}, {"$set": update_data})
     if unset_data:
-        await db.users.update_one({"_id": ObjectId(user_id)}, {"$unset": unset_data})
+        await db.users.update_one({"_id": _id_value(user_id)}, {"$unset": unset_data})
     
     await log_audit(current_user, "UPDATE_USER", "users", f"Kemaskini user: {user['email']}")
     
-    updated_user = await db.users.find_one({"_id": ObjectId(user_id)})
+    updated_user = await db.users.find_one({"_id": _id_value(user_id)})
     return _serialize_user_func(updated_user)
 
 
@@ -441,14 +510,15 @@ async def delete_user(
     if current_user.get("role") != "superadmin":
         raise HTTPException(status_code=403, detail="Akses ditolak untuk role ini")
     
-    user = await db.users.find_one({"_id": ObjectId(user_id)})
+    user = await db.users.find_one({"_id": _id_value(user_id)})
     if not user:
         raise HTTPException(status_code=404, detail="Pengguna tidak dijumpai")
+    _enforce_same_tenant(current_user, user)
     
     if str(user["_id"]) == str(current_user["_id"]):
         raise HTTPException(status_code=400, detail="Tidak boleh padam akaun sendiri")
     
-    await db.users.delete_one({"_id": ObjectId(user_id)})
+    await db.users.delete_one({"_id": _id_value(user_id)})
     await log_audit(current_user, "DELETE_USER", "users", f"Padam user: {user['email']}")
     
     return {"message": "Pengguna dipadam"}
@@ -466,12 +536,13 @@ async def toggle_user_active(
     if current_user.get("role") not in ["superadmin", "admin"]:
         raise HTTPException(status_code=403, detail="Akses ditolak untuk role ini")
     
-    user = await db.users.find_one({"_id": ObjectId(user_id)})
+    user = await db.users.find_one({"_id": _id_value(user_id)})
     if not user:
         raise HTTPException(status_code=404, detail="Pengguna tidak dijumpai")
+    _enforce_same_tenant(current_user, user)
     
     new_status = not user.get("is_active", True)
-    await db.users.update_one({"_id": ObjectId(user_id)}, {"$set": {"is_active": new_status}})
+    await db.users.update_one({"_id": _id_value(user_id)}, {"$set": {"is_active": new_status}})
     
     await log_audit(current_user, "TOGGLE_USER", "users", f"{'Aktifkan' if new_status else 'Nyahaktif'} user: {user['email']}")
     return {"message": f"User {'diaktifkan' if new_status else 'dinyahaktifkan'}", "is_active": new_status}
@@ -498,12 +569,13 @@ async def set_user_password(
     db = get_db()
     if current_user.get("role") not in ["superadmin", "admin"]:
         raise HTTPException(status_code=403, detail="Akses ditolak untuk role ini")
-    user = await db.users.find_one({"_id": ObjectId(user_id)})
+    user = await db.users.find_one({"_id": _id_value(user_id)})
     if not user:
         raise HTTPException(status_code=404, detail="Pengguna tidak dijumpai")
+    _enforce_same_tenant(current_user, user)
     hashed = _pwd_context.hash(body.new_password)
     await db.users.update_one(
-        {"_id": ObjectId(user_id)},
+        {"_id": _id_value(user_id)},
         {"$set": {"password": hashed, "must_change_password": True}}
     )
     await log_audit(

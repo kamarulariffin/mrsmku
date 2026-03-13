@@ -87,6 +87,10 @@ class StudentYuranRecord(Base):
     balance: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending")
     due_date: Mapped[str] = mapped_column(String(32), nullable=True)
+    billing_pack_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    billing_pack_mode: Mapped[str] = mapped_column(String(16), nullable=False, default="single")
+    billing_packs: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
+    charge_context: Mapped[dict] = mapped_column(JSON, nullable=True)
     installment_plan: Mapped[dict] = mapped_column(JSON, nullable=True)
     two_payment_plan: Mapped[dict] = mapped_column(JSON, nullable=True)
     last_payment_date: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -103,6 +107,8 @@ class StudentYuranRecord(Base):
         Index("ix_student_yuran_records_tahun", "tahun"),
         Index("ix_student_yuran_records_tingkatan", "tingkatan"),
         Index("ix_student_yuran_records_status", "status"),
+        Index("ix_student_yuran_records_pack_enabled", "billing_pack_enabled"),
+        Index("ix_student_yuran_records_pack_mode", "billing_pack_mode"),
         Index("ix_student_yuran_records_tahun_tingkatan", "tahun", "tingkatan"),
         Index("ix_student_yuran_records_created_at", "created_at"),
     )

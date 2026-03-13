@@ -8,7 +8,7 @@ from bson import ObjectId
 from sqlalchemy import String, and_, cast, delete, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from models_sql import SetYuranRecord, StudentYuranRecord, YuranPaymentRecord
+from models_sql import SetYuranRecord, StudentYuranRecord, YuranChargeJobRecord, YuranPaymentRecord
 from models_sql.core_documents import CoreDocument
 from repositories.core_store import (
     CoreStore,
@@ -342,10 +342,38 @@ _STUDENT_YURAN_KNOWN_FIELDS = {
     "balance",
     "status",
     "due_date",
+    "billing_pack_enabled",
+    "billing_pack_mode",
+    "billing_packs",
+    "charge_context",
     "installment_plan",
     "two_payment_plan",
     "last_payment_date",
     "created_at",
+    "updated_at",
+}
+
+
+_YURAN_CHARGE_JOBS_KNOWN_FIELDS = {
+    "_id",
+    "job_number",
+    "job_type",
+    "status",
+    "tahun",
+    "charge_type",
+    "apply_mode",
+    "charge_payload",
+    "target_summary",
+    "result_summary",
+    "result_rows",
+    "warnings",
+    "preview_id",
+    "applied_job_id",
+    "created_by",
+    "created_by_name",
+    "created_at",
+    "started_at",
+    "completed_at",
     "updated_at",
 }
 
@@ -434,6 +462,16 @@ def _student_yuran_doc_to_row_values(normalized_doc: Dict[str, Any]) -> Dict[str
     total_amount = float(normalized_doc.get("total_amount") or 0.0)
     paid_amount = float(normalized_doc.get("paid_amount") or 0.0)
     fallback_balance = total_amount - paid_amount
+    billing_pack_enabled = bool(normalized_doc.get("billing_pack_enabled", False))
+    billing_pack_mode = str(normalized_doc.get("billing_pack_mode") or "single").strip().lower()
+    if billing_pack_mode not in {"single", "hybrid"}:
+        billing_pack_mode = "hybrid" if billing_pack_enabled else "single"
+    billing_packs = normalized_doc.get("billing_packs")
+    if not isinstance(billing_packs, list):
+        billing_packs = []
+    charge_context = normalized_doc.get("charge_context")
+    if charge_context is not None and not isinstance(charge_context, dict):
+        charge_context = {"value": charge_context}
 
     return {
         "id": doc_id,
@@ -453,11 +491,57 @@ def _student_yuran_doc_to_row_values(normalized_doc: Dict[str, Any]) -> Dict[str
         "balance": float(normalized_doc.get("balance")) if normalized_doc.get("balance") is not None else fallback_balance,
         "status": normalized_doc.get("status") or "pending",
         "due_date": normalized_doc.get("due_date"),
+        "billing_pack_enabled": billing_pack_enabled,
+        "billing_pack_mode": billing_pack_mode,
+        "billing_packs": billing_packs,
+        "charge_context": charge_context,
         "installment_plan": normalized_doc.get("installment_plan"),
         "two_payment_plan": normalized_doc.get("two_payment_plan"),
         "last_payment_date": _as_datetime(normalized_doc.get("last_payment_date")),
         "created_at": _as_datetime(normalized_doc.get("created_at"), default_now=True),
         "updated_at": _as_datetime(normalized_doc.get("updated_at")),
+        "extra_data": extra_data,
+    }
+
+
+def _yuran_charge_job_doc_to_row_values(normalized_doc: Dict[str, Any]) -> Dict[str, Any]:
+    extra_data = {k: v for k, v in normalized_doc.items() if k not in _YURAN_CHARGE_JOBS_KNOWN_FIELDS}
+    raw_id = normalized_doc.get("_id")
+    doc_id = str(raw_id) if raw_id is not None else str(ObjectId())
+
+    return {
+        "id": doc_id,
+        "job_number": normalized_doc.get("job_number"),
+        "job_type": normalized_doc.get("job_type") or "yuran_charge_bulk",
+        "status": normalized_doc.get("status") or "previewed",
+        "tahun": int(normalized_doc["tahun"]) if normalized_doc.get("tahun") is not None else None,
+        "charge_type": normalized_doc.get("charge_type"),
+        "apply_mode": normalized_doc.get("apply_mode"),
+        "charge_payload": normalized_doc.get("charge_payload") or {},
+        "target_summary": normalized_doc.get("target_summary") or {},
+        "result_summary": normalized_doc.get("result_summary") or {},
+        "result_rows": normalized_doc.get("result_rows") or [],
+        "warnings": normalized_doc.get("warnings") or [],
+        "preview_id": (
+            str(normalized_doc.get("preview_id"))
+            if normalized_doc.get("preview_id") is not None
+            else None
+        ),
+        "applied_job_id": (
+            str(normalized_doc.get("applied_job_id"))
+            if normalized_doc.get("applied_job_id") is not None
+            else None
+        ),
+        "created_by": (
+            str(normalized_doc.get("created_by"))
+            if normalized_doc.get("created_by") is not None
+            else None
+        ),
+        "created_by_name": normalized_doc.get("created_by_name"),
+        "created_at": normalized_doc.get("created_at"),
+        "started_at": normalized_doc.get("started_at"),
+        "completed_at": normalized_doc.get("completed_at"),
+        "updated_at": normalized_doc.get("updated_at"),
         "extra_data": extra_data,
     }
 
@@ -918,6 +1002,8 @@ class RelationalStudentYuranCollection(_BaseSqlCollection):
         "balance": (StudentYuranRecord.balance, "float"),
         "status": (StudentYuranRecord.status, "str"),
         "due_date": (StudentYuranRecord.due_date, "str"),
+        "billing_pack_enabled": (StudentYuranRecord.billing_pack_enabled, "bool"),
+        "billing_pack_mode": (StudentYuranRecord.billing_pack_mode, "str"),
         "billing_mode": (_billing_mode_sql_expr(), "str"),
         "created_at": (StudentYuranRecord.created_at, "datetime"),
         "updated_at": (StudentYuranRecord.updated_at, "datetime"),
@@ -949,8 +1035,13 @@ class RelationalStudentYuranCollection(_BaseSqlCollection):
         doc["paid_amount"] = row.paid_amount
         doc["balance"] = row.balance
         doc["status"] = row.status
+        doc["billing_pack_enabled"] = bool(row.billing_pack_enabled)
+        doc["billing_pack_mode"] = row.billing_pack_mode or ("hybrid" if row.billing_pack_enabled else "single")
+        doc["billing_packs"] = row.billing_packs or []
         if row.due_date is not None:
             doc["due_date"] = row.due_date
+        if row.charge_context is not None:
+            doc["charge_context"] = row.charge_context
         if row.installment_plan is not None:
             doc["installment_plan"] = row.installment_plan
         if row.two_payment_plan is not None:
@@ -1241,12 +1332,220 @@ class RelationalStudentYuranCollection(_BaseSqlCollection):
         return DeleteResult(deleted_count=1)
 
 
+class RelationalYuranChargeJobsCollection(_BaseSqlCollection):
+    _KNOWN_FIELDS = _YURAN_CHARGE_JOBS_KNOWN_FIELDS
+    _QUERY_FIELD_MAP: Dict[str, Tuple[Any, str]] = {
+        "_id": (YuranChargeJobRecord.id, "id"),
+        "job_number": (YuranChargeJobRecord.job_number, "str"),
+        "job_type": (YuranChargeJobRecord.job_type, "str"),
+        "status": (YuranChargeJobRecord.status, "str"),
+        "tahun": (YuranChargeJobRecord.tahun, "int"),
+        "charge_type": (YuranChargeJobRecord.charge_type, "str"),
+        "apply_mode": (YuranChargeJobRecord.apply_mode, "str"),
+        "preview_id": (YuranChargeJobRecord.preview_id, "id"),
+        "applied_job_id": (YuranChargeJobRecord.applied_job_id, "id"),
+        "created_by": (YuranChargeJobRecord.created_by, "id"),
+        "created_at": (YuranChargeJobRecord.created_at, "str"),
+        "updated_at": (YuranChargeJobRecord.updated_at, "str"),
+    }
+
+    def __init__(self, core_store: CoreStore):
+        session_factory = core_store.get_session_factory()
+        if session_factory is None:
+            raise ValueError("RelationalYuranChargeJobsCollection requires PostgreSQL session factory")
+        super().__init__(session_factory)
+        self._mirror_collection = core_store.yuran_charge_jobs
+
+    def _row_to_doc(self, row: YuranChargeJobRecord) -> Dict[str, Any]:
+        doc: Dict[str, Any] = dict(row.extra_data or {})
+        doc["_id"] = _restore_id(row.id)
+        if row.job_number is not None:
+            doc["job_number"] = row.job_number
+        doc["job_type"] = row.job_type
+        doc["status"] = row.status
+        if row.tahun is not None:
+            doc["tahun"] = row.tahun
+        if row.charge_type is not None:
+            doc["charge_type"] = row.charge_type
+        if row.apply_mode is not None:
+            doc["apply_mode"] = row.apply_mode
+        doc["charge_payload"] = row.charge_payload or {}
+        doc["target_summary"] = row.target_summary or {}
+        doc["result_summary"] = row.result_summary or {}
+        doc["result_rows"] = row.result_rows or []
+        doc["warnings"] = row.warnings or []
+        if row.preview_id is not None:
+            doc["preview_id"] = _restore_id(row.preview_id)
+        if row.applied_job_id is not None:
+            doc["applied_job_id"] = _restore_id(row.applied_job_id)
+        if row.created_by is not None:
+            doc["created_by"] = _restore_id(row.created_by)
+        if row.created_by_name is not None:
+            doc["created_by_name"] = row.created_by_name
+        if row.created_at is not None:
+            doc["created_at"] = row.created_at
+        if row.started_at is not None:
+            doc["started_at"] = row.started_at
+        if row.completed_at is not None:
+            doc["completed_at"] = row.completed_at
+        if row.updated_at is not None:
+            doc["updated_at"] = row.updated_at
+        return doc
+
+    def _doc_to_row_values(self, normalized_doc: Dict[str, Any]) -> Dict[str, Any]:
+        return _yuran_charge_job_doc_to_row_values(normalized_doc)
+
+    async def _find_rows(self) -> List[YuranChargeJobRecord]:
+        async with self._session_factory() as session:
+            rows = await session.scalars(select(YuranChargeJobRecord))
+            return list(rows.all())
+
+    async def _find_docs(self, query: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        supported, condition = _compile_query_clause(query, self._QUERY_FIELD_MAP)
+        if supported:
+            stmt = select(YuranChargeJobRecord)
+            if condition is not None:
+                stmt = stmt.where(condition)
+            async with self._session_factory() as session:
+                rows = await session.scalars(stmt)
+                return [self._row_to_doc(row) for row in rows.all()]
+
+        rows = await self._find_rows()
+        docs: List[Dict[str, Any]] = []
+        for row in rows:
+            doc = self._row_to_doc(row)
+            if _matches_query(doc, query):
+                docs.append(doc)
+        return docs
+
+    async def find_one(
+        self,
+        query: Optional[Dict[str, Any]] = None,
+        projection: Optional[Dict[str, Any]] = None,
+        sort: Optional[List[Tuple[str, int]]] = None,
+    ):
+        supported, condition = _compile_query_clause(query, self._QUERY_FIELD_MAP)
+        sort_columns = _compile_sort_columns(sort, self._QUERY_FIELD_MAP)
+        if supported and sort_columns is not None:
+            stmt = select(YuranChargeJobRecord)
+            if condition is not None:
+                stmt = stmt.where(condition)
+            if sort_columns:
+                stmt = stmt.order_by(*sort_columns)
+            stmt = stmt.limit(1)
+            async with self._session_factory() as session:
+                row = await session.scalar(stmt)
+            if row is None:
+                return None
+            return _apply_projection(self._row_to_doc(row), projection)
+        return await super().find_one(query=query, projection=projection, sort=sort)
+
+    async def count_documents(self, query: Optional[Dict[str, Any]] = None) -> int:
+        supported, condition = _compile_query_clause(query, self._QUERY_FIELD_MAP)
+        if supported:
+            stmt = select(func.count()).select_from(YuranChargeJobRecord)
+            if condition is not None:
+                stmt = stmt.where(condition)
+            async with self._session_factory() as session:
+                return int((await session.scalar(stmt)) or 0)
+        return await super().count_documents(query)
+
+    async def _mirror_upsert(self, doc: Dict[str, Any]) -> None:
+        if self._mirror_collection is None:
+            return
+        mirror_query = {"_id": _restore_id(str(doc.get("_id")))}
+        mirror_payload = dict(doc)
+        mirror_payload.pop("_id", None)
+        try:
+            await self._mirror_collection.update_one(mirror_query, {"$set": mirror_payload}, upsert=True)
+        except Exception as exc:
+            logger.warning("yuran_charge_jobs mirror upsert failed: %s", exc)
+
+    async def _mirror_delete(self, doc_id: str) -> None:
+        if self._mirror_collection is None:
+            return
+        try:
+            await self._mirror_collection.delete_one({"_id": _restore_id(doc_id)})
+        except Exception as exc:
+            logger.warning("yuran_charge_jobs mirror delete failed: %s", exc)
+
+    async def insert_one(self, doc: Dict[str, Any]) -> InsertOneResult:
+        raw_doc = dict(doc)
+        raw_id = raw_doc.get("_id")
+        doc_id = str(raw_id) if raw_id is not None else str(ObjectId())
+        raw_doc["_id"] = doc_id
+        normalized = _normalize_for_storage(raw_doc)
+        row_values = self._doc_to_row_values(normalized)
+
+        async with self._session_factory() as session:
+            exists = await session.get(YuranChargeJobRecord, doc_id)
+            if exists is not None:
+                raise ValueError(f"Duplicate key for yuran_charge_jobs._id={doc_id}")
+            session.add(YuranChargeJobRecord(**row_values))
+            await session.commit()
+
+        await self._mirror_upsert(normalized)
+        return InsertOneResult(inserted_id=_restore_id(doc_id))
+
+    async def update_one(self, query: Dict[str, Any], update: Dict[str, Any], upsert: bool = False) -> UpdateResult:
+        target_doc = await self.find_one(query)
+        if not target_doc:
+            if not upsert:
+                return UpdateResult(matched_count=0, modified_count=0, upserted_id=None)
+            base_doc = {}
+            for k, v in (query or {}).items():
+                if not k.startswith("$") and not isinstance(v, dict):
+                    base_doc[k] = v
+            new_doc = _apply_update_ops(base_doc, update)
+            raw_id = new_doc.get("_id")
+            doc_id = str(raw_id) if raw_id is not None else str(ObjectId())
+            new_doc["_id"] = doc_id
+            normalized = _normalize_for_storage(new_doc)
+            row_values = self._doc_to_row_values(normalized)
+            async with self._session_factory() as session:
+                session.add(YuranChargeJobRecord(**row_values))
+                await session.commit()
+            await self._mirror_upsert(normalized)
+            return UpdateResult(matched_count=0, modified_count=1, upserted_id=_restore_id(doc_id))
+
+        updated_doc = _apply_update_ops(target_doc, update)
+        normalized = _normalize_for_storage(updated_doc)
+        row_values = self._doc_to_row_values(normalized)
+        doc_id = row_values["id"]
+
+        async with self._session_factory() as session:
+            row = await session.get(YuranChargeJobRecord, doc_id)
+            if row is None:
+                session.add(YuranChargeJobRecord(**row_values))
+            else:
+                for key, value in row_values.items():
+                    setattr(row, key, value)
+            await session.commit()
+
+        await self._mirror_upsert(normalized)
+        return UpdateResult(matched_count=1, modified_count=1, upserted_id=None)
+
+    async def delete_one(self, query: Dict[str, Any]) -> DeleteResult:
+        target_doc = await self.find_one(query)
+        if not target_doc:
+            return DeleteResult(deleted_count=0)
+        target_id = str(target_doc.get("_id"))
+
+        async with self._session_factory() as session:
+            await session.execute(delete(YuranChargeJobRecord).where(YuranChargeJobRecord.id == target_id))
+            await session.commit()
+
+        await self._mirror_delete(target_id)
+        return DeleteResult(deleted_count=1)
+
+
 class YuranRelationalDbAdapter:
     """
     Adapter for yuran routes:
     - set_yuran -> relational table (with compatibility mirror)
     - yuran_payments -> relational table (with compatibility mirror)
     - student_yuran -> relational table (with compatibility mirror)
+    - yuran_charge_jobs -> relational table (with compatibility mirror)
     - other collections -> delegated to original CoreStore/Mongo DB object
     """
 
@@ -1255,6 +1554,7 @@ class YuranRelationalDbAdapter:
         self._set_yuran_collection = None
         self._yuran_payments_collection = None
         self._student_yuran_collection = None
+        self._yuran_charge_jobs_collection = None
         if isinstance(db, CoreStore):
             session_factory = db.get_session_factory()
             if session_factory is not None and db.uses_postgres("set_yuran"):
@@ -1263,6 +1563,8 @@ class YuranRelationalDbAdapter:
                 self._yuran_payments_collection = RelationalYuranPaymentsCollection(db)
             if session_factory is not None and db.uses_postgres("student_yuran"):
                 self._student_yuran_collection = RelationalStudentYuranCollection(db)
+            if session_factory is not None and db.uses_postgres("yuran_charge_jobs"):
+                self._yuran_charge_jobs_collection = RelationalYuranChargeJobsCollection(db)
 
     def __getattr__(self, name: str):
         if name == "set_yuran" and self._set_yuran_collection is not None:
@@ -1271,6 +1573,8 @@ class YuranRelationalDbAdapter:
             return self._yuran_payments_collection
         if name == "student_yuran" and self._student_yuran_collection is not None:
             return self._student_yuran_collection
+        if name == "yuran_charge_jobs" and self._yuran_charge_jobs_collection is not None:
+            return self._yuran_charge_jobs_collection
         return getattr(self._db, name)
 
     def __getitem__(self, name: str):
@@ -1302,6 +1606,7 @@ async def bootstrap_relational_yuran_tables(
         set_count = await session.scalar(select(func.count()).select_from(SetYuranRecord))
         payment_count = await session.scalar(select(func.count()).select_from(YuranPaymentRecord))
         student_yuran_count = await session.scalar(select(func.count()).select_from(StudentYuranRecord))
+        charge_jobs_count = await session.scalar(select(func.count()).select_from(YuranChargeJobRecord))
 
         if (set_count or 0) == 0:
             set_rows = await session.scalars(
@@ -1338,5 +1643,17 @@ async def bootstrap_relational_yuran_tables(
                 row_values = _student_yuran_doc_to_row_values(normalized)
                 if await session.get(StudentYuranRecord, row_values["id"]) is None:
                     session.add(StudentYuranRecord(**row_values))
+
+        if (charge_jobs_count or 0) == 0:
+            charge_job_rows = await session.scalars(
+                select(CoreDocument).where(CoreDocument.collection_name == "yuran_charge_jobs")
+            )
+            for row in charge_job_rows.all():
+                doc = dict(row.document or {})
+                doc["_id"] = row.document_id
+                normalized = _normalize_for_storage(doc)
+                row_values = _yuran_charge_job_doc_to_row_values(normalized)
+                if await session.get(YuranChargeJobRecord, row_values["id"]) is None:
+                    session.add(YuranChargeJobRecord(**row_values))
 
         await session.commit()

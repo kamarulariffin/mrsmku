@@ -1,0 +1,692 @@
+{
+  "mode": "dry-run",
+  "collections_processed": 60,
+  "collections_skipped": [],
+  "totals": {
+    "records": 4714,
+    "already_valid": 4712,
+    "invalid_existing": 0,
+    "unresolved": 0,
+    "updates_planned": 2,
+    "updates_applied": 0
+  },
+  "collections": {
+    "tenant_user_memberships": {
+      "total": 35,
+      "already_valid": 35,
+      "invalid_existing": 0,
+      "unresolved": 0,
+      "updates_planned": 0,
+      "updates_applied": 0,
+      "source_counts": {},
+      "sample_unresolved_ids": [],
+      "sample_updated_ids": []
+    },
+    "tenant_module_settings": {
+      "total": 0,
+      "already_valid": 0,
+      "invalid_existing": 0,
+      "unresolved": 0,
+      "updates_planned": 0,
+      "updates_applied": 0,
+      "source_counts": {},
+      "sample_unresolved_ids": [],
+      "sample_updated_ids": []
+    },
+    "users": {
+      "total": 32,
+      "already_valid": 32,
+      "invalid_existing": 0,
+      "unresolved": 0,
+      "updates_planned": 0,
+      "updates_applied": 0,
+      "source_counts": {},
+      "sample_unresolved_ids": [],
+      "sample_updated_ids": []
+    },
+    "students": {
+      "total": 15,
+      "already_valid": 15,
+      "invalid_existing": 0,
+      "unresolved": 0,
+      "updates_planned": 0,
+      "updates_applied": 0,
+      "source_counts": {},
+      "sample_unresolved_ids": [],
+      "sample_updated_ids": []
+    },
+    "settings": {
+      "total": 13,
+      "already_valid": 13,
+      "invalid_existing": 0,
+      "unresolved": 0,
+      "updates_planned": 0,
+      "updates_applied": 0,
+      "source_counts": {},
+      "sample_unresolved_ids": [],
+      "sample_updated_ids": []
+    },
+    "rbac_config": {
+      "total": 14,
+      "already_valid": 14,
+      "invalid_existing": 0,
+      "unresolved": 0,
+      "updates_planned": 0,
+      "updates_applied": 0,
+      "source_counts": {},
+      "sample_unresolved_ids": [],
+      "sample_updated_ids": []
+    },
+    "set_yuran": {
+      "total": 15,
+      "already_valid": 15,
+      "invalid_existing": 0,
+      "unresolved": 0,
+      "updates_planned": 0,
+      "updates_applied": 0,
+      "source_counts": {},
+      "sample_unresolved_ids": [],
+      "sample_updated_ids": []
+    },
+    "student_yuran": {
+      "total": 11,
+      "already_valid": 11,
+      "invalid_existing": 0,
+      "unresolved": 0,
+      "updates_planned": 0,
+      "updates_applied": 0,
+      "source_counts": {},
+      "sample_unresolved_ids": [],
+      "sample_updated_ids": []
+    },
+    "payments": {
+      "total": 0,
+      "already_valid": 0,
+      "invalid_existing": 0,
+      "unresolved": 0,
+      "updates_planned": 0,
+      "updates_applied": 0,
+      "source_counts": {},
+      "sample_unresolved_ids": [],
+      "sample_updated_ids": []
+    },
+    "yuran_payments": {
+      "total": 1,
+      "already_valid": 1,
+      "invalid_existing": 0,
+      "unresolved": 0,
+      "updates_planned": 0,
+      "updates_applied": 0,
+      "source_counts": {},
+      "sample_unresolved_ids": [],
+      "sample_updated_ids": []
+    },
+    "payment_center_cart": {
+      "total": 2,
+      "already_valid": 2,
+      "invalid_existing": 0,
+      "unresolved": 0,
+      "updates_planned": 0,
+      "updates_applied": 0,
+      "source_counts": {},
+      "sample_unresolved_ids": [],
+      "sample_updated_ids": []
+    },
+    "payment_receipts": {
+      "total": 7,
+      "already_valid": 7,
+      "invalid_existing": 0,
+      "unresolved": 0,
+      "updates_planned": 0,
+      "updates_applied": 0,
+      "source_counts": {},
+      "sample_unresolved_ids": [],
+      "sample_updated_ids": []
+    },
+    "ar_print_jobs": {
+      "total": 1,
+      "already_valid": 1,
+      "invalid_existing": 0,
+      "unresolved": 0,
+      "updates_planned": 0,
+      "updates_applied": 0,
+      "source_counts": {},
+      "sample_unresolved_ids": [],
+      "sample_updated_ids": []
+    },
+    "ar_notification_report_log": {
+      "total": 1,
+      "already_valid": 1,
+      "invalid_existing": 0,
+      "unresolved": 0,
+      "updates_planned": 0,
+      "updates_applied": 0,
+      "source_counts": {},
+      "sample_unresolved_ids": [],
+      "sample_updated_ids": []
+    },
+    "accounting_transactions": {
+      "total": 81,
+      "already_valid": 81,
+      "invalid_existing": 0,
+      "unresolved": 0,
+      "updates_planned": 0,
+      "updates_applied": 0,
+      "source_counts": {},
+      "sample_unresolved_ids": [],
+      "sample_updated_ids": []
+    },
+    "accounting_categories": {
+      "total": 17,
+      "already_valid": 17,
+      "invalid_existing": 0,
+      "unresolved": 0,
+      "updates_planned": 0,
+      "updates_applied": 0,
+      "source_counts": {},
+      "sample_unresolved_ids": [],
+      "sample_updated_ids": []
+    },
+    "bank_accounts": {
+      "total": 2,
+      "already_valid": 2,
+      "invalid_existing": 0,
+      "unresolved": 0,
+      "updates_planned": 0,
+      "updates_applied": 0,
+      "source_counts": {},
+      "sample_unresolved_ids": [],
+      "sample_updated_ids": []
+    },
+    "financial_years": {
+      "total": 1,
+      "already_valid": 1,
+      "invalid_existing": 0,
+      "unresolved": 0,
+      "updates_planned": 0,
+      "updates_applied": 0,
+      "source_counts": {},
+      "sample_unresolved_ids": [],
+      "sample_updated_ids": []
+    },
+    "financial_ledger": {
+      "total": 2,
+      "already_valid": 2,
+      "invalid_existing": 0,
+      "unresolved": 0,
+      "updates_planned": 0,
+      "updates_applied": 0,
+      "source_counts": {},
+      "sample_unresolved_ids": [],
+      "sample_updated_ids": []
+    },
+    "accounting_audit_logs": {
+      "total": 95,
+      "already_valid": 95,
+      "invalid_existing": 0,
+      "unresolved": 0,
+      "updates_planned": 0,
+      "updates_applied": 0,
+      "source_counts": {},
+      "sample_unresolved_ids": [],
+      "sample_updated_ids": []
+    },
+    "accounting_period_locks": {
+      "total": 0,
+      "already_valid": 0,
+      "invalid_existing": 0,
+      "unresolved": 0,
+      "updates_planned": 0,
+      "updates_applied": 0,
+      "source_counts": {},
+      "sample_unresolved_ids": [],
+      "sample_updated_ids": []
+    },
+    "accounting_journal_entries": {
+      "total": 78,
+      "already_valid": 78,
+      "invalid_existing": 0,
+      "unresolved": 0,
+      "updates_planned": 0,
+      "updates_applied": 0,
+      "source_counts": {},
+      "sample_unresolved_ids": [],
+      "sample_updated_ids": []
+    },
+    "accounting_journal_lines": {
+      "total": 156,
+      "already_valid": 156,
+      "invalid_existing": 0,
+      "unresolved": 0,
+      "updates_planned": 0,
+      "updates_applied": 0,
+      "source_counts": {},
+      "sample_unresolved_ids": [],
+      "sample_updated_ids": []
+    },
+    "bank_reconciliation_profiles": {
+      "total": 15,
+      "already_valid": 15,
+      "invalid_existing": 0,
+      "unresolved": 0,
+      "updates_planned": 0,
+      "updates_applied": 0,
+      "source_counts": {},
+      "sample_unresolved_ids": [],
+      "sample_updated_ids": []
+    },
+    "bank_reconciliation_statements": {
+      "total": 32,
+      "already_valid": 32,
+      "invalid_existing": 0,
+      "unresolved": 0,
+      "updates_planned": 0,
+      "updates_applied": 0,
+      "source_counts": {},
+      "sample_unresolved_ids": [],
+      "sample_updated_ids": []
+    },
+    "bank_reconciliation_items": {
+      "total": 65,
+      "already_valid": 65,
+      "invalid_existing": 0,
+      "unresolved": 0,
+      "updates_planned": 0,
+      "updates_applied": 0,
+      "source_counts": {},
+      "sample_unresolved_ids": [],
+      "sample_updated_ids": []
+    },
+    "tabung_campaigns": {
+      "total": 2,
+      "already_valid": 2,
+      "invalid_existing": 0,
+      "unresolved": 0,
+      "updates_planned": 0,
+      "updates_applied": 0,
+      "source_counts": {},
+      "sample_unresolved_ids": [],
+      "sample_updated_ids": []
+    },
+    "tabung_donations": {
+      "total": 3,
+      "already_valid": 3,
+      "invalid_existing": 0,
+      "unresolved": 0,
+      "updates_planned": 0,
+      "updates_applied": 0,
+      "source_counts": {},
+      "sample_unresolved_ids": [],
+      "sample_updated_ids": []
+    },
+    "donation_campaigns": {
+      "total": 4,
+      "already_valid": 4,
+      "invalid_existing": 0,
+      "unresolved": 0,
+      "updates_planned": 0,
+      "updates_applied": 0,
+      "source_counts": {},
+      "sample_unresolved_ids": [],
+      "sample_updated_ids": []
+    },
+    "infaq_campaigns": {
+      "total": 1,
+      "already_valid": 1,
+      "invalid_existing": 0,
+      "unresolved": 0,
+      "updates_planned": 0,
+      "updates_applied": 0,
+      "source_counts": {},
+      "sample_unresolved_ids": [],
+      "sample_updated_ids": []
+    },
+    "payment_reminders": {
+      "total": 2,
+      "already_valid": 2,
+      "invalid_existing": 0,
+      "unresolved": 0,
+      "updates_planned": 0,
+      "updates_applied": 0,
+      "source_counts": {},
+      "sample_unresolved_ids": [],
+      "sample_updated_ids": []
+    },
+    "payment_reminder_preferences": {
+      "total": 1,
+      "already_valid": 1,
+      "invalid_existing": 0,
+      "unresolved": 0,
+      "updates_planned": 0,
+      "updates_applied": 0,
+      "source_counts": {},
+      "sample_unresolved_ids": [],
+      "sample_updated_ids": []
+    },
+    "email_templates": {
+      "total": 5,
+      "already_valid": 5,
+      "invalid_existing": 0,
+      "unresolved": 0,
+      "updates_planned": 0,
+      "updates_applied": 0,
+      "source_counts": {},
+      "sample_unresolved_ids": [],
+      "sample_updated_ids": []
+    },
+    "email_logs": {
+      "total": 1,
+      "already_valid": 1,
+      "invalid_existing": 0,
+      "unresolved": 0,
+      "updates_planned": 0,
+      "updates_applied": 0,
+      "source_counts": {},
+      "sample_unresolved_ids": [],
+      "sample_updated_ids": []
+    },
+    "push_subscriptions": {
+      "total": 1,
+      "already_valid": 1,
+      "invalid_existing": 0,
+      "unresolved": 0,
+      "updates_planned": 0,
+      "updates_applied": 0,
+      "source_counts": {},
+      "sample_unresolved_ids": [],
+      "sample_updated_ids": []
+    },
+    "push_logs": {
+      "total": 2,
+      "already_valid": 2,
+      "invalid_existing": 0,
+      "unresolved": 0,
+      "updates_planned": 0,
+      "updates_applied": 0,
+      "source_counts": {},
+      "sample_unresolved_ids": [],
+      "sample_updated_ids": []
+    },
+    "pwa_device_tokens": {
+      "total": 4,
+      "already_valid": 4,
+      "invalid_existing": 0,
+      "unresolved": 0,
+      "updates_planned": 0,
+      "updates_applied": 0,
+      "source_counts": {},
+      "sample_unresolved_ids": [],
+      "sample_updated_ids": []
+    },
+    "chatbox_faq": {
+      "total": 14,
+      "already_valid": 14,
+      "invalid_existing": 0,
+      "unresolved": 0,
+      "updates_planned": 0,
+      "updates_applied": 0,
+      "source_counts": {},
+      "sample_unresolved_ids": [],
+      "sample_updated_ids": []
+    },
+    "chatbox_responses": {
+      "total": 48,
+      "already_valid": 48,
+      "invalid_existing": 0,
+      "unresolved": 0,
+      "updates_planned": 0,
+      "updates_applied": 0,
+      "source_counts": {},
+      "sample_unresolved_ids": [],
+      "sample_updated_ids": []
+    },
+    "chatbox_suggestions": {
+      "total": 14,
+      "already_valid": 14,
+      "invalid_existing": 0,
+      "unresolved": 0,
+      "updates_planned": 0,
+      "updates_applied": 0,
+      "source_counts": {},
+      "sample_unresolved_ids": [],
+      "sample_updated_ids": []
+    },
+    "ai_chat_history": {
+      "total": 8,
+      "already_valid": 8,
+      "invalid_existing": 0,
+      "unresolved": 0,
+      "updates_planned": 0,
+      "updates_applied": 0,
+      "source_counts": {},
+      "sample_unresolved_ids": [],
+      "sample_updated_ids": []
+    },
+    "vendors": {
+      "total": 1,
+      "already_valid": 1,
+      "invalid_existing": 0,
+      "unresolved": 0,
+      "updates_planned": 0,
+      "updates_applied": 0,
+      "source_counts": {},
+      "sample_unresolved_ids": [],
+      "sample_updated_ids": []
+    },
+    "marketplace_settings": {
+      "total": 1,
+      "already_valid": 1,
+      "invalid_existing": 0,
+      "unresolved": 0,
+      "updates_planned": 0,
+      "updates_applied": 0,
+      "source_counts": {},
+      "sample_unresolved_ids": [],
+      "sample_updated_ids": []
+    },
+    "koperasi_settings": {
+      "total": 1,
+      "already_valid": 1,
+      "invalid_existing": 0,
+      "unresolved": 0,
+      "updates_planned": 0,
+      "updates_applied": 0,
+      "source_counts": {},
+      "sample_unresolved_ids": [],
+      "sample_updated_ids": []
+    },
+    "hostel_blocks": {
+      "total": 8,
+      "already_valid": 8,
+      "invalid_existing": 0,
+      "unresolved": 0,
+      "updates_planned": 0,
+      "updates_applied": 0,
+      "source_counts": {},
+      "sample_unresolved_ids": [],
+      "sample_updated_ids": []
+    },
+    "hostel_pbw_pbp_periods": {
+      "total": 1,
+      "already_valid": 1,
+      "invalid_existing": 0,
+      "unresolved": 0,
+      "updates_planned": 0,
+      "updates_applied": 0,
+      "source_counts": {},
+      "sample_unresolved_ids": [],
+      "sample_updated_ids": []
+    },
+    "offence_sections": {
+      "total": 7,
+      "already_valid": 7,
+      "invalid_existing": 0,
+      "unresolved": 0,
+      "updates_planned": 0,
+      "updates_applied": 0,
+      "source_counts": {},
+      "sample_unresolved_ids": [],
+      "sample_updated_ids": []
+    },
+    "olat_categories": {
+      "total": 6,
+      "already_valid": 6,
+      "invalid_existing": 0,
+      "unresolved": 0,
+      "updates_planned": 0,
+      "updates_applied": 0,
+      "source_counts": {},
+      "sample_unresolved_ids": [],
+      "sample_updated_ids": []
+    },
+    "bus_companies": {
+      "total": 10,
+      "already_valid": 10,
+      "invalid_existing": 0,
+      "unresolved": 0,
+      "updates_planned": 0,
+      "updates_applied": 0,
+      "source_counts": {},
+      "sample_unresolved_ids": [],
+      "sample_updated_ids": []
+    },
+    "buses": {
+      "total": 22,
+      "already_valid": 22,
+      "invalid_existing": 0,
+      "unresolved": 0,
+      "updates_planned": 0,
+      "updates_applied": 0,
+      "source_counts": {},
+      "sample_unresolved_ids": [],
+      "sample_updated_ids": []
+    },
+    "bus_routes": {
+      "total": 17,
+      "already_valid": 17,
+      "invalid_existing": 0,
+      "unresolved": 0,
+      "updates_planned": 0,
+      "updates_applied": 0,
+      "source_counts": {},
+      "sample_unresolved_ids": [],
+      "sample_updated_ids": []
+    },
+    "bus_trips": {
+      "total": 43,
+      "already_valid": 42,
+      "invalid_existing": 0,
+      "unresolved": 0,
+      "updates_planned": 1,
+      "updates_applied": 0,
+      "source_counts": {
+        "user_ref.created_by": 1
+      },
+      "sample_unresolved_ids": [],
+      "sample_updated_ids": [
+        "69b3d33f1f76528f7c4ae490"
+      ]
+    },
+    "bus_bookings": {
+      "total": 4,
+      "already_valid": 4,
+      "invalid_existing": 0,
+      "unresolved": 0,
+      "updates_planned": 0,
+      "updates_applied": 0,
+      "source_counts": {},
+      "sample_unresolved_ids": [],
+      "sample_updated_ids": []
+    },
+    "bus_live_locations": {
+      "total": 38,
+      "already_valid": 37,
+      "invalid_existing": 0,
+      "unresolved": 0,
+      "updates_planned": 1,
+      "updates_applied": 0,
+      "source_counts": {
+        "ref.trip_id": 1
+      },
+      "sample_unresolved_ids": [],
+      "sample_updated_ids": [
+        "69b3d3401f76528f7c4ae496"
+      ]
+    },
+    "scheduler_logs": {
+      "total": 93,
+      "already_valid": 93,
+      "invalid_existing": 0,
+      "unresolved": 0,
+      "updates_planned": 0,
+      "updates_applied": 0,
+      "source_counts": {},
+      "sample_unresolved_ids": [],
+      "sample_updated_ids": []
+    },
+    "agm_events": {
+      "total": 1,
+      "already_valid": 1,
+      "invalid_existing": 0,
+      "unresolved": 0,
+      "updates_planned": 0,
+      "updates_applied": 0,
+      "source_counts": {},
+      "sample_unresolved_ids": [],
+      "sample_updated_ids": []
+    },
+    "notifications": {
+      "total": 116,
+      "already_valid": 116,
+      "invalid_existing": 0,
+      "unresolved": 0,
+      "updates_planned": 0,
+      "updates_applied": 0,
+      "source_counts": {},
+      "sample_unresolved_ids": [],
+      "sample_updated_ids": []
+    },
+    "audit_logs": {
+      "total": 3544,
+      "already_valid": 3544,
+      "invalid_existing": 0,
+      "unresolved": 0,
+      "updates_planned": 0,
+      "updates_applied": 0,
+      "source_counts": {},
+      "sample_unresolved_ids": [],
+      "sample_updated_ids": []
+    },
+    "tenant_onboarding_jobs": {
+      "total": 0,
+      "already_valid": 0,
+      "invalid_existing": 0,
+      "unresolved": 0,
+      "updates_planned": 0,
+      "updates_applied": 0,
+      "source_counts": {},
+      "sample_unresolved_ids": [],
+      "sample_updated_ids": []
+    },
+    "institution_onboarding_requests": {
+      "total": 0,
+      "already_valid": 0,
+      "invalid_existing": 0,
+      "unresolved": 0,
+      "updates_planned": 0,
+      "updates_applied": 0,
+      "source_counts": {},
+      "sample_unresolved_ids": [],
+      "sample_updated_ids": []
+    }
+  },
+  "generated_at": "2026-03-13T09:29:37.735072+00:00",
+  "database_url": "postgresql+psycopg://kamarulariffin@localhost:5432/mrsm_portal",
+  "default_tenant": {
+    "tenant_id": "tenant_legacy_main",
+    "tenant_code": "mrsm-main",
+    "exists_in_tenant_master": true,
+    "assign_unresolved_to_default": false,
+    "allow_nonexistent_default_tenant": false
+  }
+}

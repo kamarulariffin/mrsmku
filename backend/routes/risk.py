@@ -3,8 +3,9 @@ AI Risiko Disiplin - Fasa 6
 Semua data dari MongoDB sahaja (offences, olat_cases, movement_logs). Tiada mock.
 """
 from datetime import datetime, timezone
-from typing import Optional, List, Callable
+from typing import Any, Optional, List, Callable
 from bson import ObjectId
+from services.id_normalizer import object_id_or_none
 
 from fastapi import APIRouter, HTTPException, Depends, Query
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -32,6 +33,31 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
     return await _get_current_user_func(credentials)
 
 
+def _id_value(
+    value: object,
+    *,
+    strict: bool = False,
+    status_code: int = 400,
+    error_detail: str = "ID tidak sah",
+):
+    """Normalize ID-like inputs while supporting non-ObjectId IDs."""
+    if value is None:
+        if strict:
+            raise HTTPException(status_code=status_code, detail=error_detail)
+        return None
+    if isinstance(value, ObjectId):
+        return value
+    text = str(value).strip()
+    try:
+        if ObjectId.is_valid(text):
+            return object_id_or_none(text)
+    except Exception:
+        pass
+    if strict:
+        raise HTTPException(status_code=status_code, detail=error_detail)
+    return text
+
+
 def require_warden_admin():
     async def _dep(credentials: HTTPAuthorizationCredentials = Depends(security)):
         user = await get_current_user(credentials)
@@ -47,7 +73,7 @@ BAND_MEDIUM = "medium"
 BAND_HIGH = "high"
 
 
-async def _compute_risk_for_student(db, student_id: ObjectId, student_name: str = ""):
+async def _compute_risk_for_student(db, student_id: Any, student_name: str = ""):
     """
     Kira risiko dari data sebenar MongoDB sahaja.
     Faktor: bilangan kesalahan, kes OLAT terbuka, lewat balik.
@@ -105,11 +131,13 @@ async def list_risk_profiles(
     for s in students_with_offences:
         all_ids.append(s["_id"])
     all_ids = list(set(all_ids))
-    # Ensure ObjectId
-    try:
-        all_ids = [ObjectId(str(x)) for x in all_ids]
-    except Exception:
-        all_ids = [x for x in all_ids if isinstance(x, ObjectId)]
+    # Normalize IDs while keeping compatibility with ObjectId and string IDs
+    normalized_ids = []
+    for raw_id in all_ids:
+        normalized = _id_value(raw_id)
+        if normalized is not None:
+            normalized_ids.append(normalized)
+    all_ids = list({str(x): x for x in normalized_ids}.values())
     results = []
     for sid in all_ids[:limit]:
         student = await db.students.find_one({"_id": sid})
@@ -138,7 +166,11 @@ async def get_risk_profile_student(
     if not student:
         raise HTTPException(status_code=404, detail="Pelajar tidak dijumpai")
     student_name = student.get("full_name", student.get("fullName", "Unknown"))
-    profile = await _compute_risk_for_student(db, ObjectId(student_id), student_name)
+    profile = await _compute_risk_for_student(
+        db,
+        _id_value(student_id, strict=True, status_code=400, error_detail="ID pelajar tidak sah"),
+        student_name,
+    )
     return profile
 
 

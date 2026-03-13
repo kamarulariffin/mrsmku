@@ -5,9 +5,10 @@ Central inventory that syncs between Koperasi, PUM, and Merchandise modules
 
 from fastapi import APIRouter, HTTPException, Depends
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from typing import List, Optional
+from typing import Any, List, Optional
 from datetime import datetime, timezone
 from bson import ObjectId
+from services.id_normalizer import object_id_or_none
 
 from models.inventory import (
     InventoryItemCreate, InventoryItemUpdate, InventoryItemResponse,
@@ -49,6 +50,35 @@ async def log_audit(user, action, module, details):
         await _log_audit_func(user, action, module, details)
 
 
+def _id_value(value: Any) -> Any:
+    """Normalize ID-like inputs while supporting non-ObjectId IDs."""
+    if value is None:
+        return None
+    if isinstance(value, ObjectId):
+        return value
+    text = str(value)
+    try:
+        if ObjectId.is_valid(text):
+            return object_id_or_none(text)
+    except Exception:
+        pass
+    return text
+
+
+def _as_float(value: Any) -> float:
+    try:
+        return float(value or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _as_int(value: Any) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
 async def record_movement(db, inventory_item_id: str, movement_type: str, quantity: int,
                           previous_stock: int, new_stock: int, source_module: str,
                           reference_type: str = None, reference_id: str = None,
@@ -73,7 +103,7 @@ async def record_movement(db, inventory_item_id: str, movement_type: str, quanti
 
 async def sync_linked_products(db, inventory_item_id: str, new_stock: int, source_module: str, user_id: str = None):
     """Sync stock to all linked products in other modules"""
-    item = await db.central_inventory.find_one({"_id": ObjectId(inventory_item_id)})
+    item = await db.central_inventory.find_one({"_id": _id_value(inventory_item_id)})
     if not item or item.get("sync_mode") == InventorySyncMode.DISABLED.value:
         return []
     
@@ -99,7 +129,7 @@ async def sync_linked_products(db, inventory_item_id: str, new_stock: int, sourc
         
         # Update stock in linked product
         result = await collection.update_one(
-            {"_id": ObjectId(link["product_id"])},
+            {"_id": _id_value(link["product_id"])},
             {"$set": {"stock": new_stock, "total_stock": new_stock, "updated_at": datetime.now(timezone.utc)}}
         )
         
@@ -128,12 +158,11 @@ async def get_shared_categories(user: dict = Depends(get_current_user)):
     db = get_db()
     
     # Count usage in central inventory
-    pipeline = [
-        {"$match": {"is_active": True}},
-        {"$group": {"_id": "$category", "count": {"$sum": 1}}}
-    ]
-    results = await db.central_inventory.aggregate(pipeline).to_list(50)
-    counts = {r["_id"]: r["count"] for r in results}
+    counts = {}
+    async for item in db.central_inventory.find({"is_active": True}):
+        category = item.get("category")
+        if category:
+            counts[category] = counts.get(category, 0) + 1
     
     categories = []
     for cat in SharedCategory:
@@ -241,7 +270,7 @@ async def update_vendor(vendor_id: str, vendor: VendorUpdate, user: dict = Depen
         update_data["vendor_type"] = update_data["vendor_type"].value
     update_data["updated_at"] = datetime.now(timezone.utc)
     
-    result = await db.vendors.update_one({"_id": ObjectId(vendor_id)}, {"$set": update_data})
+    result = await db.vendors.update_one({"_id": _id_value(vendor_id)}, {"$set": update_data})
     
     if result.matched_count == 0:
         raise HTTPException(status_code=404, detail="Vendor tidak dijumpai")
@@ -260,7 +289,7 @@ async def delete_vendor(vendor_id: str, user: dict = Depends(get_current_user)):
         raise HTTPException(status_code=403, detail="Akses ditolak")
     
     result = await db.vendors.update_one(
-        {"_id": ObjectId(vendor_id)},
+        {"_id": _id_value(vendor_id)},
         {"$set": {"is_active": False, "updated_at": datetime.now(timezone.utc)}}
     )
     
@@ -309,7 +338,7 @@ async def get_inventory_items(
     vendor_ids = list(set(i.get("vendor_id") for i in items if i.get("vendor_id")))
     vendors = {}
     if vendor_ids:
-        vendor_docs = await db.vendors.find({"_id": {"$in": [ObjectId(v) for v in vendor_ids if v]}}).to_list(100)
+        vendor_docs = await db.vendors.find({"_id": {"$in": [_id_value(v) for v in vendor_ids if v]}}).to_list(100)
         vendors = {str(v["_id"]): v["name"] for v in vendor_docs}
     
     result = []
@@ -411,14 +440,14 @@ async def get_inventory_item(item_id: str, user: dict = Depends(get_current_user
     """Get single inventory item with full details"""
     db = get_db()
     
-    item = await db.central_inventory.find_one({"_id": ObjectId(item_id)})
+    item = await db.central_inventory.find_one({"_id": _id_value(item_id)})
     if not item:
         raise HTTPException(status_code=404, detail="Item tidak dijumpai")
     
     # Get vendor
     vendor_name = None
     if item.get("vendor_id"):
-        vendor = await db.vendors.find_one({"_id": ObjectId(item["vendor_id"])})
+        vendor = await db.vendors.find_one({"_id": _id_value(item["vendor_id"])})
         vendor_name = vendor["name"] if vendor else None
     
     # Get linked products with details
@@ -427,11 +456,11 @@ async def get_inventory_item(item_id: str, user: dict = Depends(get_current_user
     for link in links:
         product_name = None
         if link["module"] == "koperasi":
-            product = await db.koop_products.find_one({"_id": ObjectId(link["product_id"])})
+            product = await db.koop_products.find_one({"_id": _id_value(link["product_id"])})
         elif link["module"] == "pum":
-            product = await db.pum_products.find_one({"_id": ObjectId(link["product_id"])})
+            product = await db.pum_products.find_one({"_id": _id_value(link["product_id"])})
         elif link["module"] == "merchandise":
-            product = await db.merchandise_products.find_one({"_id": ObjectId(link["product_id"])})
+            product = await db.merchandise_products.find_one({"_id": _id_value(link["product_id"])})
         else:
             product = None
         
@@ -490,7 +519,7 @@ async def update_inventory_item(item_id: str, item: InventoryItemUpdate, user: d
     if user["role"] not in ["superadmin", "admin", "koop_admin", "pum_admin", "merchandise_admin"]:
         raise HTTPException(status_code=403, detail="Akses ditolak")
     
-    existing = await db.central_inventory.find_one({"_id": ObjectId(item_id)})
+    existing = await db.central_inventory.find_one({"_id": _id_value(item_id)})
     if not existing:
         raise HTTPException(status_code=404, detail="Item tidak dijumpai")
     
@@ -508,7 +537,7 @@ async def update_inventory_item(item_id: str, item: InventoryItemUpdate, user: d
     old_stock = existing.get("stock", 0)
     new_stock = update_data.get("stock", old_stock)
     
-    await db.central_inventory.update_one({"_id": ObjectId(item_id)}, {"$set": update_data})
+    await db.central_inventory.update_one({"_id": _id_value(item_id)}, {"$set": update_data})
     
     # If stock changed, sync to linked products
     if new_stock != old_stock:
@@ -535,7 +564,7 @@ async def delete_inventory_item(item_id: str, user: dict = Depends(get_current_u
         raise HTTPException(status_code=403, detail="Akses ditolak")
     
     result = await db.central_inventory.update_one(
-        {"_id": ObjectId(item_id)},
+        {"_id": _id_value(item_id)},
         {"$set": {"is_active": False, "updated_at": datetime.now(timezone.utc)}}
     )
     
@@ -558,17 +587,17 @@ async def create_inventory_link(link: InventoryLinkCreate, user: dict = Depends(
         raise HTTPException(status_code=403, detail="Akses ditolak")
     
     # Verify inventory item exists
-    item = await db.central_inventory.find_one({"_id": ObjectId(link.inventory_item_id)})
+    item = await db.central_inventory.find_one({"_id": _id_value(link.inventory_item_id)})
     if not item:
         raise HTTPException(status_code=404, detail="Item inventori tidak dijumpai")
     
     # Verify product exists in target module
     if link.module == InventorySource.KOPERASI:
-        product = await db.koop_products.find_one({"_id": ObjectId(link.product_id)})
+        product = await db.koop_products.find_one({"_id": _id_value(link.product_id)})
     elif link.module == InventorySource.PUM:
-        product = await db.pum_products.find_one({"_id": ObjectId(link.product_id)})
+        product = await db.pum_products.find_one({"_id": _id_value(link.product_id)})
     elif link.module == InventorySource.MERCHANDISE:
-        product = await db.merchandise_products.find_one({"_id": ObjectId(link.product_id)})
+        product = await db.merchandise_products.find_one({"_id": _id_value(link.product_id)})
     else:
         product = None
     
@@ -601,17 +630,17 @@ async def create_inventory_link(link: InventoryLinkCreate, user: dict = Depends(
         stock = item.get("stock", 0)
         if link.module == InventorySource.KOPERASI:
             await db.koop_products.update_one(
-                {"_id": ObjectId(link.product_id)},
+                {"_id": _id_value(link.product_id)},
                 {"$set": {"total_stock": stock, "updated_at": datetime.now(timezone.utc)}}
             )
         elif link.module == InventorySource.PUM:
             await db.pum_products.update_one(
-                {"_id": ObjectId(link.product_id)},
+                {"_id": _id_value(link.product_id)},
                 {"$set": {"stock": stock, "updated_at": datetime.now(timezone.utc)}}
             )
         elif link.module == InventorySource.MERCHANDISE:
             await db.merchandise_products.update_one(
-                {"_id": ObjectId(link.product_id)},
+                {"_id": _id_value(link.product_id)},
                 {"$set": {"stock": stock, "updated_at": datetime.now(timezone.utc)}}
             )
     
@@ -629,7 +658,7 @@ async def delete_inventory_link(link_id: str, user: dict = Depends(get_current_u
     if user["role"] not in ["superadmin", "admin", "koop_admin", "pum_admin", "merchandise_admin"]:
         raise HTTPException(status_code=403, detail="Akses ditolak")
     
-    result = await db.inventory_links.delete_one({"_id": ObjectId(link_id)})
+    result = await db.inventory_links.delete_one({"_id": _id_value(link_id)})
     
     if result.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Pautan tidak dijumpai")
@@ -648,7 +677,7 @@ async def toggle_link_sync(link_id: str, sync_enabled: bool, user: dict = Depend
         raise HTTPException(status_code=403, detail="Akses ditolak")
     
     result = await db.inventory_links.update_one(
-        {"_id": ObjectId(link_id)},
+        {"_id": _id_value(link_id)},
         {"$set": {"sync_enabled": sync_enabled}}
     )
     
@@ -668,7 +697,7 @@ async def manual_sync(request: SyncRequest, user: dict = Depends(get_current_use
     if user["role"] not in ["superadmin", "admin", "koop_admin", "pum_admin", "merchandise_admin"]:
         raise HTTPException(status_code=403, detail="Akses ditolak")
     
-    item = await db.central_inventory.find_one({"_id": ObjectId(request.inventory_item_id)})
+    item = await db.central_inventory.find_one({"_id": _id_value(request.inventory_item_id)})
     if not item:
         raise HTTPException(status_code=404, detail="Item tidak dijumpai")
     
@@ -709,7 +738,7 @@ async def sync_from_module_stock(
     inventory_item_id = link["inventory_item_id"]
     
     # Get current central stock
-    item = await db.central_inventory.find_one({"_id": ObjectId(inventory_item_id)})
+    item = await db.central_inventory.find_one({"_id": _id_value(inventory_item_id)})
     if not item:
         return {"message": "Item inventori tidak dijumpai", "synced": False}
     
@@ -717,7 +746,7 @@ async def sync_from_module_stock(
     
     # Update central inventory
     await db.central_inventory.update_one(
-        {"_id": ObjectId(inventory_item_id)},
+        {"_id": _id_value(inventory_item_id)},
         {"$set": {"stock": new_stock, "updated_at": datetime.now(timezone.utc)}}
     )
     
@@ -765,7 +794,7 @@ async def get_inventory_movements(
     result = []
     for m in movements:
         # Get item name
-        item = await db.central_inventory.find_one({"_id": ObjectId(m["inventory_item_id"])})
+        item = await db.central_inventory.find_one({"_id": _id_value(m["inventory_item_id"])})
         item_name = item["name"] if item else "Unknown"
         
         created_at = m.get("created_at")
@@ -806,40 +835,51 @@ async def get_inventory_stats(user: dict = Depends(get_current_user)):
     active_items = await db.central_inventory.count_documents({"is_active": True})
     out_of_stock = await db.central_inventory.count_documents({"is_active": True, "stock": 0})
     
-    # Low stock (using aggregation)
-    pipeline = [
-        {"$match": {"is_active": True, "stock": {"$gt": 0}}},
-        {"$addFields": {"is_low": {"$lte": ["$stock", {"$ifNull": ["$low_stock_threshold", 10]}]}}},
-        {"$match": {"is_low": True}},
-        {"$count": "count"}
+    low_stock_items = 0
+    total_value = 0.0
+    by_category_map = {}
+    by_vendor_map = {}
+    by_module_map = {}
+
+    async for item in db.central_inventory.find({"is_active": True}):
+        stock = _as_int(item.get("stock"))
+        total_value += _as_float(item.get("base_price")) * stock
+
+        if stock > 0:
+            threshold_raw = item.get("low_stock_threshold")
+            threshold = 10 if threshold_raw is None else _as_int(threshold_raw)
+            if stock <= threshold:
+                low_stock_items += 1
+
+        category = item.get("category")
+        if category not in by_category_map:
+            by_category_map[category] = {"count": 0, "total_stock": 0}
+        by_category_map[category]["count"] += 1
+        by_category_map[category]["total_stock"] += stock
+
+        vendor_type = item.get("vendor_type")
+        if vendor_type not in by_vendor_map:
+            by_vendor_map[vendor_type] = {"count": 0, "total_stock": 0}
+        by_vendor_map[vendor_type]["count"] += 1
+        by_vendor_map[vendor_type]["total_stock"] += stock
+
+        source_module = item.get("source_module")
+        if source_module not in by_module_map:
+            by_module_map[source_module] = {"count": 0}
+        by_module_map[source_module]["count"] += 1
+
+    by_category = [
+        {"_id": category, "count": values["count"], "total_stock": values["total_stock"]}
+        for category, values in by_category_map.items()
     ]
-    low_stock_result = await db.central_inventory.aggregate(pipeline).to_list(1)
-    low_stock_items = low_stock_result[0]["count"] if low_stock_result else 0
-    
-    # Total value
-    items = await db.central_inventory.find({"is_active": True}).to_list(1000)
-    total_value = sum(i.get("base_price", 0) * i.get("stock", 0) for i in items)
-    
-    # By category
-    cat_pipeline = [
-        {"$match": {"is_active": True}},
-        {"$group": {"_id": "$category", "count": {"$sum": 1}, "total_stock": {"$sum": "$stock"}}}
+    by_vendor = [
+        {"_id": vendor_type, "count": values["count"], "total_stock": values["total_stock"]}
+        for vendor_type, values in by_vendor_map.items()
     ]
-    by_category = await db.central_inventory.aggregate(cat_pipeline).to_list(20)
-    
-    # By vendor
-    vendor_pipeline = [
-        {"$match": {"is_active": True}},
-        {"$group": {"_id": "$vendor_type", "count": {"$sum": 1}, "total_stock": {"$sum": "$stock"}}}
+    by_module = [
+        {"_id": source_module, "count": values["count"]}
+        for source_module, values in by_module_map.items()
     ]
-    by_vendor = await db.central_inventory.aggregate(vendor_pipeline).to_list(10)
-    
-    # By source module
-    module_pipeline = [
-        {"$match": {"is_active": True}},
-        {"$group": {"_id": "$source_module", "count": {"$sum": 1}}}
-    ]
-    by_module = await db.central_inventory.aggregate(module_pipeline).to_list(10)
     
     return {
         "total_items": total_items,

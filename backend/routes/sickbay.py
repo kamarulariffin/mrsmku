@@ -3,8 +3,9 @@ Sickbay Routes - Sick bay management for students
 Extracted from server.py for better code organization
 """
 from datetime import datetime, timezone, timedelta
-from typing import Optional, Callable
+from typing import Any, Optional, Callable
 from bson import ObjectId
+from services.id_normalizer import object_id_or_none
 
 from fastapi import APIRouter, HTTPException, Depends
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -55,6 +56,21 @@ async def log_audit(user, action, module, details):
         await _log_audit_func(user, action, module, details)
 
 
+def _id_value(value: Any) -> Any:
+    """Normalize ID-like inputs while supporting non-ObjectId IDs."""
+    if value is None:
+        return None
+    if isinstance(value, ObjectId):
+        return value
+    text = str(value).strip()
+    try:
+        if ObjectId.is_valid(text):
+            return object_id_or_none(text)
+    except Exception:
+        pass
+    return text
+
+
 def require_warden_admin():
     """Return dependency for requiring warden/admin roles"""
     async def _require_roles(credentials: HTTPAuthorizationCredentials = Depends(security)):
@@ -91,17 +107,17 @@ async def sickbay_checkin(
     db = get_db()
     
     # Try users collection first (pelajar role)
-    student = await db.users.find_one({"_id": ObjectId(record.student_id), "role": "pelajar"})
+    student = await db.users.find_one({"_id": _id_value(record.student_id), "role": "pelajar"})
     if not student:
         # Fallback to students collection
-        student = await db.students.find_one({"_id": ObjectId(record.student_id)})
+        student = await db.students.find_one({"_id": _id_value(record.student_id)})
     if not student:
         raise HTTPException(status_code=404, detail="Pelajar tidak dijumpai")
     
     student_name = student.get("fullName", student.get("full_name", "Unknown"))
     
     record_doc = {
-        "student_id": ObjectId(record.student_id),
+        "student_id": _id_value(record.student_id),
         "student_name": student_name,
         "student_matric": student.get("matric", ""),
         "student_form": student.get("form", 0),
@@ -150,12 +166,12 @@ async def sickbay_checkout(
 ):
     """Record sickbay checkout"""
     db = get_db()
-    record = await db.sickbay_records.find_one({"_id": ObjectId(record_id)})
+    record = await db.sickbay_records.find_one({"_id": _id_value(record_id)})
     if not record:
         raise HTTPException(status_code=404, detail="Rekod tidak dijumpai")
     
     await db.sickbay_records.update_one(
-        {"_id": ObjectId(record_id)},
+        {"_id": _id_value(record_id)},
         {"$set": {
             "check_out_time": datetime.now(timezone.utc).isoformat(),
             "checkout_remarks": remarks,
@@ -191,14 +207,16 @@ async def get_sickbay_stats(
         "check_out_time": {"$regex": f"^{today}"}
     })
     
-    # Common symptoms (last 30 days)
-    pipeline = [
-        {"$match": {"created_at": {"$gte": (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()}}},
-        {"$group": {"_id": "$symptoms", "count": {"$sum": 1}}},
-        {"$sort": {"count": -1}},
-        {"$limit": 5}
+    # Common symptoms (last 30 days) without aggregate()
+    cutoff_iso = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
+    symptom_counts = {}
+    async for item in db.sickbay_records.find({"created_at": {"$gte": cutoff_iso}}):
+        symptom = item.get("symptoms")
+        symptom_counts[symptom] = symptom_counts.get(symptom, 0) + 1
+    common_symptoms = [
+        {"_id": symptom, "count": count}
+        for symptom, count in sorted(symptom_counts.items(), key=lambda kv: kv[1], reverse=True)[:5]
     ]
-    common_symptoms = await db.sickbay_records.aggregate(pipeline).to_list(5)
     
     return {
         "in_sickbay": in_sickbay,

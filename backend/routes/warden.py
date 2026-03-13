@@ -5,10 +5,10 @@ MRSMKU Smart360
 from fastapi import APIRouter, HTTPException, Depends, Query
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel as PydanticBase
-from typing import List, Optional
+from typing import Any, List, Optional
 from datetime import datetime, timezone, timedelta, date
 from bson import ObjectId
-from bson.errors import InvalidId
+from services.id_normalizer import object_id_or_none
 import calendar
 
 from models.warden import (
@@ -49,9 +49,26 @@ async def log_audit(user, action, module, details):
         await _log_audit_func(user, action, module, details)
 
 
+def _id_value(value: Any, *, strict: bool = False) -> Any:
+    """Normalize ID-like inputs while supporting non-ObjectId IDs."""
+    if value is None:
+        return None
+    if isinstance(value, ObjectId):
+        return value
+    text = str(value).strip()
+    try:
+        if ObjectId.is_valid(text):
+            return object_id_or_none(text)
+    except Exception:
+        pass
+    if strict:
+        raise ValueError("Invalid ObjectId")
+    return text
+
+
 async def serialize_schedule(schedule: dict) -> dict:
     """Serialize schedule with warden info"""
-    warden = await get_db().users.find_one({"_id": ObjectId(schedule["warden_id"])})
+    warden = await get_db().users.find_one({"_id": _id_value(schedule["warden_id"])})
     
     # Determine position based on warden's assignment
     jawatan = "warden"
@@ -120,7 +137,7 @@ async def get_current_duty_wardens():
     
     duty_wardens = []
     for schedule in schedules:
-        warden = await get_db().users.find_one({"_id": ObjectId(schedule["warden_id"])})
+        warden = await get_db().users.find_one({"_id": _id_value(schedule["warden_id"])})
         if warden and warden.get("is_active", True):
             duty_wardens.append(await serialize_duty_warden(schedule, warden))
     
@@ -152,7 +169,7 @@ async def get_duty_warden_for_block(block_code: str):
     if not schedule:
         return {"warden": None, "message": "Tiada warden bertugas untuk blok ini"}
     
-    warden = await get_db().users.find_one({"_id": ObjectId(schedule["warden_id"])})
+    warden = await get_db().users.find_one({"_id": _id_value(schedule["warden_id"])})
     if not warden:
         return {"warden": None, "message": "Maklumat warden tidak dijumpai"}
     
@@ -221,7 +238,7 @@ async def create_schedule(
         raise HTTPException(status_code=403, detail="Tiada kebenaran untuk mencipta jadual")
     
     # Verify warden exists
-    warden = await get_db().users.find_one({"_id": ObjectId(schedule_data.warden_id), "role": "warden"})
+    warden = await get_db().users.find_one({"_id": _id_value(schedule_data.warden_id), "role": "warden"})
     if not warden:
         raise HTTPException(status_code=404, detail="Warden tidak dijumpai")
     
@@ -265,7 +282,7 @@ async def create_schedule(
     
     # Notify warden
     await get_db().notifications.insert_one({
-        "user_id": ObjectId(schedule_data.warden_id),
+        "user_id": _id_value(schedule_data.warden_id),
         "title": "Jadual Tugas Baru",
         "message": f"Anda dijadualkan bertugas dari {schedule_data.tarikh_mula} hingga {schedule_data.tarikh_tamat}",
         "type": "info",
@@ -284,8 +301,8 @@ async def create_schedule(
 def _valid_schedule_id(schedule_id: str):
     """Return ObjectId or raise HTTPException if invalid."""
     try:
-        return ObjectId(schedule_id)
-    except (InvalidId, TypeError):
+        return _id_value(schedule_id, strict=True)
+    except (ValueError, TypeError):
         raise HTTPException(status_code=400, detail="ID jadual tidak sah")
 
 
@@ -391,7 +408,7 @@ async def get_calendar_view(
         }).to_list(100)
         wardens = []
         for schedule in schedules:
-            warden = await db.users.find_one({"_id": ObjectId(schedule["warden_id"])})
+            warden = await db.users.find_one({"_id": _id_value(schedule["warden_id"])})
             if warden:
                 wardens.append(await serialize_duty_warden(schedule, warden))
         outing_type = await _get_outing_type_for_date(db, date_str)
@@ -507,7 +524,7 @@ async def update_calendar_event(
     if not upd:
         return {"message": "Tiada perubahan"}
     upd["updated_at"] = datetime.now(timezone.utc).isoformat()
-    await db.warden_calendar_events.update_one({"_id": ObjectId(event_id)}, {"$set": upd})
+    await db.warden_calendar_events.update_one({"_id": _id_value(event_id)}, {"$set": upd})
     return {"message": "Peristiwa dikemaskini"}
 
 
@@ -521,7 +538,7 @@ async def delete_calendar_event(
     if role not in ["admin", "superadmin", "warden"]:
         raise HTTPException(status_code=403, detail="Tiada kebenaran")
     db = get_db()
-    result = await db.warden_calendar_events.delete_one({"_id": ObjectId(event_id)})
+    result = await db.warden_calendar_events.delete_one({"_id": _id_value(event_id)})
     if result.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Peristiwa tidak dijumpai")
     return {"message": "Peristiwa dipadam"}
@@ -578,7 +595,7 @@ async def get_calendar_public(
         }).to_list(100)
         wardens = []
         for s in schedules:
-            w = await db.users.find_one({"_id": ObjectId(s["warden_id"])})
+            w = await db.users.find_one({"_id": _id_value(s["warden_id"])})
             if w:
                 wardens.append({
                     "warden_name": w.get("full_name", ""),
@@ -727,7 +744,7 @@ async def delete_outing_rotation(
     if role not in ["admin", "superadmin", "warden"]:
         raise HTTPException(status_code=403, detail="Tiada kebenaran")
     db = get_db()
-    result = await db.outing_rotation.delete_one({"_id": ObjectId(item_id)})
+    result = await db.outing_rotation.delete_one({"_id": _id_value(item_id)})
     if result.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Rekod tidak dijumpai")
     return {"message": "Giliran dipadam"}

@@ -4,9 +4,10 @@ For school cooperative shop with kit-based product sales
 """
 
 from fastapi import APIRouter, HTTPException, Depends
-from typing import List, Optional
+from typing import Any, List, Optional
 from datetime import datetime, timezone
 from bson import ObjectId
+from services.id_normalizer import object_id_or_none
 import random
 import string
 
@@ -25,6 +26,21 @@ def generate_order_number():
     timestamp = datetime.now().strftime("%Y%m%d")
     random_str = ''.join(random.choices(string.ascii_uppercase + string.digits, k=6))
     return f"KOOP-{timestamp}-{random_str}"
+
+
+def _id_value(value: Any) -> Any:
+    """Normalize ID-like inputs while supporting non-ObjectId IDs."""
+    if value is None:
+        return None
+    if isinstance(value, ObjectId):
+        return value
+    text = str(value)
+    try:
+        if ObjectId.is_valid(text):
+            return object_id_or_none(text)
+    except Exception:
+        pass
+    return text
 
 
 # ==================== KIT MANAGEMENT (Admin) ====================
@@ -96,7 +112,7 @@ async def get_kits(
 @router.get("/kits/{kit_id}", response_model=dict)
 async def get_kit(kit_id: str, db=None, current_user=None):
     """Get single kit with its products"""
-    kit = await db.koop_kits.find_one({"_id": ObjectId(kit_id)})
+    kit = await db.koop_kits.find_one({"_id": _id_value(kit_id)})
     if not kit:
         raise HTTPException(status_code=404, detail="Kit tidak dijumpai")
     
@@ -146,7 +162,7 @@ async def update_kit(kit_id: str, kit: KoopKitUpdate, db=None, current_user=None
     update_data["updated_at"] = datetime.now(timezone.utc)
     
     result = await db.koop_kits.update_one(
-        {"_id": ObjectId(kit_id)},
+        {"_id": _id_value(kit_id)},
         {"$set": update_data}
     )
     
@@ -164,7 +180,7 @@ async def delete_kit(kit_id: str, db=None, current_user=None):
     
     # Soft delete - just deactivate
     result = await db.koop_kits.update_one(
-        {"_id": ObjectId(kit_id)},
+        {"_id": _id_value(kit_id)},
         {"$set": {"is_active": False, "updated_at": datetime.now(timezone.utc)}}
     )
     
@@ -226,7 +242,7 @@ async def create_product(product: KoopProductCreate, db=None, current_user=None)
         raise HTTPException(status_code=403, detail="Akses ditolak")
     
     # Verify kit exists
-    kit = await db.koop_kits.find_one({"_id": ObjectId(product.kit_id)})
+    kit = await db.koop_kits.find_one({"_id": _id_value(product.kit_id)})
     if not kit:
         raise HTTPException(status_code=404, detail="Kit tidak dijumpai")
     
@@ -280,7 +296,7 @@ async def get_products(
     
     # Get kit names
     kit_ids = list(set(p["kit_id"] for p in products))
-    kits = await db.koop_kits.find({"_id": {"$in": [ObjectId(k) for k in kit_ids]}}).to_list(100)
+    kits = await db.koop_kits.find({"_id": {"$in": [_id_value(k) for k in kit_ids]}}).to_list(100)
     kit_map = {str(k["_id"]): k["name"] for k in kits}
     
     result = []
@@ -310,12 +326,12 @@ async def get_products(
 @router.get("/products/{product_id}", response_model=dict)
 async def get_product(product_id: str, db=None, current_user=None):
     """Get single product"""
-    product = await db.koop_products.find_one({"_id": ObjectId(product_id)})
+    product = await db.koop_products.find_one({"_id": _id_value(product_id)})
     if not product:
         raise HTTPException(status_code=404, detail="Produk tidak dijumpai")
     
     # Get kit name
-    kit = await db.koop_kits.find_one({"_id": ObjectId(product["kit_id"])})
+    kit = await db.koop_kits.find_one({"_id": _id_value(product["kit_id"])})
     kit_name = kit["name"] if kit else "Unknown"
     
     return {
@@ -357,7 +373,7 @@ async def update_product(product_id: str, product: KoopProductUpdate, db=None, c
     update_data["updated_at"] = datetime.now(timezone.utc)
     
     result = await db.koop_products.update_one(
-        {"_id": ObjectId(product_id)},
+        {"_id": _id_value(product_id)},
         {"$set": update_data}
     )
     
@@ -374,7 +390,7 @@ async def delete_product(product_id: str, db=None, current_user=None):
         raise HTTPException(status_code=403, detail="Akses ditolak")
     
     result = await db.koop_products.update_one(
-        {"_id": ObjectId(product_id)},
+        {"_id": _id_value(product_id)},
         {"$set": {"is_active": False, "updated_at": datetime.now(timezone.utc)}}
     )
     
@@ -410,7 +426,7 @@ async def get_cart(student_id: str, db=None, current_user=None):
         }
     
     # Get student name
-    student = await db.students.find_one({"_id": ObjectId(student_id)})
+    student = await db.students.find_one({"_id": _id_value(student_id)})
     student_name = student.get("full_name") if student else None
     
     items = cart.get("items", [])
@@ -436,10 +452,10 @@ async def add_to_cart(request: AddToCartRequest, db=None, current_user=None):
     
     # Verify student belongs to parent (handle both string and ObjectId parent_id)
     student = await db.students.find_one({
-        "_id": ObjectId(request.student_id),
+        "_id": _id_value(request.student_id),
         "$or": [
             {"parent_id": current_user["id"]},
-            {"parent_id": ObjectId(current_user["id"])}
+            {"parent_id": _id_value(current_user["id"])}
         ]
     })
     if not student:
@@ -447,7 +463,7 @@ async def add_to_cart(request: AddToCartRequest, db=None, current_user=None):
     
     # Get product
     product = await db.koop_products.find_one({
-        "_id": ObjectId(request.product_id),
+        "_id": _id_value(request.product_id),
         "is_active": True
     })
     if not product:
@@ -465,7 +481,7 @@ async def add_to_cart(request: AddToCartRequest, db=None, current_user=None):
             raise HTTPException(status_code=400, detail="Stok tidak mencukupi")
     
     # Get kit name
-    kit = await db.koop_kits.find_one({"_id": ObjectId(product["kit_id"])})
+    kit = await db.koop_kits.find_one({"_id": _id_value(product["kit_id"])})
     kit_name = kit["name"] if kit else "Unknown"
     
     # Find or create cart
@@ -525,17 +541,17 @@ async def add_kit_to_cart(kit_id: str, student_id: str, db=None, current_user=No
     
     # Verify student belongs to parent
     student = await db.students.find_one({
-        "_id": ObjectId(student_id),
+        "_id": _id_value(student_id),
         "$or": [
             {"parent_id": current_user["id"]},
-            {"parent_id": ObjectId(current_user["id"])}
+            {"parent_id": _id_value(current_user["id"])}
         ]
     })
     if not student:
         raise HTTPException(status_code=404, detail="Pelajar tidak dijumpai")
     
     # Get kit
-    kit = await db.koop_kits.find_one({"_id": ObjectId(kit_id), "is_active": True})
+    kit = await db.koop_kits.find_one({"_id": _id_value(kit_id), "is_active": True})
     if not kit:
         raise HTTPException(status_code=404, detail="Kit tidak dijumpai")
     
@@ -622,17 +638,17 @@ async def add_kit_to_cart_with_sizes(request: AddKitToCartRequest, db=None, curr
     
     # Verify student belongs to parent
     student = await db.students.find_one({
-        "_id": ObjectId(request.student_id),
+        "_id": _id_value(request.student_id),
         "$or": [
             {"parent_id": current_user["id"]},
-            {"parent_id": ObjectId(current_user["id"])}
+            {"parent_id": _id_value(current_user["id"])}
         ]
     })
     if not student:
         raise HTTPException(status_code=404, detail="Pelajar tidak dijumpai")
     
     # Get kit
-    kit = await db.koop_kits.find_one({"_id": ObjectId(request.kit_id), "is_active": True})
+    kit = await db.koop_kits.find_one({"_id": _id_value(request.kit_id), "is_active": True})
     if not kit:
         raise HTTPException(status_code=404, detail="Kit tidak dijumpai")
     
@@ -907,7 +923,7 @@ async def create_order(order: KoopOrderCreate, db=None, current_user=None):
     # Enrich items with product category for commission calculation
     enriched_items = []
     for item in items:
-        product = await db.koop_products.find_one({"_id": ObjectId(item["product_id"])})
+        product = await db.koop_products.find_one({"_id": _id_value(item["product_id"])})
         enriched_item = {**item}
         if product:
             enriched_item["category"] = product.get("category", "")
@@ -917,7 +933,7 @@ async def create_order(order: KoopOrderCreate, db=None, current_user=None):
     commission_data = await calculate_merchandise_commission(db, enriched_items)
     
     # Get student name
-    student = await db.students.find_one({"_id": ObjectId(order.student_id)})
+    student = await db.students.find_one({"_id": _id_value(order.student_id)})
     student_name = student.get("full_name") if student else None
     
     # Create order with commission info
@@ -947,7 +963,7 @@ async def create_order(order: KoopOrderCreate, db=None, current_user=None):
     
     # Deduct stock
     for item in enriched_items:
-        product = await db.koop_products.find_one({"_id": ObjectId(item["product_id"])})
+        product = await db.koop_products.find_one({"_id": _id_value(item["product_id"])})
         if product:
             if product.get("has_sizes") and item.get("size"):
                 sizes_stock = product.get("sizes_stock", [])
@@ -1021,7 +1037,7 @@ async def get_orders(
 @router.get("/orders/{order_id}", response_model=dict)
 async def get_order(order_id: str, db=None, current_user=None):
     """Get single order"""
-    order = await db.koop_orders.find_one({"_id": ObjectId(order_id)})
+    order = await db.koop_orders.find_one({"_id": _id_value(order_id)})
     
     if not order:
         raise HTTPException(status_code=404, detail="Pesanan tidak dijumpai")
@@ -1066,7 +1082,7 @@ async def update_order_status(
         raise HTTPException(status_code=400, detail=f"Status tidak sah. Pilihan: {valid_statuses}")
     
     result = await db.koop_orders.update_one(
-        {"_id": ObjectId(order_id)},
+        {"_id": _id_value(order_id)},
         {"$set": {"status": status, "updated_at": datetime.now(timezone.utc)}}
     )
     
@@ -1250,13 +1266,21 @@ async def get_laporan_detail(
     # Inventori PUM (if exists)
     inventori_pum = {"nilai_stok": 0, "bilangan_item": 0}
     if hasattr(db, "pum_products"):
-        agg = await db.pum_products.aggregate([
-            {"$match": {"is_active": True}},
-            {"$group": {"_id": None, "total_stock_value": {"$sum": {"$multiply": ["$price", "$stock"]}}, "total_items": {"$sum": "$stock"}}}
-        ]).to_list(1)
-        if agg:
-            inventori_pum["nilai_stok"] = round(agg[0].get("total_stock_value", 0), 2)
-            inventori_pum["bilangan_item"] = agg[0].get("total_items", 0)
+        total_stock_value = 0.0
+        total_items = 0
+        async for row in db.pum_products.find({"is_active": True}):
+            try:
+                stock = int(row.get("stock", 0) or 0)
+            except (TypeError, ValueError):
+                stock = 0
+            try:
+                price = float(row.get("price", 0) or 0)
+            except (TypeError, ValueError):
+                price = 0.0
+            total_stock_value += (price * stock)
+            total_items += stock
+        inventori_pum["nilai_stok"] = round(total_stock_value, 2)
+        inventori_pum["bilangan_item"] = total_items
 
     return {
         "tahun": year,

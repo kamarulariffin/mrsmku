@@ -7,9 +7,10 @@ Supports: jpg, png, webp
 
 from fastapi import APIRouter, HTTPException, Depends, UploadFile, File, Form
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from typing import List, Optional
+from typing import Any, List, Optional
 from datetime import datetime, timezone
 from bson import ObjectId
+from services.id_normalizer import object_id_or_none
 import os
 import uuid
 import base64
@@ -71,6 +72,21 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
 async def log_audit(user, action, module, details):
     if _log_audit_func:
         await _log_audit_func(user, action, module, details)
+
+
+def _id_value(value: Any) -> Any:
+    """Normalize ID-like inputs while supporting non-ObjectId IDs."""
+    if value is None:
+        return None
+    if isinstance(value, ObjectId):
+        return value
+    text = str(value).strip()
+    try:
+        if ObjectId.is_valid(text):
+            return object_id_or_none(text)
+    except Exception:
+        pass
+    return text
 
 
 def get_file_extension(filename: str) -> str:
@@ -158,7 +174,7 @@ async def upload_product_image(
     
     # Get existing product images count
     collection = "koop_products" if product_type == "koperasi" else "pum_products"
-    product = await db[collection].find_one({"_id": ObjectId(product_id)})
+    product = await db[collection].find_one({"_id": _id_value(product_id)})
     
     if not product:
         raise HTTPException(status_code=404, detail="Produk tidak dijumpai")
@@ -196,7 +212,7 @@ async def upload_product_image(
     }
     
     await db[collection].update_one(
-        {"_id": ObjectId(product_id)},
+        {"_id": _id_value(product_id)},
         {
             "$push": {"images": image_doc},
             "$set": {"updated_at": datetime.now(timezone.utc)}
@@ -206,7 +222,7 @@ async def upload_product_image(
     # Set as primary image if first image
     if len(existing_images) == 0:
         await db[collection].update_one(
-            {"_id": ObjectId(product_id)},
+            {"_id": _id_value(product_id)},
             {"$set": {"image_url": image_url}}
         )
     
@@ -238,7 +254,7 @@ async def upload_product_images_bulk(
         raise HTTPException(status_code=403, detail="Akses ditolak")
     
     collection = "koop_products" if product_type == "koperasi" else "pum_products"
-    product = await db[collection].find_one({"_id": ObjectId(product_id)})
+    product = await db[collection].find_one({"_id": _id_value(product_id)})
     
     if not product:
         raise HTTPException(status_code=404, detail="Produk tidak dijumpai")
@@ -308,7 +324,7 @@ async def upload_product_images_bulk(
             update_ops["$set"]["image_url"] = uploaded_images[0]["url"]
         
         await db[collection].update_one(
-            {"_id": ObjectId(product_id)},
+            {"_id": _id_value(product_id)},
             update_ops
         )
     
@@ -335,7 +351,7 @@ async def delete_product_image(
         raise HTTPException(status_code=403, detail="Akses ditolak")
     
     collection = "koop_products" if product_type == "koperasi" else "pum_products"
-    product = await db[collection].find_one({"_id": ObjectId(product_id)})
+    product = await db[collection].find_one({"_id": _id_value(product_id)})
     
     if not product:
         raise HTTPException(status_code=404, detail="Produk tidak dijumpai")
@@ -367,7 +383,7 @@ async def delete_product_image(
         update_data["image_url"] = new_images[0]["url"] if new_images else None
     
     await db[collection].update_one(
-        {"_id": ObjectId(product_id)},
+        {"_id": _id_value(product_id)},
         {"$set": update_data}
     )
     
@@ -394,7 +410,7 @@ async def reorder_product_images(
         raise HTTPException(status_code=403, detail="Akses ditolak")
     
     collection = "koop_products" if product_type == "koperasi" else "pum_products"
-    product = await db[collection].find_one({"_id": ObjectId(product_id)})
+    product = await db[collection].find_one({"_id": _id_value(product_id)})
     
     if not product:
         raise HTTPException(status_code=404, detail="Produk tidak dijumpai")
@@ -423,7 +439,7 @@ async def reorder_product_images(
         update_data["image_url"] = reordered[0]["url"]
     
     await db[collection].update_one(
-        {"_id": ObjectId(product_id)},
+        {"_id": _id_value(product_id)},
         {"$set": update_data}
     )
     
@@ -448,7 +464,7 @@ async def set_primary_image(
         raise HTTPException(status_code=403, detail="Akses ditolak")
     
     collection = "koop_products" if product_type == "koperasi" else "pum_products"
-    product = await db[collection].find_one({"_id": ObjectId(product_id)})
+    product = await db[collection].find_one({"_id": _id_value(product_id)})
     
     if not product:
         raise HTTPException(status_code=404, detail="Produk tidak dijumpai")
@@ -463,7 +479,7 @@ async def set_primary_image(
     reordered = [image] + [img for img in images if img["id"] != image_id]
     
     await db[collection].update_one(
-        {"_id": ObjectId(product_id)},
+        {"_id": _id_value(product_id)},
         {
             "$set": {
                 "images": reordered,

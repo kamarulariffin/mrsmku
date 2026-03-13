@@ -10,6 +10,7 @@ from fastapi import APIRouter, HTTPException, Depends
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from datetime import datetime, timezone, timedelta
 from bson import ObjectId
+from services.id_normalizer import object_id_or_none
 from typing import Any, Dict, Optional
 from collections import defaultdict, deque
 from sqlalchemy import delete
@@ -1186,10 +1187,9 @@ async def get_financial_analytics_ai(
         if isinstance(sid, ObjectId):
             student_ids.append(sid)
         else:
-            try:
-                student_ids.append(ObjectId(sid))
-            except Exception:
-                pass
+            sid_oid = object_id_or_none(sid)
+            if sid_oid is not None:
+                student_ids.append(sid_oid)
     
     students_data = {}
     if student_ids:

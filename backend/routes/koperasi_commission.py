@@ -8,6 +8,7 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from typing import List, Optional
 from datetime import datetime, timezone, timedelta
 from bson import ObjectId
+from services.id_normalizer import object_id_or_none
 
 router = APIRouter(prefix="/api/koperasi/commission", tags=["Koperasi Commission"])
 security = HTTPBearer()
@@ -359,25 +360,21 @@ async def get_pending_commissions(user: dict = Depends(get_current_user)):
         raise HTTPException(status_code=403, detail="Akses ditolak")
     
     # Get completed orders that haven't had commission marked as paid
-    pipeline = [
+    total_sales = 0.0
+    order_count = 0
+    async for row in db.koop_orders.find(
         {
-            "$match": {
-                "status": {"$in": ["paid", "processing", "ready", "collected"]},
-                "commission_paid": {"$ne": True}
-            }
-        },
-        {
-            "$group": {
-                "_id": None,
-                "total_sales": {"$sum": "$total_amount"},
-                "order_count": {"$sum": 1}
-            }
+            "status": {"$in": ["paid", "processing", "ready", "collected"]},
+            "commission_paid": {"$ne": True},
         }
-    ]
-    
-    result = await db.koop_orders.aggregate(pipeline).to_list(1)
-    
-    if not result:
+    ):
+        try:
+            total_sales += float(row.get("total_amount", 0) or 0)
+        except (TypeError, ValueError):
+            pass
+        order_count += 1
+
+    if order_count == 0:
         return {
             "pending_orders": 0,
             "total_sales": 0,
@@ -388,11 +385,10 @@ async def get_pending_commissions(user: dict = Depends(get_current_user)):
     settings = await db.koperasi_settings.find_one({"type": "commission"})
     rate = settings.get("pum_commission_rate", 10.0) if settings else 10.0
     
-    total_sales = result[0]["total_sales"]
     pending_commission = total_sales * (rate / 100)
     
     return {
-        "pending_orders": result[0]["order_count"],
+        "pending_orders": order_count,
         "total_sales": round(total_sales, 2),
         "commission_rate": rate,
         "pending_commission": round(pending_commission, 2)
@@ -417,7 +413,13 @@ async def mark_commission_paid(
     if mark_all_pending:
         query["commission_paid"] = {"$ne": True}
     elif order_ids:
-        query["_id"] = {"$in": [ObjectId(oid) for oid in order_ids]}
+        normalized_order_ids = []
+        for oid in order_ids:
+            parsed = object_id_or_none(oid)
+            if parsed is None:
+                raise HTTPException(status_code=400, detail="ID pesanan tidak sah")
+            normalized_order_ids.append(parsed)
+        query["_id"] = {"$in": normalized_order_ids}
     else:
         raise HTTPException(status_code=400, detail="Sila pilih pesanan atau tandakan semua")
     

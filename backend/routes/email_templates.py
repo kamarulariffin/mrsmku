@@ -3,8 +3,9 @@ Modul Template Email - CRUD template e-mel mengikut fungsi dalam sistem.
 Akses: semua peranan pentadbiran (superadmin, admin, bendahari, warden, dll.) — BUKAN pelajar/ibu bapa.
 """
 from datetime import datetime, timezone
-from typing import Optional, List, Callable
+from typing import Any, Optional, List, Callable
 from bson import ObjectId
+from services.id_normalizer import object_id_or_none
 
 from fastapi import APIRouter, HTTPException, Depends, Query
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -37,6 +38,21 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
     if not credentials:
         raise HTTPException(status_code=401, detail="Token diperlukan")
     return await _get_current_user_func(credentials)
+
+
+def _id_value(value: Any) -> Any:
+    """Normalize ID-like inputs while supporting non-ObjectId IDs."""
+    if value is None:
+        return None
+    if isinstance(value, ObjectId):
+        return value
+    text = str(value).strip()
+    try:
+        if ObjectId.is_valid(text):
+            return object_id_or_none(text)
+    except Exception:
+        pass
+    return text
 
 
 def require_admin():
@@ -131,14 +147,13 @@ async def stats_by_tingkatan(current_user: dict = Depends(require_admin())):
     for tingkatan in range(1, 6):
         student_count = await db.students.count_documents({"form": tingkatan})
         # Ibu bapa unik yang mempunyai sekurang-kurangnya seorang anak dalam tingkatan ini
-        pipeline = [
-            {"$match": {"form": tingkatan}},
-            {"$group": {"_id": "$parent_id"}},
-            {"$match": {"_id": {"$ne": None, "$ne": ""}}},
-            {"$count": "count"},
-        ]
-        agg = await db.students.aggregate(pipeline).to_list(1)
-        parent_count = agg[0]["count"] if agg else 0
+        parent_ids = set()
+        async for row in db.students.find({"form": tingkatan, "parent_id": {"$nin": [None, ""]}}):
+            parent_id = row.get("parent_id")
+            if parent_id in (None, ""):
+                continue
+            parent_ids.add(str(parent_id).strip())
+        parent_count = len(parent_ids)
         stats[str(tingkatan)] = {"students": student_count, "parents": parent_count}
     return {"by_tingkatan": stats}
 
@@ -212,7 +227,7 @@ async def send_test_email(
 async def get_template(template_id: str, current_user: dict = Depends(require_admin())):
     """Dapatkan template mengikut ID."""
     db = get_db()
-    doc = await db.email_templates.find_one({"_id": ObjectId(template_id)})
+    doc = await db.email_templates.find_one({"_id": _id_value(template_id)})
     if not doc:
         raise HTTPException(status_code=404, detail="Template tidak dijumpai")
     return {"template": serialize_template(doc)}
@@ -262,15 +277,15 @@ async def update_template(
 ):
     """Kemaskini template e-mel."""
     db = get_db()
-    doc = await db.email_templates.find_one({"_id": ObjectId(template_id)})
+    doc = await db.email_templates.find_one({"_id": _id_value(template_id)})
     if not doc:
         raise HTTPException(status_code=404, detail="Template tidak dijumpai")
     update = {k: v for k, v in body.dict().items() if v is not None}
     if not update:
         return {"message": "Tiada perubahan", "template": serialize_template(doc)}
     update["updated_at"] = datetime.now(timezone.utc).isoformat()
-    await db.email_templates.update_one({"_id": ObjectId(template_id)}, {"$set": update})
-    updated = await db.email_templates.find_one({"_id": ObjectId(template_id)})
+    await db.email_templates.update_one({"_id": _id_value(template_id)}, {"$set": update})
+    updated = await db.email_templates.find_one({"_id": _id_value(template_id)})
     return {"message": "Template dikemaskini", "template": serialize_template(updated)}
 
 
@@ -281,8 +296,8 @@ async def delete_template(
 ):
     """Padam template (soft: set is_active=False) atau hard delete."""
     db = get_db()
-    doc = await db.email_templates.find_one({"_id": ObjectId(template_id)})
+    doc = await db.email_templates.find_one({"_id": _id_value(template_id)})
     if not doc:
         raise HTTPException(status_code=404, detail="Template tidak dijumpai")
-    await db.email_templates.delete_one({"_id": ObjectId(template_id)})
+    await db.email_templates.delete_one({"_id": _id_value(template_id)})
     return {"message": "Template dipadam"}

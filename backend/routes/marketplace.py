@@ -6,9 +6,10 @@ Extended with: Product Variants, Bundles, Category Access Rules, Vendor Wallet &
 
 from fastapi import APIRouter, HTTPException, Depends
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from typing import List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from datetime import datetime, timezone, timedelta
 from bson import ObjectId
+from services.id_normalizer import object_id_or_none
 import random
 import string
 
@@ -91,6 +92,65 @@ def generate_reference_number(prefix: str = "LED"):
     timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
     random_str = ''.join(random.choices(string.digits, k=4))
     return f"{prefix}-{timestamp}-{random_str}"
+
+
+def _safe_float(value: Any) -> float:
+    """Convert numeric-like values to float safely."""
+    if value is None:
+        return 0.0
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _to_utc_datetime(value: Any) -> Optional[datetime]:
+    """Parse datetime value into timezone-aware UTC datetime."""
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc)
+    if isinstance(value, str):
+        raw = value.strip()
+        if raw.endswith("Z"):
+            raw = raw[:-1] + "+00:00"
+        try:
+            parsed = datetime.fromisoformat(raw)
+            if parsed.tzinfo is None:
+                return parsed.replace(tzinfo=timezone.utc)
+            return parsed.astimezone(timezone.utc)
+        except ValueError:
+            return None
+    return None
+
+
+def _month_key(value: Any) -> Optional[Tuple[int, int]]:
+    dt = _to_utc_datetime(value)
+    if dt is None:
+        return None
+    return (dt.year, dt.month)
+
+
+def _day_key(value: Any) -> Optional[Tuple[int, int, int]]:
+    dt = _to_utc_datetime(value)
+    if dt is None:
+        return None
+    return (dt.year, dt.month, dt.day)
+
+
+def _id_value(value: Any) -> Any:
+    """Normalize ID-like inputs while remaining compatible with non-ObjectId IDs."""
+    if value is None:
+        return None
+    if isinstance(value, ObjectId):
+        return value
+    text = str(value)
+    try:
+        if ObjectId.is_valid(text):
+            return object_id_or_none(text)
+    except Exception:
+        pass
+    return text
 
 
 # ==================== SETTINGS ====================
@@ -543,7 +603,7 @@ async def get_vendor(vendor_id: str, user: dict = Depends(get_current_user_optio
     """Get single vendor details"""
     db = get_db()
     
-    vendor = await db.marketplace_vendors.find_one({"_id": ObjectId(vendor_id)})
+    vendor = await db.marketplace_vendors.find_one({"_id": _id_value(vendor_id)})
     if not vendor:
         raise HTTPException(status_code=404, detail="Vendor tidak dijumpai")
     
@@ -597,7 +657,7 @@ async def approve_vendor(
     if user["role"] not in ["superadmin", "admin"]:
         raise HTTPException(status_code=403, detail="Akses ditolak")
     
-    vendor = await db.marketplace_vendors.find_one({"_id": ObjectId(vendor_id)})
+    vendor = await db.marketplace_vendors.find_one({"_id": _id_value(vendor_id)})
     if not vendor:
         raise HTTPException(status_code=404, detail="Vendor tidak dijumpai")
     
@@ -633,13 +693,13 @@ async def approve_vendor(
         update_data["rejection_reason"] = approval.rejection_reason
     
     await db.marketplace_vendors.update_one(
-        {"_id": ObjectId(vendor_id)},
+        {"_id": _id_value(vendor_id)},
         {"$set": update_data}
     )
     
     # Notify vendor
     await db.notifications.insert_one({
-        "user_id": ObjectId(vendor["user_id"]),
+        "user_id": _id_value(vendor["user_id"]),
         "title": "Status Permohonan Vendor",
         "message": f"Permohonan vendor anda telah {'diluluskan' if approval.status == VendorStatus.APPROVED else 'ditolak'}." + 
                   (f" Sebab: {approval.rejection_reason}" if approval.rejection_reason else ""),
@@ -884,7 +944,7 @@ async def get_product(product_id: str, user: dict = Depends(get_current_user_opt
     """Get single product"""
     db = get_db()
     
-    product = await db.marketplace_products.find_one({"_id": ObjectId(product_id)})
+    product = await db.marketplace_products.find_one({"_id": _id_value(product_id)})
     if not product:
         raise HTTPException(status_code=404, detail="Produk tidak dijumpai")
     
@@ -899,7 +959,7 @@ async def get_product(product_id: str, user: dict = Depends(get_current_user_opt
         raise HTTPException(status_code=404, detail="Produk tidak dijumpai")
     
     # Get vendor info
-    vendor = await db.marketplace_vendors.find_one({"_id": ObjectId(product["vendor_id"])})
+    vendor = await db.marketplace_vendors.find_one({"_id": _id_value(product["vendor_id"])})
     
     return {
         "id": str(product["_id"]),
@@ -930,7 +990,7 @@ async def update_product(product_id: str, product: VendorProductUpdate, user: di
     """Update product - Vendor owner only"""
     db = get_db()
     
-    existing = await db.marketplace_products.find_one({"_id": ObjectId(product_id)})
+    existing = await db.marketplace_products.find_one({"_id": _id_value(product_id)})
     if not existing:
         raise HTTPException(status_code=404, detail="Produk tidak dijumpai")
     
@@ -950,7 +1010,7 @@ async def update_product(product_id: str, product: VendorProductUpdate, user: di
         update_data["rejection_reason"] = None
     
     await db.marketplace_products.update_one(
-        {"_id": ObjectId(product_id)},
+        {"_id": _id_value(product_id)},
         {"$set": update_data}
     )
     
@@ -971,7 +1031,7 @@ async def approve_product(
     if user["role"] not in ["superadmin", "admin"]:
         raise HTTPException(status_code=403, detail="Akses ditolak")
     
-    product = await db.marketplace_products.find_one({"_id": ObjectId(product_id)})
+    product = await db.marketplace_products.find_one({"_id": _id_value(product_id)})
     if not product:
         raise HTTPException(status_code=404, detail="Produk tidak dijumpai")
     
@@ -987,7 +1047,7 @@ async def approve_product(
         
         # Update vendor product count
         await db.marketplace_vendors.update_one(
-            {"_id": ObjectId(product["vendor_id"])},
+            {"_id": _id_value(product["vendor_id"])},
             {"$inc": {"total_products": 1}}
         )
     elif approval.status == ProductApprovalStatus.REJECTED:
@@ -996,15 +1056,15 @@ async def approve_product(
         update_data["rejection_reason"] = approval.rejection_reason
     
     await db.marketplace_products.update_one(
-        {"_id": ObjectId(product_id)},
+        {"_id": _id_value(product_id)},
         {"$set": update_data}
     )
     
     # Notify vendor
-    vendor = await db.marketplace_vendors.find_one({"_id": ObjectId(product["vendor_id"])})
+    vendor = await db.marketplace_vendors.find_one({"_id": _id_value(product["vendor_id"])})
     if vendor:
         await db.notifications.insert_one({
-            "user_id": ObjectId(vendor["user_id"]),
+            "user_id": _id_value(vendor["user_id"]),
             "title": "Status Kelulusan Produk",
             "message": f"Produk '{product['name']}' telah {'diluluskan' if approval.status == ProductApprovalStatus.APPROVED else 'ditolak'}." +
                       (f" Sebab: {approval.rejection_reason}" if approval.rejection_reason else ""),
@@ -1024,7 +1084,7 @@ async def delete_product(product_id: str, user: dict = Depends(get_current_user)
     """Soft delete product - Vendor owner or admin"""
     db = get_db()
     
-    product = await db.marketplace_products.find_one({"_id": ObjectId(product_id)})
+    product = await db.marketplace_products.find_one({"_id": _id_value(product_id)})
     if not product:
         raise HTTPException(status_code=404, detail="Produk tidak dijumpai")
     
@@ -1035,14 +1095,14 @@ async def delete_product(product_id: str, user: dict = Depends(get_current_user)
         raise HTTPException(status_code=403, detail="Akses ditolak")
     
     await db.marketplace_products.update_one(
-        {"_id": ObjectId(product_id)},
+        {"_id": _id_value(product_id)},
         {"$set": {"is_active": False, "updated_at": datetime.now(timezone.utc)}}
     )
     
     # Update vendor product count if was approved
     if product["approval_status"] == ProductApprovalStatus.APPROVED.value:
         await db.marketplace_vendors.update_one(
-            {"_id": ObjectId(product["vendor_id"])},
+            {"_id": _id_value(product["vendor_id"])},
             {"$inc": {"total_products": -1}}
         )
     
@@ -1115,7 +1175,7 @@ async def create_order(order: MarketplaceOrderCreate, user: dict = Depends(get_c
     
     # Verify student belongs to parent and is active
     student = await db.students.find_one({
-        "_id": ObjectId(order.student_id),
+        "_id": _id_value(order.student_id),
         "$or": [
             {"parent_id": str(user["_id"])},
             {"parent_id": user["_id"]}
@@ -1157,7 +1217,7 @@ async def create_order(order: MarketplaceOrderCreate, user: dict = Depends(get_c
     # Process regular items
     for item in order.items:
         product = await db.marketplace_products.find_one({
-            "_id": ObjectId(item.product_id),
+            "_id": _id_value(item.product_id),
             "is_active": True,
             "approval_status": ProductApprovalStatus.APPROVED.value
         })
@@ -1236,7 +1296,7 @@ async def create_order(order: MarketplaceOrderCreate, user: dict = Depends(get_c
     # Process bundles
     for bundle_item in order.bundles:
         bundle = await db.marketplace_bundles.find_one({
-            "_id": ObjectId(bundle_item.bundle_id),
+            "_id": _id_value(bundle_item.bundle_id),
             "is_active": True,
             "approval_status": ProductApprovalStatus.APPROVED.value
         })
@@ -1246,7 +1306,7 @@ async def create_order(order: MarketplaceOrderCreate, user: dict = Depends(get_c
         
         # Validate all bundle items have stock
         for bi in bundle.get("items", []):
-            product = await db.marketplace_products.find_one({"_id": ObjectId(bi["product_id"])})
+            product = await db.marketplace_products.find_one({"_id": _id_value(bi["product_id"])})
             if not product:
                 raise HTTPException(status_code=400, detail="Produk dalam bundle tidak dijumpai")
             
@@ -1341,12 +1401,12 @@ async def create_order(order: MarketplaceOrderCreate, user: dict = Depends(get_c
     for update in stock_updates:
         if update["type"] == "variant":
             await db.marketplace_products.update_one(
-                {"_id": ObjectId(update["product_id"]), "variants.sku": update["variant_sku"]},
+                {"_id": _id_value(update["product_id"]), "variants.sku": update["variant_sku"]},
                 {"$inc": {"variants.$.stock": -update["quantity"]}}
             )
         else:
             await db.marketplace_products.update_one(
-                {"_id": ObjectId(update["product_id"])},
+                {"_id": _id_value(update["product_id"])},
                 {"$inc": {"stock": -update["quantity"]}}
             )
     
@@ -1421,7 +1481,7 @@ async def get_order(order_id: str, user: dict = Depends(get_current_user)):
     """Get single order details"""
     db = get_db()
     
-    order = await db.marketplace_orders.find_one({"_id": ObjectId(order_id)})
+    order = await db.marketplace_orders.find_one({"_id": _id_value(order_id)})
     if not order:
         raise HTTPException(status_code=404, detail="Pesanan tidak dijumpai")
     
@@ -1466,7 +1526,7 @@ async def update_order_status(
     """Update order status - Admin or Vendor"""
     db = get_db()
     
-    order = await db.marketplace_orders.find_one({"_id": ObjectId(order_id)})
+    order = await db.marketplace_orders.find_one({"_id": _id_value(order_id)})
     if not order:
         raise HTTPException(status_code=404, detail="Pesanan tidak dijumpai")
     
@@ -1567,14 +1627,14 @@ async def update_order_status(
             
             # Update vendor total sales
             await db.marketplace_vendors.update_one(
-                {"_id": ObjectId(vendor_id_key)},
+                {"_id": _id_value(vendor_id_key)},
                 {"$inc": {"total_sales": vendor_data["total"]}}
             )
         
         # Update products sales count
         for item in order["items"]:
             await db.marketplace_products.update_one(
-                {"_id": ObjectId(item["product_id"])},
+                {"_id": _id_value(item["product_id"])},
                 {"$inc": {"sales_count": item["quantity"]}}
             )
         
@@ -1590,36 +1650,36 @@ async def update_order_status(
                     if bi.get("variant_sku"):
                         # Restore variant stock
                         await db.marketplace_products.update_one(
-                            {"_id": ObjectId(bi["product_id"]), "variants.sku": bi["variant_sku"]},
+                            {"_id": _id_value(bi["product_id"]), "variants.sku": bi["variant_sku"]},
                             {"$inc": {"variants.$.stock": required_qty}}
                         )
                     else:
                         # Restore simple product stock
                         await db.marketplace_products.update_one(
-                            {"_id": ObjectId(bi["product_id"])},
+                            {"_id": _id_value(bi["product_id"])},
                             {"$inc": {"stock": required_qty}}
                         )
             elif item.get("variant_snapshot") and item["variant_snapshot"].get("sku"):
                 # Restore variant stock
                 await db.marketplace_products.update_one(
-                    {"_id": ObjectId(item["product_id"]), "variants.sku": item["variant_snapshot"]["sku"]},
+                    {"_id": _id_value(item["product_id"]), "variants.sku": item["variant_snapshot"]["sku"]},
                     {"$inc": {"variants.$.stock": item["quantity"]}}
                 )
             else:
                 # Restore simple product stock
                 await db.marketplace_products.update_one(
-                    {"_id": ObjectId(item["product_id"])},
+                    {"_id": _id_value(item["product_id"])},
                     {"$inc": {"stock": item["quantity"]}}
                 )
     
     await db.marketplace_orders.update_one(
-        {"_id": ObjectId(order_id)},
+        {"_id": _id_value(order_id)},
         {"$set": update_data}
     )
     
     # Notify buyer of status change
     await db.notifications.insert_one({
-        "user_id": ObjectId(order["buyer_id"]),
+        "user_id": _id_value(order["buyer_id"]),
         "title": "Status Pesanan Dikemaskini",
         "message": f"Pesanan {order['order_number']} telah dikemaskini ke status: {new_status}",
         "type": "info",
@@ -1653,16 +1713,14 @@ async def get_dashboard_stats(user: dict = Depends(get_current_user)):
         pending_products = await db.marketplace_products.count_documents({"approval_status": ProductApprovalStatus.PENDING.value})
         total_orders = await db.marketplace_orders.count_documents({})
         
-        # Calculate totals from ledger
-        dk_total = await db.financial_ledger.aggregate([
-            {"$match": {"type": LedgerType.DANA_KECEMERLANGAN.value}},
-            {"$group": {"_id": None, "total": {"$sum": "$amount"}}}
-        ]).to_list(1)
+        # Calculate totals from ledger without Mongo aggregate pipeline.
+        dk_total = 0.0
+        async for entry in db.financial_ledger.find({"type": LedgerType.DANA_KECEMERLANGAN.value}):
+            dk_total += _safe_float(entry.get("amount"))
         
-        kop_total = await db.financial_ledger.aggregate([
-            {"$match": {"type": LedgerType.KOPERASI.value}},
-            {"$group": {"_id": None, "total": {"$sum": "$amount"}}}
-        ]).to_list(1)
+        kop_total = 0.0
+        async for entry in db.financial_ledger.find({"type": LedgerType.KOPERASI.value}):
+            kop_total += _safe_float(entry.get("amount"))
         
         return {
             "type": "admin",
@@ -1671,8 +1729,8 @@ async def get_dashboard_stats(user: dict = Depends(get_current_user)):
             "total_products": total_products,
             "pending_products": pending_products,
             "total_orders": total_orders,
-            "dana_kecemerlangan_total": dk_total[0]["total"] if dk_total else 0,
-            "koperasi_total": kop_total[0]["total"] if kop_total else 0
+            "dana_kecemerlangan_total": dk_total,
+            "koperasi_total": kop_total
         }
     
     elif vendor:
@@ -1687,11 +1745,12 @@ async def get_dashboard_stats(user: dict = Depends(get_current_user)):
             "status": {"$in": [OrderStatus.PAID.value, OrderStatus.PREPARING.value]}
         })
         
-        # Calculate earnings
-        earnings = await db.financial_ledger.aggregate([
-            {"$match": {"type": LedgerType.VENDOR_EARNING.value, "vendor_id": vendor_id}},
-            {"$group": {"_id": None, "total": {"$sum": "$amount"}}}
-        ]).to_list(1)
+        # Calculate earnings without Mongo aggregate pipeline.
+        earnings = 0.0
+        async for entry in db.financial_ledger.find(
+            {"type": LedgerType.VENDOR_EARNING.value, "vendor_id": vendor_id}
+        ):
+            earnings += _safe_float(entry.get("amount"))
         
         return {
             "type": "vendor",
@@ -1701,7 +1760,7 @@ async def get_dashboard_stats(user: dict = Depends(get_current_user)):
             "my_orders": my_orders,
             "pending_orders": pending_orders,
             "total_sales": vendor.get("total_sales", 0),
-            "total_earnings": earnings[0]["total"] if earnings else 0
+            "total_earnings": earnings
         }
     
     else:
@@ -1847,18 +1906,19 @@ async def get_vendor_performance_report(
                 query["created_at"] = {}
             query["created_at"]["$lte"] = datetime.fromisoformat(end_date)
         
-        earnings = await db.financial_ledger.aggregate([
-            {"$match": query},
-            {"$group": {"_id": None, "total": {"$sum": "$amount"}, "count": {"$sum": 1}}}
-        ]).to_list(1)
+        earnings_total = 0.0
+        earnings_count = 0
+        async for entry in db.financial_ledger.find(query):
+            earnings_total += _safe_float(entry.get("amount"))
+            earnings_count += 1
         
         result.append({
             "vendor_id": vendor_id,
             "vendor_name": v["business_name"],
             "total_sales": v.get("total_sales", 0),
             "total_products": v.get("total_products", 0),
-            "total_earnings": earnings[0]["total"] if earnings else 0,
-            "orders_count": earnings[0]["count"] if earnings else 0,
+            "total_earnings": earnings_total,
+            "orders_count": earnings_count,
             "rating": v.get("rating", 0)
         })
     
@@ -1890,7 +1950,7 @@ async def create_bundle(bundle: BundleCreate, user: dict = Depends(get_current_u
     
     for item in bundle.items:
         product = await db.marketplace_products.find_one({
-            "_id": ObjectId(item.product_id),
+            "_id": _id_value(item.product_id),
             "vendor_id": str(vendor["_id"]),
             "is_active": True,
             "approval_status": ProductApprovalStatus.APPROVED.value
@@ -2053,7 +2113,7 @@ async def get_bundle(bundle_id: str, user: dict = Depends(get_current_user_optio
     """Get single bundle details"""
     db = get_db()
     
-    bundle = await db.marketplace_bundles.find_one({"_id": ObjectId(bundle_id)})
+    bundle = await db.marketplace_bundles.find_one({"_id": _id_value(bundle_id)})
     if not bundle:
         raise HTTPException(status_code=404, detail="Bundle tidak dijumpai")
     
@@ -2093,7 +2153,7 @@ async def update_bundle(bundle_id: str, bundle_update: BundleUpdate, user: dict 
     """Update bundle - Vendor owner only"""
     db = get_db()
     
-    existing = await db.marketplace_bundles.find_one({"_id": ObjectId(bundle_id)})
+    existing = await db.marketplace_bundles.find_one({"_id": _id_value(bundle_id)})
     if not existing:
         raise HTTPException(status_code=404, detail="Bundle tidak dijumpai")
     
@@ -2124,7 +2184,7 @@ async def update_bundle(bundle_id: str, bundle_update: BundleUpdate, user: dict 
             
             for item in bundle_update.items:
                 product = await db.marketplace_products.find_one({
-                    "_id": ObjectId(item.product_id),
+                    "_id": _id_value(item.product_id),
                     "vendor_id": existing["vendor_id"],
                     "is_active": True
                 })
@@ -2172,7 +2232,7 @@ async def update_bundle(bundle_id: str, bundle_update: BundleUpdate, user: dict 
         update_data["approval_status"] = ProductApprovalStatus.PENDING.value
         update_data["rejection_reason"] = None
     
-    await db.marketplace_bundles.update_one({"_id": ObjectId(bundle_id)}, {"$set": update_data})
+    await db.marketplace_bundles.update_one({"_id": _id_value(bundle_id)}, {"$set": update_data})
     
     await log_audit(user, "UPDATE_BUNDLE", "marketplace", f"Bundle dikemaskini: {existing['name']}")
     
@@ -2184,7 +2244,7 @@ async def delete_bundle(bundle_id: str, user: dict = Depends(get_current_user)):
     """Soft delete bundle - Vendor owner or admin"""
     db = get_db()
     
-    bundle = await db.marketplace_bundles.find_one({"_id": ObjectId(bundle_id)})
+    bundle = await db.marketplace_bundles.find_one({"_id": _id_value(bundle_id)})
     if not bundle:
         raise HTTPException(status_code=404, detail="Bundle tidak dijumpai")
     
@@ -2195,7 +2255,7 @@ async def delete_bundle(bundle_id: str, user: dict = Depends(get_current_user)):
         raise HTTPException(status_code=403, detail="Akses ditolak")
     
     await db.marketplace_bundles.update_one(
-        {"_id": ObjectId(bundle_id)},
+        {"_id": _id_value(bundle_id)},
         {"$set": {"is_active": False, "updated_at": datetime.now(timezone.utc)}}
     )
     
@@ -2216,7 +2276,7 @@ async def approve_bundle(
     if user["role"] not in ["superadmin", "admin"]:
         raise HTTPException(status_code=403, detail="Akses ditolak")
     
-    bundle = await db.marketplace_bundles.find_one({"_id": ObjectId(bundle_id)})
+    bundle = await db.marketplace_bundles.find_one({"_id": _id_value(bundle_id)})
     if not bundle:
         raise HTTPException(status_code=404, detail="Bundle tidak dijumpai")
     
@@ -2232,7 +2292,7 @@ async def approve_bundle(
             raise HTTPException(status_code=400, detail="Sila nyatakan sebab penolakan")
         update_data["rejection_reason"] = approval.rejection_reason
     
-    await db.marketplace_bundles.update_one({"_id": ObjectId(bundle_id)}, {"$set": update_data})
+    await db.marketplace_bundles.update_one({"_id": _id_value(bundle_id)}, {"$set": update_data})
     
     await log_audit(user, f"BUNDLE_{approval.status.value.upper()}", "marketplace", f"Bundle {bundle['name']} {approval.status.value}")
     
@@ -2302,12 +2362,12 @@ async def update_category_rule(
     if user["role"] not in ["superadmin", "admin"]:
         raise HTTPException(status_code=403, detail="Akses ditolak")
     
-    existing = await db.marketplace_category_rules.find_one({"_id": ObjectId(rule_id)})
+    existing = await db.marketplace_category_rules.find_one({"_id": _id_value(rule_id)})
     if not existing:
         raise HTTPException(status_code=404, detail="Peraturan tidak dijumpai")
     
     await db.marketplace_category_rules.update_one(
-        {"_id": ObjectId(rule_id)},
+        {"_id": _id_value(rule_id)},
         {"$set": {
             "category": rule.category,
             "allowed_roles": rule.allowed_roles,
@@ -2329,7 +2389,7 @@ async def delete_category_rule(rule_id: str, user: dict = Depends(get_current_us
     if user["role"] not in ["superadmin", "admin"]:
         raise HTTPException(status_code=403, detail="Akses ditolak")
     
-    result = await db.marketplace_category_rules.delete_one({"_id": ObjectId(rule_id)})
+    result = await db.marketplace_category_rules.delete_one({"_id": _id_value(rule_id)})
     if result.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Peraturan tidak dijumpai")
     
@@ -2349,35 +2409,36 @@ async def get_my_wallet(user: dict = Depends(get_current_user)):
     
     vendor_id = str(vendor["_id"])
     
-    # Calculate earnings from ledger
-    total_earnings_result = await db.financial_ledger.aggregate([
-        {"$match": {"type": LedgerType.VENDOR_EARNING.value, "vendor_id": vendor_id}},
-        {"$group": {"_id": None, "total": {"$sum": "$amount"}}}
-    ]).to_list(1)
-    total_earnings = total_earnings_result[0]["total"] if total_earnings_result else 0
+    # Calculate earnings from ledger without Mongo aggregate pipeline.
+    total_earnings = 0.0
+    async for entry in db.financial_ledger.find(
+        {"type": LedgerType.VENDOR_EARNING.value, "vendor_id": vendor_id}
+    ):
+        total_earnings += _safe_float(entry.get("amount"))
     
-    # Calculate total withdrawn (payouts completed)
-    total_withdrawn_result = await db.marketplace_payouts.aggregate([
-        {"$match": {"vendor_id": vendor_id, "status": PayoutStatus.COMPLETED.value}},
-        {"$group": {"_id": None, "total": {"$sum": "$amount"}}}
-    ]).to_list(1)
-    total_withdrawn = total_withdrawn_result[0]["total"] if total_withdrawn_result else 0
+    # Calculate total withdrawn (payouts completed).
+    total_withdrawn = 0.0
+    async for payout in db.marketplace_payouts.find(
+        {"vendor_id": vendor_id, "status": PayoutStatus.COMPLETED.value}
+    ):
+        total_withdrawn += _safe_float(payout.get("amount"))
     
-    # Calculate pending payouts
-    pending_payouts_result = await db.marketplace_payouts.aggregate([
-        {"$match": {"vendor_id": vendor_id, "status": {"$in": [PayoutStatus.PENDING.value, PayoutStatus.APPROVED.value]}}},
-        {"$group": {"_id": None, "total": {"$sum": "$amount"}}}
-    ]).to_list(1)
-    pending_payouts = pending_payouts_result[0]["total"] if pending_payouts_result else 0
+    # Calculate pending payouts.
+    pending_payouts = 0.0
+    async for payout in db.marketplace_payouts.find(
+        {"vendor_id": vendor_id, "status": {"$in": [PayoutStatus.PENDING.value, PayoutStatus.APPROVED.value]}}
+    ):
+        pending_payouts += _safe_float(payout.get("amount"))
     
-    # Calculate pending earnings (orders not yet PAID)
-    pending_earnings_result = await db.marketplace_orders.aggregate([
-        {"$match": {"items.vendor_id": vendor_id, "status": OrderStatus.PENDING_PAYMENT.value}},
-        {"$unwind": "$items"},
-        {"$match": {"items.vendor_id": vendor_id}},
-        {"$group": {"_id": None, "total": {"$sum": "$items.total_price"}}}
-    ]).to_list(1)
-    pending_earnings = pending_earnings_result[0]["total"] if pending_earnings_result else 0
+    # Calculate pending earnings (orders not yet paid).
+    pending_earnings = 0.0
+    async for order in db.marketplace_orders.find(
+        {"items.vendor_id": vendor_id, "status": OrderStatus.PENDING_PAYMENT.value}
+    ):
+        for item in order.get("items", []):
+            if str(item.get("vendor_id")) != vendor_id:
+                continue
+            pending_earnings += _safe_float(item.get("total_price"))
     
     available_balance = total_earnings - total_withdrawn - pending_payouts
     
@@ -2402,24 +2463,24 @@ async def request_payout(payout: PayoutRequest, user: dict = Depends(get_current
     
     vendor_id = str(vendor["_id"])
     
-    # Calculate available balance inline
-    total_earnings_result = await db.financial_ledger.aggregate([
-        {"$match": {"type": LedgerType.VENDOR_EARNING.value, "vendor_id": vendor_id}},
-        {"$group": {"_id": None, "total": {"$sum": "$amount"}}}
-    ]).to_list(1)
-    total_earnings = total_earnings_result[0]["total"] if total_earnings_result else 0
+    # Calculate available balance inline without Mongo aggregate pipeline.
+    total_earnings = 0.0
+    async for entry in db.financial_ledger.find(
+        {"type": LedgerType.VENDOR_EARNING.value, "vendor_id": vendor_id}
+    ):
+        total_earnings += _safe_float(entry.get("amount"))
     
-    total_withdrawn_result = await db.marketplace_payouts.aggregate([
-        {"$match": {"vendor_id": vendor_id, "status": PayoutStatus.COMPLETED.value}},
-        {"$group": {"_id": None, "total": {"$sum": "$amount"}}}
-    ]).to_list(1)
-    total_withdrawn = total_withdrawn_result[0]["total"] if total_withdrawn_result else 0
+    total_withdrawn = 0.0
+    async for existing_payout in db.marketplace_payouts.find(
+        {"vendor_id": vendor_id, "status": PayoutStatus.COMPLETED.value}
+    ):
+        total_withdrawn += _safe_float(existing_payout.get("amount"))
     
-    pending_payouts_result = await db.marketplace_payouts.aggregate([
-        {"$match": {"vendor_id": vendor_id, "status": {"$in": [PayoutStatus.PENDING.value, PayoutStatus.APPROVED.value]}}},
-        {"$group": {"_id": None, "total": {"$sum": "$amount"}}}
-    ]).to_list(1)
-    pending_payouts = pending_payouts_result[0]["total"] if pending_payouts_result else 0
+    pending_payouts = 0.0
+    async for existing_payout in db.marketplace_payouts.find(
+        {"vendor_id": vendor_id, "status": {"$in": [PayoutStatus.PENDING.value, PayoutStatus.APPROVED.value]}}
+    ):
+        pending_payouts += _safe_float(existing_payout.get("amount"))
     
     available_balance = total_earnings - total_withdrawn - pending_payouts
     
@@ -2526,7 +2587,7 @@ async def approve_payout(
     if user["role"] not in ["superadmin", "admin", "bendahari"]:
         raise HTTPException(status_code=403, detail="Akses ditolak")
     
-    payout = await db.marketplace_payouts.find_one({"_id": ObjectId(payout_id)})
+    payout = await db.marketplace_payouts.find_one({"_id": _id_value(payout_id)})
     if not payout:
         raise HTTPException(status_code=404, detail="Permohonan tidak dijumpai")
     
@@ -2561,10 +2622,10 @@ async def approve_payout(
             "created_at": datetime.now(timezone.utc)
         })
     
-    await db.marketplace_payouts.update_one({"_id": ObjectId(payout_id)}, {"$set": update_data})
+    await db.marketplace_payouts.update_one({"_id": _id_value(payout_id)}, {"$set": update_data})
     
     # Notify vendor
-    vendor = await db.marketplace_vendors.find_one({"_id": ObjectId(payout["vendor_id"])})
+    vendor = await db.marketplace_vendors.find_one({"_id": _id_value(payout["vendor_id"])})
     if vendor:
         status_msg = {
             PayoutStatus.APPROVED.value: "diluluskan",
@@ -2572,7 +2633,7 @@ async def approve_payout(
             PayoutStatus.COMPLETED.value: "selesai diproses"
         }
         await db.notifications.insert_one({
-            "user_id": ObjectId(vendor["user_id"]),
+            "user_id": _id_value(vendor["user_id"]),
             "title": "Status Pengeluaran Wang",
             "message": f"Permohonan pengeluaran RM {payout['amount']:.2f} telah {status_msg.get(approval.status.value, approval.status.value)}." +
                       (f" Rujukan: {approval.reference_number}" if approval.reference_number else "") +
@@ -2637,38 +2698,55 @@ async def get_finance_dashboard(user: dict = Depends(get_current_user)):
     now = datetime.now(timezone.utc)
     start_of_month = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
     
-    # Dana Kecemerlangan totals
-    dk_total = await db.financial_ledger.aggregate([
-        {"$match": {"type": LedgerType.DANA_KECEMERLANGAN.value}},
-        {"$group": {"_id": None, "total": {"$sum": "$amount"}}}
-    ]).to_list(1)
-    
-    dk_month = await db.financial_ledger.aggregate([
-        {"$match": {"type": LedgerType.DANA_KECEMERLANGAN.value, "created_at": {"$gte": start_of_month}}},
-        {"$group": {"_id": None, "total": {"$sum": "$amount"}}}
-    ]).to_list(1)
-    
-    # Koperasi totals
-    kop_total = await db.financial_ledger.aggregate([
-        {"$match": {"type": LedgerType.KOPERASI.value}},
-        {"$group": {"_id": None, "total": {"$sum": "$amount"}}}
-    ]).to_list(1)
-    
-    kop_month = await db.financial_ledger.aggregate([
-        {"$match": {"type": LedgerType.KOPERASI.value, "created_at": {"$gte": start_of_month}}},
-        {"$group": {"_id": None, "total": {"$sum": "$amount"}}}
-    ]).to_list(1)
-    
-    # Vendor earnings & payouts
-    vendor_earnings_total = await db.financial_ledger.aggregate([
-        {"$match": {"type": LedgerType.VENDOR_EARNING.value}},
-        {"$group": {"_id": None, "total": {"$sum": "$amount"}}}
-    ]).to_list(1)
-    
-    vendor_payouts_total = await db.financial_ledger.aggregate([
-        {"$match": {"type": LedgerType.VENDOR_PAYOUT.value}},
-        {"$group": {"_id": None, "total": {"$sum": {"$abs": "$amount"}}}}
-    ]).to_list(1)
+    # Financial totals without Mongo aggregation pipeline.
+    tracked_types = {
+        LedgerType.DANA_KECEMERLANGAN.value,
+        LedgerType.KOPERASI.value,
+        LedgerType.VENDOR_EARNING.value,
+        LedgerType.VENDOR_PAYOUT.value,
+    }
+    dk_total = 0.0
+    dk_month = 0.0
+    kop_total = 0.0
+    kop_month = 0.0
+    vendor_earnings_total = 0.0
+    vendor_payouts_total = 0.0
+    monthly_type_totals: Dict[Tuple[int, int], Dict[str, float]] = {}
+
+    async for entry in db.financial_ledger.find({"type": {"$in": list(tracked_types)}}):
+        entry_type = entry.get("type")
+        amount = _safe_float(entry.get("amount"))
+        created_at = _to_utc_datetime(entry.get("created_at"))
+
+        if entry_type == LedgerType.DANA_KECEMERLANGAN.value:
+            dk_total += amount
+            if created_at and created_at >= start_of_month:
+                dk_month += amount
+        elif entry_type == LedgerType.KOPERASI.value:
+            kop_total += amount
+            if created_at and created_at >= start_of_month:
+                kop_month += amount
+        elif entry_type == LedgerType.VENDOR_EARNING.value:
+            vendor_earnings_total += amount
+        elif entry_type == LedgerType.VENDOR_PAYOUT.value:
+            vendor_payouts_total += abs(amount)
+
+        if created_at and entry_type in {
+            LedgerType.DANA_KECEMERLANGAN.value,
+            LedgerType.KOPERASI.value,
+            LedgerType.VENDOR_EARNING.value,
+        }:
+            key = (created_at.year, created_at.month)
+            month_bucket = monthly_type_totals.setdefault(
+                key,
+                {"dana_kecemerlangan": 0.0, "koperasi": 0.0, "vendor_earnings": 0.0},
+            )
+            if entry_type == LedgerType.DANA_KECEMERLANGAN.value:
+                month_bucket["dana_kecemerlangan"] += amount
+            elif entry_type == LedgerType.KOPERASI.value:
+                month_bucket["koperasi"] += amount
+            elif entry_type == LedgerType.VENDOR_EARNING.value:
+                month_bucket["vendor_earnings"] += amount
     
     # Pending payouts count
     pending_payouts = await db.marketplace_payouts.count_documents({"status": PayoutStatus.PENDING.value})
@@ -2677,57 +2755,42 @@ async def get_finance_dashboard(user: dict = Depends(get_current_user)):
     orders_month = await db.marketplace_orders.count_documents({"created_at": {"$gte": start_of_month}})
     orders_total = await db.marketplace_orders.count_documents({})
     
-    # Total sales (from orders)
-    sales_total = await db.marketplace_orders.aggregate([
-        {"$match": {"status": {"$nin": [OrderStatus.CANCELLED.value, OrderStatus.FAILED.value]}}},
-        {"$group": {"_id": None, "total": {"$sum": "$total_amount"}}}
-    ]).to_list(1)
+    # Total sales (from orders) without Mongo aggregate pipeline.
+    sales_total = 0.0
+    sales_month = 0.0
+    async for order in db.marketplace_orders.find(
+        {"status": {"$nin": [OrderStatus.CANCELLED.value, OrderStatus.FAILED.value]}}
+    ):
+        amount = _safe_float(order.get("total_amount"))
+        created_at = _to_utc_datetime(order.get("created_at"))
+        sales_total += amount
+        if created_at and created_at >= start_of_month:
+            sales_month += amount
     
-    sales_month = await db.marketplace_orders.aggregate([
-        {"$match": {"created_at": {"$gte": start_of_month}, "status": {"$nin": [OrderStatus.CANCELLED.value, OrderStatus.FAILED.value]}}},
-        {"$group": {"_id": None, "total": {"$sum": "$total_amount"}}}
-    ]).to_list(1)
-    
-    # Monthly breakdown (last 6 months)
-    monthly_breakdown = await db.financial_ledger.aggregate([
-        {"$match": {"type": {"$in": [LedgerType.DANA_KECEMERLANGAN.value, LedgerType.KOPERASI.value, LedgerType.VENDOR_EARNING.value]}}},
-        {"$group": {
-            "_id": {
-                "year": {"$year": "$created_at"},
-                "month": {"$month": "$created_at"},
-                "type": "$type"
-            },
-            "total": {"$sum": "$amount"}
-        }},
-        {"$sort": {"_id.year": -1, "_id.month": -1}},
-        {"$limit": 30}
-    ]).to_list(30)
-    
-    # Process monthly data
+    # Process monthly data (last 6 months, mirroring previous grouped output).
     months_data = {}
-    for entry in monthly_breakdown:
-        key = f"{entry['_id']['year']}-{entry['_id']['month']:02d}"
-        if key not in months_data:
-            months_data[key] = {"dana_kecemerlangan": 0, "koperasi": 0, "vendor_earnings": 0}
-        if entry['_id']['type'] == LedgerType.DANA_KECEMERLANGAN.value:
-            months_data[key]["dana_kecemerlangan"] = round(entry["total"], 2)
-        elif entry['_id']['type'] == LedgerType.KOPERASI.value:
-            months_data[key]["koperasi"] = round(entry["total"], 2)
-        elif entry['_id']['type'] == LedgerType.VENDOR_EARNING.value:
-            months_data[key]["vendor_earnings"] = round(entry["total"], 2)
+    monthly_keys = sorted(monthly_type_totals.keys(), reverse=True)[:30]
+    for year, month in monthly_keys:
+        key = f"{year}-{month:02d}"
+        bucket = monthly_type_totals.get((year, month), {})
+        months_data[key] = {
+            "dana_kecemerlangan": round(bucket.get("dana_kecemerlangan", 0.0), 2),
+            "koperasi": round(bucket.get("koperasi", 0.0), 2),
+            "vendor_earnings": round(bucket.get("vendor_earnings", 0.0), 2),
+        }
     
     return {
         "summary": {
-            "dana_kecemerlangan_total": round(dk_total[0]["total"], 2) if dk_total else 0,
-            "dana_kecemerlangan_month": round(dk_month[0]["total"], 2) if dk_month else 0,
-            "koperasi_total": round(kop_total[0]["total"], 2) if kop_total else 0,
-            "koperasi_month": round(kop_month[0]["total"], 2) if kop_month else 0,
-            "vendor_earnings_total": round(vendor_earnings_total[0]["total"], 2) if vendor_earnings_total else 0,
-            "vendor_payouts_total": round(vendor_payouts_total[0]["total"], 2) if vendor_payouts_total else 0,
-            "vendor_balance_unpaid": round((vendor_earnings_total[0]["total"] if vendor_earnings_total else 0) - (vendor_payouts_total[0]["total"] if vendor_payouts_total else 0), 2),
+            "dana_kecemerlangan_total": round(dk_total, 2),
+            "dana_kecemerlangan_month": round(dk_month, 2),
+            "koperasi_total": round(kop_total, 2),
+            "koperasi_month": round(kop_month, 2),
+            "vendor_earnings_total": round(vendor_earnings_total, 2),
+            "vendor_payouts_total": round(vendor_payouts_total, 2),
+            "vendor_balance_unpaid": round(vendor_earnings_total - vendor_payouts_total, 2),
             "pending_payouts_count": pending_payouts,
-            "sales_total": round(sales_total[0]["total"], 2) if sales_total else 0,
-            "sales_month": round(sales_month[0]["total"], 2) if sales_month else 0,
+            "sales_total": round(sales_total, 2),
+            "sales_month": round(sales_month, 2),
             "orders_total": orders_total,
             "orders_month": orders_month
         },
@@ -2774,15 +2837,13 @@ async def get_finance_ledger(
     skip = (page - 1) * limit
     entries = await db.financial_ledger.find(query).sort("created_at", -1).skip(skip).limit(limit).to_list(limit)
     
-    # Calculate totals for current filter
-    totals = await db.financial_ledger.aggregate([
-        {"$match": query},
-        {"$group": {
-            "_id": "$type",
-            "total": {"$sum": "$amount"},
-            "count": {"$sum": 1}
-        }}
-    ]).to_list(20)
+    # Calculate totals for current filter without Mongo aggregate pipeline.
+    totals_map: Dict[str, Dict[str, float]] = {}
+    async for entry in db.financial_ledger.find(query):
+        entry_type = str(entry.get("type", "unknown"))
+        bucket = totals_map.setdefault(entry_type, {"total": 0.0, "count": 0})
+        bucket["total"] += _safe_float(entry.get("amount"))
+        bucket["count"] += 1
     
     return {
         "entries": [{
@@ -2803,7 +2864,10 @@ async def get_finance_ledger(
             "limit": limit,
             "pages": (total + limit - 1) // limit
         },
-        "totals": {t["_id"]: {"total": round(t["total"], 2), "count": t["count"]} for t in totals}
+        "totals": {
+            entry_type: {"total": round(values["total"], 2), "count": int(values["count"])}
+            for entry_type, values in totals_map.items()
+        }
     }
 
 
@@ -2822,27 +2886,24 @@ async def get_vendor_financial_summary(user: dict = Depends(get_current_user)):
     for vendor in vendors:
         vendor_id = str(vendor["_id"])
         
-        # Get earnings
-        earnings = await db.financial_ledger.aggregate([
-            {"$match": {"type": LedgerType.VENDOR_EARNING.value, "vendor_id": vendor_id}},
-            {"$group": {"_id": None, "total": {"$sum": "$amount"}}}
-        ]).to_list(1)
-        
-        # Get payouts
-        payouts = await db.financial_ledger.aggregate([
-            {"$match": {"type": LedgerType.VENDOR_PAYOUT.value, "vendor_id": vendor_id}},
-            {"$group": {"_id": None, "total": {"$sum": {"$abs": "$amount"}}}}
-        ]).to_list(1)
-        
-        # Get pending payout
-        pending = await db.marketplace_payouts.aggregate([
-            {"$match": {"vendor_id": vendor_id, "status": PayoutStatus.PENDING.value}},
-            {"$group": {"_id": None, "total": {"$sum": "$amount"}}}
-        ]).to_list(1)
-        
-        total_earnings = earnings[0]["total"] if earnings else 0
-        total_payouts = payouts[0]["total"] if payouts else 0
-        pending_amount = pending[0]["total"] if pending else 0
+        # Get earnings/payouts without Mongo aggregate pipeline.
+        total_earnings = 0.0
+        async for entry in db.financial_ledger.find(
+            {"type": LedgerType.VENDOR_EARNING.value, "vendor_id": vendor_id}
+        ):
+            total_earnings += _safe_float(entry.get("amount"))
+
+        total_payouts = 0.0
+        async for entry in db.financial_ledger.find(
+            {"type": LedgerType.VENDOR_PAYOUT.value, "vendor_id": vendor_id}
+        ):
+            total_payouts += abs(_safe_float(entry.get("amount")))
+
+        pending_amount = 0.0
+        async for payout in db.marketplace_payouts.find(
+            {"vendor_id": vendor_id, "status": PayoutStatus.PENDING.value}
+        ):
+            pending_amount += _safe_float(payout.get("amount"))
         
         result.append({
             "vendor_id": vendor_id,
@@ -2969,10 +3030,11 @@ async def get_all_payouts(
     
     payouts = await db.marketplace_payouts.find(query).sort("requested_at", -1).skip(skip).limit(limit).to_list(limit)
     
-    # Get status counts
-    status_counts = await db.marketplace_payouts.aggregate([
-        {"$group": {"_id": "$status", "count": {"$sum": 1}}}
-    ]).to_list(10)
+    # Get status counts without Mongo aggregate pipeline.
+    status_counts: Dict[str, int] = {}
+    async for payout_row in db.marketplace_payouts.find({}):
+        row_status = str(payout_row.get("status", "unknown"))
+        status_counts[row_status] = status_counts.get(row_status, 0) + 1
     
     return {
         "payouts": [{
@@ -2997,7 +3059,7 @@ async def get_all_payouts(
             "limit": limit,
             "pages": (total + limit - 1) // limit
         },
-        "status_counts": {s["_id"]: s["count"] for s in status_counts}
+        "status_counts": status_counts
     }
 
 
@@ -3208,7 +3270,7 @@ async def record_ad_click(ad_id: str):
     db = get_db()
     
     result = await db.marketplace_ads.update_one(
-        {"_id": ObjectId(ad_id)},
+        {"_id": _id_value(ad_id)},
         {"$inc": {"clicks": 1}}
     )
     
@@ -3230,7 +3292,7 @@ async def approve_ad(
     if user["role"] not in ["superadmin", "admin"]:
         raise HTTPException(status_code=403, detail="Akses ditolak")
     
-    ad = await db.marketplace_ads.find_one({"_id": ObjectId(ad_id)})
+    ad = await db.marketplace_ads.find_one({"_id": _id_value(ad_id)})
     if not ad:
         raise HTTPException(status_code=404, detail="Iklan tidak dijumpai")
     
@@ -3251,15 +3313,15 @@ async def approve_ad(
         update_data["rejection_reason"] = approval.rejection_reason
     
     await db.marketplace_ads.update_one(
-        {"_id": ObjectId(ad_id)},
+        {"_id": _id_value(ad_id)},
         {"$set": update_data}
     )
     
     # Notify vendor
-    vendor = await db.marketplace_vendors.find_one({"_id": ObjectId(ad["vendor_id"])})
+    vendor = await db.marketplace_vendors.find_one({"_id": _id_value(ad["vendor_id"])})
     if vendor:
         await db.notifications.insert_one({
-            "user_id": ObjectId(vendor["user_id"]),
+            "user_id": _id_value(vendor["user_id"]),
             "title": "Status Kelulusan Iklan",
             "message": f"Iklan '{ad['title']}' telah {'diluluskan. Sila buat pembayaran.' if approval.status == AdStatus.APPROVED else 'ditolak. Sebab: ' + (approval.rejection_reason or '')}",
             "type": "info" if approval.status == AdStatus.APPROVED else "warning",
@@ -3284,7 +3346,7 @@ async def pay_for_ad(ad_id: str, user: dict = Depends(get_current_user)):
         raise HTTPException(status_code=403, detail="Anda bukan vendor")
     
     ad = await db.marketplace_ads.find_one({
-        "_id": ObjectId(ad_id),
+        "_id": _id_value(ad_id),
         "vendor_id": str(vendor["_id"])
     })
     
@@ -3313,7 +3375,7 @@ async def pay_for_ad(ad_id: str, user: dict = Depends(get_current_user)):
     
     # Activate ad
     await db.marketplace_ads.update_one(
-        {"_id": ObjectId(ad_id)},
+        {"_id": _id_value(ad_id)},
         {"$set": {
             "status": AdStatus.ACTIVE.value,
             "payment_status": "paid",
@@ -3338,7 +3400,7 @@ async def delete_ad(ad_id: str, user: dict = Depends(get_current_user)):
     """Delete ad - vendor or admin"""
     db = get_db()
     
-    ad = await db.marketplace_ads.find_one({"_id": ObjectId(ad_id)})
+    ad = await db.marketplace_ads.find_one({"_id": _id_value(ad_id)})
     if not ad:
         raise HTTPException(status_code=404, detail="Iklan tidak dijumpai")
     
@@ -3353,7 +3415,7 @@ async def delete_ad(ad_id: str, user: dict = Depends(get_current_user)):
     if ad["status"] == AdStatus.ACTIVE.value and ad.get("payment_status") == "paid":
         raise HTTPException(status_code=400, detail="Tidak boleh padam iklan yang aktif dan berbayar")
     
-    await db.marketplace_ads.delete_one({"_id": ObjectId(ad_id)})
+    await db.marketplace_ads.delete_one({"_id": _id_value(ad_id)})
     
     await log_audit(user, "DELETE_AD", "marketplace", f"Iklan dipadam: {ad['title']}")
     
@@ -3404,7 +3466,7 @@ async def boost_product(
         raise HTTPException(status_code=403, detail="Anda bukan vendor")
     
     product = await db.marketplace_products.find_one({
-        "_id": ObjectId(product_id),
+        "_id": _id_value(product_id),
         "vendor_id": str(vendor["_id"]),
         "approval_status": ProductApprovalStatus.APPROVED.value
     })
@@ -3454,7 +3516,7 @@ async def boost_product(
         update_fields["boost_expires_at"] = end_date
     
     await db.marketplace_products.update_one(
-        {"_id": ObjectId(product_id)},
+        {"_id": _id_value(product_id)},
         {"$set": update_fields}
     )
     
@@ -3689,7 +3751,7 @@ async def register_for_flash_sale(
         raise HTTPException(status_code=403, detail="Anda bukan vendor")
     
     # Verify flash sale exists and has slots
-    flash_sale = await db.flash_sales.find_one({"_id": ObjectId(flash_sale_id)})
+    flash_sale = await db.flash_sales.find_one({"_id": _id_value(flash_sale_id)})
     if not flash_sale:
         raise HTTPException(status_code=404, detail="Flash sale tidak dijumpai")
     
@@ -3700,7 +3762,7 @@ async def register_for_flash_sale(
     
     # Verify product ownership
     product = await db.marketplace_products.find_one({
-        "_id": ObjectId(registration.product_id),
+        "_id": _id_value(registration.product_id),
         "vendor_id": str(vendor["_id"]),
         "approval_status": ProductApprovalStatus.APPROVED.value
     })
@@ -3801,12 +3863,12 @@ async def run_expiration_scheduler(cron_key: Optional[str] = None, user: dict = 
         # Update product
         if boost["boost_type"] == BoostType.FEATURED.value:
             await db.marketplace_products.update_one(
-                {"_id": ObjectId(boost["product_id"])},
+                {"_id": _id_value(boost["product_id"])},
                 {"$set": {"is_featured": False, "featured_until": None}}
             )
         elif boost["boost_type"] == BoostType.BOOST.value:
             await db.marketplace_products.update_one(
-                {"_id": ObjectId(boost["product_id"])},
+                {"_id": _id_value(boost["product_id"])},
                 {"$set": {"is_boosted": False, "boost_expires_at": None}}
             )
     
@@ -3826,7 +3888,7 @@ async def run_expiration_scheduler(cron_key: Optional[str] = None, user: dict = 
         
         # Notify vendor
         await db.notifications.insert_one({
-            "user_id": ObjectId(vendor["user_id"]),
+            "user_id": _id_value(vendor["user_id"]),
             "title": "Langganan Premium Tamat",
             "message": "Langganan premium anda telah tamat. Langgani semula untuk terus menikmati faedah premium.",
             "type": "warning",
@@ -3868,29 +3930,24 @@ async def get_monetization_stats(user: dict = Depends(get_current_user)):
     active_ads = await db.marketplace_ads.count_documents({"status": AdStatus.ACTIVE.value})
     pending_ads = await db.marketplace_ads.count_documents({"status": AdStatus.PENDING.value})
     
-    # Ad revenue
-    ad_revenue = await db.financial_ledger.aggregate([
-        {"$match": {"type": LedgerType.AD_REVENUE.value}},
-        {"$group": {"_id": None, "total": {"$sum": "$amount"}}}
-    ]).to_list(1)
-    
-    # Boost revenue
-    boost_revenue = await db.financial_ledger.aggregate([
-        {"$match": {"type": {"$in": [LedgerType.FEATURED_PRODUCT.value, LedgerType.BOOST_LISTING.value]}}},
-        {"$group": {"_id": None, "total": {"$sum": "$amount"}}}
-    ]).to_list(1)
-    
-    # Premium subscriptions revenue
-    subscription_revenue = await db.financial_ledger.aggregate([
-        {"$match": {"type": LedgerType.PREMIUM_SUBSCRIPTION.value}},
-        {"$group": {"_id": None, "total": {"$sum": "$amount"}}}
-    ]).to_list(1)
-    
-    # Flash sale revenue
-    flash_sale_revenue = await db.financial_ledger.aggregate([
-        {"$match": {"type": LedgerType.FLASH_SALE_SLOT.value}},
-        {"$group": {"_id": None, "total": {"$sum": "$amount"}}}
-    ]).to_list(1)
+    # Revenue totals without Mongo aggregate pipeline.
+    ad_revenue = 0.0
+    async for entry in db.financial_ledger.find({"type": LedgerType.AD_REVENUE.value}):
+        ad_revenue += _safe_float(entry.get("amount"))
+
+    boost_revenue = 0.0
+    async for entry in db.financial_ledger.find(
+        {"type": {"$in": [LedgerType.FEATURED_PRODUCT.value, LedgerType.BOOST_LISTING.value]}}
+    ):
+        boost_revenue += _safe_float(entry.get("amount"))
+
+    subscription_revenue = 0.0
+    async for entry in db.financial_ledger.find({"type": LedgerType.PREMIUM_SUBSCRIPTION.value}):
+        subscription_revenue += _safe_float(entry.get("amount"))
+
+    flash_sale_revenue = 0.0
+    async for entry in db.financial_ledger.find({"type": LedgerType.FLASH_SALE_SLOT.value}):
+        flash_sale_revenue += _safe_float(entry.get("amount"))
     
     # Active premium vendors
     premium_vendors = await db.marketplace_vendors.count_documents({
@@ -3908,24 +3965,24 @@ async def get_monetization_stats(user: dict = Depends(get_current_user)):
         "ads": {
             "active": active_ads,
             "pending": pending_ads,
-            "revenue": ad_revenue[0]["total"] if ad_revenue else 0
+            "revenue": ad_revenue
         },
         "boosts": {
             "active": active_boosts,
-            "revenue": boost_revenue[0]["total"] if boost_revenue else 0
+            "revenue": boost_revenue
         },
         "subscriptions": {
             "premium_vendors": premium_vendors,
-            "revenue": subscription_revenue[0]["total"] if subscription_revenue else 0
+            "revenue": subscription_revenue
         },
         "flash_sales": {
-            "revenue": flash_sale_revenue[0]["total"] if flash_sale_revenue else 0
+            "revenue": flash_sale_revenue
         },
         "total_monetization_revenue": (
-            (ad_revenue[0]["total"] if ad_revenue else 0) +
-            (boost_revenue[0]["total"] if boost_revenue else 0) +
-            (subscription_revenue[0]["total"] if subscription_revenue else 0) +
-            (flash_sale_revenue[0]["total"] if flash_sale_revenue else 0)
+            ad_revenue +
+            boost_revenue +
+            subscription_revenue +
+            flash_sale_revenue
         )
     }
 
@@ -3950,7 +4007,7 @@ async def get_vendor_analytics(
     if not is_admin and not is_owner:
         raise HTTPException(status_code=403, detail="Akses ditolak")
     
-    vendor = await db.marketplace_vendors.find_one({"_id": ObjectId(vendor_id)})
+    vendor = await db.marketplace_vendors.find_one({"_id": _id_value(vendor_id)})
     if not vendor:
         raise HTTPException(status_code=404, detail="Vendor tidak dijumpai")
     
@@ -3964,37 +4021,31 @@ async def get_vendor_analytics(
     else:
         start_date = datetime(2020, 1, 1, tzinfo=timezone.utc)
     
-    # Monthly sales trend (aggregation)
-    monthly_sales = await db.marketplace_orders.aggregate([
+    # Monthly sales trend without Mongo aggregate pipeline.
+    monthly_sales_map: Dict[Tuple[int, int], Dict[str, float]] = {}
+    async for order in db.marketplace_orders.find(
         {
-            "$match": {
-                "items.vendor_id": vendor_id,
-                "status": {"$in": [OrderStatus.PAID.value, OrderStatus.DELIVERED.value]},
-                "created_at": {"$gte": start_date}
-            }
-        },
-        {
-            "$group": {
-                "_id": {
-                    "year": {"$year": "$created_at"},
-                    "month": {"$month": "$created_at"}
-                },
-                "total_sales": {"$sum": "$total_amount"},
-                "order_count": {"$sum": 1}
-            }
-        },
-        {"$sort": {"_id.year": 1, "_id.month": 1}}
-    ]).to_list(24)
+            "items.vendor_id": vendor_id,
+            "status": {"$in": [OrderStatus.PAID.value, OrderStatus.DELIVERED.value]},
+            "created_at": {"$gte": start_date},
+        }
+    ):
+        month = _month_key(order.get("created_at"))
+        if month is None:
+            continue
+        bucket = monthly_sales_map.setdefault(month, {"total_sales": 0.0, "order_count": 0})
+        bucket["total_sales"] += _safe_float(order.get("total_amount"))
+        bucket["order_count"] += 1
     
-    # Format monthly data
     monthly_trend = []
-    for m in monthly_sales:
-        month_name = f"{m['_id']['year']}-{str(m['_id']['month']).zfill(2)}"
-        monthly_trend.append({
-            "month": month_name,
-            "sales": m["total_sales"],
-            "orders": m["order_count"]
-        })
+    for (year, month), values in sorted(monthly_sales_map.items()):
+        monthly_trend.append(
+            {
+                "month": f"{year}-{month:02d}",
+                "sales": values["total_sales"],
+                "orders": int(values["order_count"]),
+            }
+        )
     
     # Top selling products
     top_products = await db.marketplace_products.find(
@@ -4008,60 +4059,59 @@ async def get_vendor_analytics(
         "revenue": p.get("sales_count", 0) * p["price"]
     } for p in top_products]
     
-    # Category breakdown
-    category_sales = await db.marketplace_orders.aggregate([
-        {"$match": {"items.vendor_id": vendor_id, "status": {"$in": [OrderStatus.PAID.value, OrderStatus.DELIVERED.value]}}},
-        {"$unwind": "$items"},
-        {"$match": {"items.vendor_id": vendor_id}},
-        {"$lookup": {
-            "from": "marketplace_products",
-            "localField": "items.product_id",
-            "foreignField": "_id",
-            "as": "product"
-        }},
-        {"$unwind": {"path": "$product", "preserveNullAndEmptyArrays": True}},
-        {"$group": {
-            "_id": "$product.category",
-            "total": {"$sum": "$items.total_price"},
-            "count": {"$sum": "$items.quantity"}
-        }},
-        {"$sort": {"total": -1}}
-    ]).to_list(20)
-    
-    # Order status breakdown
-    order_status_breakdown = await db.marketplace_orders.aggregate([
-        {"$match": {"items.vendor_id": vendor_id}},
-        {"$group": {"_id": "$status", "count": {"$sum": 1}}}
-    ]).to_list(10)
+    # Category breakdown without Mongo aggregate pipeline.
+    vendor_products = await db.marketplace_products.find(
+        {"vendor_id": vendor_id}, {"category": 1}
+    ).to_list(5000)
+    category_by_product_id = {str(product["_id"]): product.get("category") for product in vendor_products}
+    category_totals: Dict[str, Dict[str, float]] = {}
+    order_status_breakdown: Dict[str, int] = {}
+
+    async for order in db.marketplace_orders.find({"items.vendor_id": vendor_id}):
+        status = str(order.get("status", "unknown"))
+        order_status_breakdown[status] = order_status_breakdown.get(status, 0) + 1
+
+        if status not in {OrderStatus.PAID.value, OrderStatus.DELIVERED.value}:
+            continue
+
+        for item in order.get("items", []):
+            if str(item.get("vendor_id")) != vendor_id:
+                continue
+            category = category_by_product_id.get(str(item.get("product_id"))) or "Lain-lain"
+            bucket = category_totals.setdefault(category, {"total": 0.0, "count": 0})
+            bucket["total"] += _safe_float(item.get("total_price"))
+            bucket["count"] += int(_safe_float(item.get("quantity")))
+
+    category_sales = sorted(
+        [
+            {"category": category, "total": values["total"], "count": values["count"]}
+            for category, values in category_totals.items()
+        ],
+        key=lambda row: row["total"],
+        reverse=True,
+    )[:20]
     
     # Wallet summary
     wallet = await db.vendor_wallets.find_one({"vendor_id": vendor_id})
     
-    # Earnings trend
-    earnings_trend = await db.financial_ledger.aggregate([
+    # Earnings trend without Mongo aggregate pipeline.
+    earnings_map: Dict[Tuple[int, int], float] = {}
+    async for entry in db.financial_ledger.find(
         {
-            "$match": {
-                "type": LedgerType.VENDOR_EARNING.value,
-                "vendor_id": vendor_id,
-                "created_at": {"$gte": start_date}
-            }
-        },
-        {
-            "$group": {
-                "_id": {
-                    "year": {"$year": "$created_at"},
-                    "month": {"$month": "$created_at"}
-                },
-                "earnings": {"$sum": "$amount"}
-            }
-        },
-        {"$sort": {"_id.year": 1, "_id.month": 1}}
-    ]).to_list(24)
+            "type": LedgerType.VENDOR_EARNING.value,
+            "vendor_id": vendor_id,
+            "created_at": {"$gte": start_date},
+        }
+    ):
+        month = _month_key(entry.get("created_at"))
+        if month is None:
+            continue
+        earnings_map[month] = earnings_map.get(month, 0.0) + _safe_float(entry.get("amount"))
     
-    earnings_monthly = [{
-        "month": f"{e['_id']['year']}-{str(e['_id']['month']).zfill(2)}",
-        "earnings": e["earnings"]
-    } for e in earnings_trend]
+    earnings_monthly = [
+        {"month": f"{year}-{month:02d}", "earnings": amount}
+        for (year, month), amount in sorted(earnings_map.items())
+    ]
     
     return {
         "vendor": {
@@ -4075,8 +4125,8 @@ async def get_vendor_analytics(
         "monthly_trend": monthly_trend,
         "earnings_trend": earnings_monthly,
         "top_products": top_products_data,
-        "category_breakdown": [{"category": c["_id"] or "Lain-lain", "total": c["total"], "count": c["count"]} for c in category_sales],
-        "order_status": {s["_id"]: s["count"] for s in order_status_breakdown},
+        "category_breakdown": category_sales,
+        "order_status": order_status_breakdown,
         "wallet": {
             "total_earnings": wallet.get("total_earnings", 0) if wallet else 0,
             "available_balance": wallet.get("available_balance", 0) if wallet else 0,
@@ -4107,67 +4157,85 @@ async def get_sales_overview(
     else:
         start_date = datetime(2020, 1, 1, tzinfo=timezone.utc)
     
-    # Monthly sales trend
-    monthly_sales = await db.marketplace_orders.aggregate([
-        {
-            "$match": {
-                "status": {"$in": [OrderStatus.PAID.value, OrderStatus.DELIVERED.value]},
-                "created_at": {"$gte": start_date}
-            }
-        },
-        {
-            "$group": {
-                "_id": {
-                    "year": {"$year": "$created_at"},
-                    "month": {"$month": "$created_at"}
-                },
-                "total_sales": {"$sum": "$total_amount"},
-                "dana_kecemerlangan": {"$sum": "$dana_kecemerlangan_amount"},
-                "koperasi": {"$sum": "$koperasi_amount"},
-                "vendor_earnings": {"$sum": "$vendor_earnings"},
-                "order_count": {"$sum": 1}
-            }
-        },
-        {"$sort": {"_id.year": 1, "_id.month": 1}}
-    ]).to_list(24)
-    
-    monthly_trend = [{
-        "month": f"{m['_id']['year']}-{str(m['_id']['month']).zfill(2)}",
-        "sales": m["total_sales"],
-        "dana_kecemerlangan": m["dana_kecemerlangan"],
-        "koperasi": m["koperasi"],
-        "vendor_earnings": m["vendor_earnings"],
-        "orders": m["order_count"]
-    } for m in monthly_sales]
-    
-    # Daily sales for last 30 days
+    paid_statuses = {OrderStatus.PAID.value, OrderStatus.DELIVERED.value}
     thirty_days_ago = now - timedelta(days=30)
-    daily_sales = await db.marketplace_orders.aggregate([
-        {
-            "$match": {
-                "status": {"$in": [OrderStatus.PAID.value, OrderStatus.DELIVERED.value]},
-                "created_at": {"$gte": thirty_days_ago}
-            }
-        },
-        {
-            "$group": {
-                "_id": {
-                    "year": {"$year": "$created_at"},
-                    "month": {"$month": "$created_at"},
-                    "day": {"$dayOfMonth": "$created_at"}
+    monthly_map: Dict[Tuple[int, int], Dict[str, float]] = {}
+    daily_map: Dict[Tuple[int, int, int], Dict[str, float]] = {}
+    summary = {
+        "total_sales": 0.0,
+        "total_orders": 0,
+        "dana_kecemerlangan": 0.0,
+        "koperasi": 0.0,
+        "vendor_earnings": 0.0,
+    }
+
+    product_categories = await db.marketplace_products.find({}, {"category": 1}).to_list(50000)
+    category_by_product_id = {str(product["_id"]): product.get("category") for product in product_categories}
+    category_totals: Dict[str, Dict[str, float]] = {}
+
+    async for order in db.marketplace_orders.find({"status": {"$in": list(paid_statuses)}}):
+        created_at = _to_utc_datetime(order.get("created_at"))
+        total_amount = _safe_float(order.get("total_amount"))
+        dk_amount = _safe_float(order.get("dana_kecemerlangan_amount"))
+        kop_amount = _safe_float(order.get("koperasi_amount"))
+        vendor_amount = _safe_float(order.get("vendor_earnings"))
+
+        summary["total_sales"] += total_amount
+        summary["total_orders"] += 1
+        summary["dana_kecemerlangan"] += dk_amount
+        summary["koperasi"] += kop_amount
+        summary["vendor_earnings"] += vendor_amount
+
+        if created_at and created_at >= start_date:
+            month = (created_at.year, created_at.month)
+            bucket = monthly_map.setdefault(
+                month,
+                {
+                    "sales": 0.0,
+                    "dana_kecemerlangan": 0.0,
+                    "koperasi": 0.0,
+                    "vendor_earnings": 0.0,
+                    "orders": 0,
                 },
-                "total": {"$sum": "$total_amount"},
-                "count": {"$sum": 1}
-            }
-        },
-        {"$sort": {"_id.year": 1, "_id.month": 1, "_id.day": 1}}
-    ]).to_list(31)
-    
-    daily_trend = [{
-        "date": f"{d['_id']['year']}-{str(d['_id']['month']).zfill(2)}-{str(d['_id']['day']).zfill(2)}",
-        "sales": d["total"],
-        "orders": d["count"]
-    } for d in daily_sales]
+            )
+            bucket["sales"] += total_amount
+            bucket["dana_kecemerlangan"] += dk_amount
+            bucket["koperasi"] += kop_amount
+            bucket["vendor_earnings"] += vendor_amount
+            bucket["orders"] += 1
+
+        if created_at and created_at >= thirty_days_ago:
+            day = (created_at.year, created_at.month, created_at.day)
+            day_bucket = daily_map.setdefault(day, {"sales": 0.0, "orders": 0})
+            day_bucket["sales"] += total_amount
+            day_bucket["orders"] += 1
+
+        for item in order.get("items", []):
+            category = category_by_product_id.get(str(item.get("product_id"))) or "Lain-lain"
+            category_bucket = category_totals.setdefault(category, {"sales": 0.0, "quantity": 0})
+            category_bucket["sales"] += _safe_float(item.get("total_price"))
+            category_bucket["quantity"] += int(_safe_float(item.get("quantity")))
+
+    monthly_trend = [
+        {
+            "month": f"{year}-{month:02d}",
+            "sales": values["sales"],
+            "dana_kecemerlangan": values["dana_kecemerlangan"],
+            "koperasi": values["koperasi"],
+            "vendor_earnings": values["vendor_earnings"],
+            "orders": int(values["orders"]),
+        }
+        for (year, month), values in sorted(monthly_map.items())
+    ]
+
+    daily_trend = [
+        {
+            "date": f"{year}-{month:02d}-{day:02d}",
+            "sales": values["sales"],
+            "orders": int(values["orders"]),
+        }
+        for (year, month, day), values in sorted(daily_map.items())
+    ]
     
     # Top vendors by sales
     top_vendors = await db.marketplace_vendors.find(
@@ -4181,52 +4249,25 @@ async def get_sales_overview(
         "products": v.get("total_products", 0)
     } for v in top_vendors]
     
-    # Category sales breakdown
-    category_breakdown = await db.marketplace_orders.aggregate([
-        {"$match": {"status": {"$in": [OrderStatus.PAID.value, OrderStatus.DELIVERED.value]}}},
-        {"$unwind": "$items"},
-        {"$lookup": {
-            "from": "marketplace_products",
-            "let": {"pid": {"$toObjectId": "$items.product_id"}},
-            "pipeline": [{"$match": {"$expr": {"$eq": ["$_id", "$$pid"]}}}],
-            "as": "product"
-        }},
-        {"$unwind": {"path": "$product", "preserveNullAndEmptyArrays": True}},
-        {"$group": {
-            "_id": "$product.category",
-            "total_sales": {"$sum": "$items.total_price"},
-            "quantity": {"$sum": "$items.quantity"}
-        }},
-        {"$sort": {"total_sales": -1}}
-    ]).to_list(20)
-    
-    # Summary totals
-    totals = await db.marketplace_orders.aggregate([
-        {"$match": {"status": {"$in": [OrderStatus.PAID.value, OrderStatus.DELIVERED.value]}}},
-        {"$group": {
-            "_id": None,
-            "total_sales": {"$sum": "$total_amount"},
-            "total_orders": {"$sum": 1},
-            "dana_kecemerlangan": {"$sum": "$dana_kecemerlangan_amount"},
-            "koperasi": {"$sum": "$koperasi_amount"},
-            "vendor_earnings": {"$sum": "$vendor_earnings"}
-        }}
-    ]).to_list(1)
-    
-    summary = totals[0] if totals else {
-        "total_sales": 0, "total_orders": 0, 
-        "dana_kecemerlangan": 0, "koperasi": 0, "vendor_earnings": 0
-    }
-    
-    # Order status distribution
-    status_dist = await db.marketplace_orders.aggregate([
-        {"$group": {"_id": "$status", "count": {"$sum": 1}}}
-    ]).to_list(10)
+    category_breakdown = sorted(
+        [
+            {"category": category, "sales": values["sales"], "quantity": values["quantity"]}
+            for category, values in category_totals.items()
+        ],
+        key=lambda row: row["sales"],
+        reverse=True,
+    )[:20]
+
+    # Order status distribution without Mongo aggregate pipeline.
+    status_dist: Dict[str, int] = {}
+    async for order in db.marketplace_orders.find({}):
+        status = str(order.get("status", "unknown"))
+        status_dist[status] = status_dist.get(status, 0) + 1
     
     return {
         "summary": {
             "total_sales": summary.get("total_sales", 0),
-            "total_orders": summary.get("total_orders", 0),
+            "total_orders": int(summary.get("total_orders", 0)),
             "dana_kecemerlangan": summary.get("dana_kecemerlangan", 0),
             "koperasi": summary.get("koperasi", 0),
             "vendor_earnings": summary.get("vendor_earnings", 0)
@@ -4234,11 +4275,8 @@ async def get_sales_overview(
         "monthly_trend": monthly_trend,
         "daily_trend": daily_trend,
         "top_vendors": top_vendors_data,
-        "category_breakdown": [
-            {"category": c["_id"] or "Lain-lain", "sales": c["total_sales"], "quantity": c["quantity"]} 
-            for c in category_breakdown
-        ],
-        "order_status_distribution": {s["_id"]: s["count"] for s in status_dist},
+        "category_breakdown": category_breakdown,
+        "order_status_distribution": status_dist,
         "period": period
     }
 

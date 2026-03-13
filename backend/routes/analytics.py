@@ -26,16 +26,31 @@ def init_router(database, auth_func):
     pass
 
 
+def _as_float(value: Any) -> float:
+    try:
+        return float(value or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _as_int(value: Any) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
 async def get_fees_analytics(db):
     """Get fees analytics data"""
-    pipeline = [
-        {"$group": {
-            "_id": "$status",
-            "count": {"$sum": 1},
-            "total": {"$sum": "$amount"}
-        }}
-    ]
-    fees_by_status = await db.student_fees.aggregate(pipeline).to_list(100)
+    fees_by_status: Dict[str, Dict[str, Any]] = {}
+    async for row in db.student_fees.find({}):
+        status = row.get("status")
+        if not status:
+            continue
+        if status not in fees_by_status:
+            fees_by_status[status] = {"count": 0, "total": 0.0}
+        fees_by_status[status]["count"] += 1
+        fees_by_status[status]["total"] += _as_float(row.get("amount"))
     
     total_fees = await db.student_fees.count_documents({})
     paid_fees = await db.student_fees.count_documents({"status": "paid"})
@@ -50,7 +65,10 @@ async def get_fees_analytics(db):
         "paid_fees": paid_fees,
         "pending_fees": pending_fees,
         "collection_rate": round((paid_fees / total_fees * 100) if total_fees > 0 else 0, 1),
-        "fees_by_status": {item["_id"]: {"count": item["count"], "total": item["total"]} for item in fees_by_status if item["_id"]},
+        "fees_by_status": {
+            status: {"count": stats["count"], "total": stats["total"]}
+            for status, stats in fees_by_status.items()
+        },
         "recent_collection": total_collected
     }
 
@@ -61,25 +79,30 @@ async def get_koperasi_analytics(db):
     total_kits = await db.koperasi_kits.count_documents({})
     total_orders = await db.koperasi_orders.count_documents({})
     
-    pipeline = [
-        {"$group": {
-            "_id": "$status",
-            "count": {"$sum": 1},
-            "total": {"$sum": "$total_amount"}
-        }}
-    ]
-    orders_by_status = await db.koperasi_orders.aggregate(pipeline).to_list(100)
+    orders_by_status: Dict[str, Dict[str, Any]] = {}
+    async for row in db.koperasi_orders.find({}):
+        status = row.get("status")
+        if not status:
+            continue
+        if status not in orders_by_status:
+            orders_by_status[status] = {"count": 0, "total": 0.0}
+        orders_by_status[status]["count"] += 1
+        orders_by_status[status]["total"] += _as_float(row.get("total_amount"))
     
     # Calculate revenue
-    paid_orders = await db.koperasi_orders.find({"status": "paid"}).to_list(1000)
-    total_revenue = sum([o.get("total_amount", 0) for o in paid_orders])
+    total_revenue = 0.0
+    async for row in db.koperasi_orders.find({"status": "paid"}):
+        total_revenue += _as_float(row.get("total_amount"))
     
     return {
         "total_products": total_products,
         "total_kits": total_kits,
         "total_orders": total_orders,
         "total_revenue": total_revenue,
-        "orders_by_status": {item["_id"]: {"count": item["count"], "total": item["total"]} for item in orders_by_status if item["_id"]}
+        "orders_by_status": {
+            status: {"count": stats["count"], "total": stats["total"]}
+            for status, stats in orders_by_status.items()
+        },
     }
 
 
@@ -88,23 +111,23 @@ async def get_bus_analytics(db):
     total_trips = await db.bus_trips.count_documents({})
     total_bookings = await db.bus_bookings.count_documents({})
     
-    pipeline = [
-        {"$group": {
-            "_id": "$status",
-            "count": {"$sum": 1}
-        }}
-    ]
-    bookings_by_status = await db.bus_bookings.aggregate(pipeline).to_list(100)
+    bookings_by_status: Dict[str, int] = {}
+    async for row in db.bus_bookings.find({}):
+        status = row.get("status")
+        if not status:
+            continue
+        bookings_by_status[status] = bookings_by_status.get(status, 0) + 1
     
     # Revenue from confirmed bookings
-    confirmed_bookings = await db.bus_bookings.find({"status": {"$in": ["confirmed", "paid"]}}).to_list(1000)
-    total_revenue = sum([b.get("total_price", 0) for b in confirmed_bookings])
+    total_revenue = 0.0
+    async for row in db.bus_bookings.find({"status": {"$in": ["confirmed", "paid"]}}):
+        total_revenue += _as_float(row.get("total_price"))
     
     return {
         "total_trips": total_trips,
         "total_bookings": total_bookings,
         "total_revenue": total_revenue,
-        "bookings_by_status": {item["_id"]: item["count"] for item in bookings_by_status if item["_id"]}
+        "bookings_by_status": bookings_by_status,
     }
 
 
@@ -114,17 +137,11 @@ async def get_infaq_analytics(db):
     active_campaigns = await db.infaq_campaigns.count_documents({"status": "active"})
     total_donations = await db.infaq_donations.count_documents({})
     
-    pipeline = [
-        {"$group": {
-            "_id": None,
-            "total_amount": {"$sum": "$amount"},
-            "total_slots": {"$sum": "$slots"}
-        }}
-    ]
-    donation_stats = await db.infaq_donations.aggregate(pipeline).to_list(1)
-    
-    total_collected = donation_stats[0]["total_amount"] if donation_stats else 0
-    total_slots_sold = donation_stats[0]["total_slots"] if donation_stats else 0
+    total_collected = 0.0
+    total_slots_sold = 0
+    async for row in db.infaq_donations.find({}):
+        total_collected += _as_float(row.get("amount"))
+        total_slots_sold += _as_int(row.get("slots"))
     
     return {
         "total_campaigns": total_campaigns,
@@ -139,13 +156,11 @@ async def get_sedekah_analytics(db):
     """Get sedekah/tabung analytics data (unified Tabung & Sumbangan)"""
     total_campaigns = await db.tabung_campaigns.count_documents({})
     active_campaigns = await db.tabung_campaigns.count_documents({"status": "active"})
-    pipeline = [
-        {"$match": {"payment_status": "completed"}},
-        {"$group": {"_id": None, "total_amount": {"$sum": "$amount"}, "count": {"$sum": 1}}}
-    ]
-    result = await db.tabung_donations.aggregate(pipeline).to_list(1)
-    total_collected = result[0]["total_amount"] if result else 0
-    total_donations = result[0]["count"] if result else 0
+    total_collected = 0.0
+    total_donations = 0
+    async for row in db.tabung_donations.find({"payment_status": "completed"}):
+        total_collected += _as_float(row.get("amount"))
+        total_donations += 1
     unique_donors = len(await db.tabung_donations.distinct("user_id"))
     return {
         "total_campaigns": total_campaigns,
@@ -173,23 +188,21 @@ async def get_hostel_analytics(db):
             {"$or": [{"room_number": {"$exists": True, "$ne": ""}}, {"room": {"$exists": True, "$ne": ""}}]}
         ]
     }
-    pipeline = [
-        {"$match": students_match},
-        {"$project": {
-            "block": {"$ifNull": ["$block_name", {"$ifNull": ["$block", "$hostel_block"]}]},
-            "room": {"$ifNull": ["$room_number", "$room"]}
-        }},
-        {"$group": {"_id": {"block": "$block", "room": "$room"}, "occupants": {"$sum": 1}}}
-    ]
-    room_occupancy = await db.students.aggregate(pipeline).to_list(1000)
     from collections import defaultdict
     by_room = defaultdict(int)
-    for r in room_occupancy:
-        bid = r.get("_id") or {}
-        block = (bid.get("block") or "").strip()
-        room = (bid.get("room") or "").strip()
+    async for row in db.students.find(students_match):
+        block = row.get("block_name")
+        if block in (None, ""):
+            block = row.get("block")
+        if block in (None, ""):
+            block = row.get("hostel_block")
+        room = row.get("room_number")
+        if room in (None, ""):
+            room = row.get("room")
+        block = str(block or "").strip()
+        room = str(room or "").strip()
         if block or room:
-            by_room[(block, room)] += r.get("occupants", 0)
+            by_room[(block, room)] += 1
     # Tetapan katil per bilik dari blok (jika ada); jika tidak guna default
     block_beds_map = {}
     try:
@@ -197,8 +210,9 @@ async def get_hostel_analytics(db):
         for b in await blocks_cursor.to_list(100):
             code = (b.get("code") or "").strip()
             bp = b.get("beds_per_room")
-            if code and bp is not None and int(bp) > 0:
-                block_beds_map[code] = int(bp)
+            bp_int = _as_int(bp)
+            if code and bp_int > 0:
+                block_beds_map[code] = bp_int
     except Exception:
         pass
     rooms_with_empty_beds = 0
@@ -235,13 +249,12 @@ async def get_sickbay_analytics(db):
     total_records = await db.sickbay_records.count_documents({})
     
     # Records by status
-    pipeline = [
-        {"$group": {
-            "_id": "$status",
-            "count": {"$sum": 1}
-        }}
-    ]
-    records_by_status = await db.sickbay_records.aggregate(pipeline).to_list(100)
+    records_by_status: Dict[str, int] = {}
+    async for row in db.sickbay_records.find({}):
+        status = row.get("status")
+        if not status:
+            continue
+        records_by_status[status] = records_by_status.get(status, 0) + 1
     
     # Recent week
     week_ago = datetime.now(timezone.utc) - timedelta(days=7)
@@ -250,7 +263,7 @@ async def get_sickbay_analytics(db):
     return {
         "total_records": total_records,
         "recent_week_records": recent_records,
-        "records_by_status": {item["_id"]: item["count"] for item in records_by_status if item["_id"]}
+        "records_by_status": records_by_status,
     }
 
 
